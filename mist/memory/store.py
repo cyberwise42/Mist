@@ -45,7 +45,11 @@ END;
 class MemoryStore:
     def __init__(self, db_path: str | Path):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False: the streaming TUI calls into this store via
+        # asyncio.to_thread (a different worker thread per call) to avoid
+        # blocking the event loop. Access is always sequential — one turn in
+        # flight at a time — never truly concurrent, so this is safe here.
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()

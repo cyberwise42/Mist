@@ -113,5 +113,22 @@ def compact(config: str = typer.Option(None, help="Path to config.yaml"),
         console.print(f"  [dim]session {r.session_id}: {r.memories_written} memories[/]")
 
 
+@app.command()
+def tui(config: str = typer.Option(None, help="Path to config.yaml"),
+        backend: str = typer.Option(None, help="ollama | vllm"),
+        model: str = typer.Option(None),
+        base_url: str = typer.Option(None)):
+    """Full-screen streaming TUI: live token streaming, queued messages,
+    Ctrl+C to interrupt the current turn (Ctrl+Q to quit)."""
+    try:
+        from mist.tui.app import MistTUI
+    except ImportError as exc:
+        console.print("[red]The TUI needs the optional `textual` dependency:[/] "
+                      "pip install 'mist-agent[tui]'")
+        raise typer.Exit(1) from exc
+    agent = _build_agent(config, backend, model, base_url)
+    MistTUI(agent).run()
+
+
 if __name__ == "__main__":
     app()

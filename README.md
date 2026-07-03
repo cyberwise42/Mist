@@ -27,6 +27,11 @@ context tiny and the model's output constrained.
 6. **Compaction over accumulation.** Old sessions don't just sit in SQLite —
    `mist compact` folds each one into a handful of durable memories via a
    single LLM call, then never touches it again.
+7. **Streaming is a separate concern from constrained decoding.** Streaming a
+   JSON-wrapped action token-by-token would surface raw JSON syntax to the
+   user, so the streaming TUI decides respond-vs-tool with one small
+   constrained call, then streams the answer itself as free, unconstrained
+   text.
 
 ## Running on Apple Silicon (M4 Pro / M4 Max)
 
@@ -62,6 +67,9 @@ mist chat --backend ollama --model qwen2.5:14b
 # vLLM backend (OpenAI-compatible server, e.g. a remote GPU box)
 mist chat --backend vllm --base-url http://localhost:8000/v1 --model Qwen/Qwen2.5-14B-Instruct
 
+# Full-screen streaming TUI (needs the optional `textual` extra, see below)
+mist tui
+
 # Fold old sessions into long-term memory
 mist compact
 ```
@@ -75,6 +83,7 @@ mist/
   memory/     # SQLite store: sessions, memories, FTS5 search, compaction tracking
   skills/     # skill loader, router (two-tier, keyword-first with embedding fallback)
   tools/      # built-in tools + registry + JSON-schema constraints
+  tui/        # full-screen streaming TUI (Textual)
 skills_library/  # SKILL.md files (portable, agentskills.io-style)
 tests/
 ```
@@ -113,10 +122,35 @@ single LLM call that extracts durable facts/preferences/notes, written to the
 then marked compacted and skipped by future runs. Options:
 `mist compact --keep-recent 2 --min-turns 6`.
 
+## Streaming TUI
+
+```bash
+pip install -e ".[tui]"   # or ".[dev]", which already includes it
+mist tui
+```
+
+A full-screen chat, in the spirit of Hermes:
+
+- **Live token streaming** — the answer appears as the model generates it,
+  not after a full round trip. Tool calls and their results also appear live
+  as they happen.
+- **Message queuing** — typing and submitting while a turn is in flight never
+  blocks; the message is queued and dispatched automatically as soon as the
+  current turn finishes. The status line shows how many are queued.
+- **Ctrl+C interrupts, it doesn't quit** — cancels only the in-flight turn
+  (whatever was streaming or mid-tool-call is discarded) and returns to idle,
+  picking up the next queued message if there is one. `Ctrl+Q` quits the app.
+
+This is powered by `MistAgent.astream_turn()`, an async generator that
+decides respond-vs-tool with one small constrained call and then streams the
+answer as free text (see design principle 7 above); `mist chat`/`mist ask`
+still use the original synchronous `turn()`.
+
 ## Status
 
 Early scaffold. Core loop, memory store, skill router, batch summarizer,
-subagent spawning, and both backends are functional; expect rough edges.
+subagent spawning, streaming TUI, and both backends are functional; expect
+rough edges.
 
 ## License
 

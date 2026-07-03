@@ -19,7 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
+tui = ["textual>=0.58"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4", "textual>=0.58"]
 
 [project.scripts]
 mist = "mist.cli:app"
@@ -29,3 +30,6 @@ packages = ["mist"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -67,6 +67,23 @@ class ToolRegistry:
             "additionalProperties": False,
         }
 
+    def decision_schema(self, tools: list[Tool]) -> dict[str, Any]:
+        """Like action_schema, but with no `response` field: used by the
+        streaming agent loop, which decides respond-vs-tool in one small
+        (non-streamed) call and only generates the actual answer text — as a
+        second, unconstrained, streamed call — once "respond" is decided.
+        Keeps token-by-token streaming free of JSON wrapper syntax."""
+        return {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["respond", "use_tool"]},
+                "tool": {"type": "string", "enum": [t.name for t in tools] or ["none"]},
+                "arguments": {"type": "object"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Built-in tools
