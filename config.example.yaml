@@ -1,0 +1,26 @@
+# Mist configuration. Copy to ~/.mist/config.yaml or pass with --config.
+
+backend: ollama            # ollama | vllm
+model: qwen2.5:7b
+base_url: http://localhost:11434   # vllm example: http://localhost:8000/v1
+api_key: ""                # only needed for secured vLLM deployments
+
+context:
+  token_budget: 6000       # hard cap on assembled prompt
+  history_turns: 6         # recent turns kept verbatim
+  max_tool_output_chars: 2000  # tool results truncated beyond this
+
+memory:
+  db_path: ~/.mist/mist.db
+  top_k: 3                 # memory snippets retrieved per turn
+
+skills:
+  library_path: skills_library
+  max_candidates: 4        # skill descriptions surfaced per turn
+
+tools:
+  max_exposed: 5           # tools exposed to the model per call
+
+generation:
+  temperature: 0.2
+  max_tokens: 1024
