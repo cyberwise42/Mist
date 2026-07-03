@@ -1,7 +1,20 @@
 # Mist configuration. Copy to ~/.mist/config.yaml or pass with --config.
 
+# --- Apple Silicon notes (M4 Pro / M4 Max) ------------------------------
+# Ollama runs great locally via Metal and is the right choice for everyday
+# local chat on a Mac. vLLM does not accelerate on Apple GPUs (CUDA/ROCm
+# only) — point `base_url` at a remote vLLM server (a rented GPU box, a
+# workstation on your LAN, etc.) if you want vLLM's continuous batching,
+# especially for the `spawn_subagents` tool below.
+#
+# Model sizing by unified memory (Ollama's default tags are already
+# Q4_K_M-quantized, leaving headroom for the OS and the embedding model):
+#   36-48 GB : qwen2.5:14b   (default below)
+#   64 GB    : qwen2.5:32b
+#   128 GB   : qwen2.5:32b (fp16) or llama3.1:70b
+
 backend: ollama            # ollama | vllm
-model: qwen2.5:7b
+model: qwen2.5:14b
 base_url: http://localhost:11434   # vllm example: http://localhost:8000/v1
 api_key: ""                # only needed for secured vLLM deployments
 
@@ -13,13 +26,27 @@ context:
 memory:
   db_path: ~/.mist/mist.db
   top_k: 3                 # memory snippets retrieved per turn
+  keep_recent_sessions: 1  # sessions `mist compact` always leaves alone
+  compact_min_turns: 4     # sessions shorter than this are skipped
 
 skills:
   library_path: skills_library
   max_candidates: 4        # skill descriptions surfaced per turn
 
+embeddings:
+  enabled: true
+  backend: ollama           # ollama | vllm
+  model: bge-small           # `ollama pull bge-small`
+  base_url: http://localhost:11434
+  api_key: ""
+  similarity_threshold: 0.35  # min cosine similarity to accept a semantic skill match
+
 tools:
   max_exposed: 5           # tools exposed to the model per call
+
+subagents:
+  enabled: true
+  max_workers: 4            # concurrent subagent calls; raise this against vLLM
 
 generation:
   temperature: 0.2

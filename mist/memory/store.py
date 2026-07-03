@@ -14,7 +14,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at REAL NOT NULL,
-    title TEXT DEFAULT ''
+    title TEXT DEFAULT '',
+    compacted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +48,18 @@ class MemoryStore:
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a DB's initial creation. CREATE TABLE
+        IF NOT EXISTS above is a no-op on pre-existing tables, so new columns
+        need an explicit, idempotent ALTER TABLE here."""
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "compacted" not in cols:
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
 
     # -- sessions ------------------------------------------------------
     def new_session(self, title: str = "") -> int:
@@ -71,6 +84,34 @@ class MemoryStore:
             (session_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def all_turns(self, session_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT role, content FROM turns WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- compaction ------------------------------------------------------
+    def sessions_to_compact(self, exclude_session_id: int | None,
+                             keep_recent: int = 1, min_turns: int = 4) -> list[int]:
+        """Uncompacted sessions with at least ``min_turns`` turns, most recent
+        first, excluding the active session and the ``keep_recent`` newest
+        of what remains (so a session in progress is never folded away)."""
+        rows = self.conn.execute(
+            "SELECT s.id FROM sessions s "
+            "JOIN (SELECT session_id, COUNT(*) c FROM turns GROUP BY session_id) t "
+            "ON t.session_id = s.id "
+            "WHERE s.compacted = 0 AND t.c >= ? "
+            "ORDER BY s.id DESC",
+            (min_turns,),
+        ).fetchall()
+        ids = [r["id"] for r in rows if r["id"] != exclude_session_id]
+        return ids[keep_recent:]
+
+    def mark_compacted(self, session_id: int) -> None:
+        self.conn.execute("UPDATE sessions SET compacted = 1 WHERE id = ?", (session_id,))
+        self.conn.commit()
 
     # -- memories ------------------------------------------------------
     def remember(self, content: str, kind: str = "note") -> int:

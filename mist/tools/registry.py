@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from mist.core.subagent import format_results, run_subagents
+from mist.llm.client import LLMClient
 
 
 @dataclass
@@ -93,7 +97,9 @@ def _shell(command: str) -> str:
         return "ERROR: command timed out after 60s"
 
 
-def default_registry(remember_fn: Callable[[str], Any] | None = None) -> ToolRegistry:
+def default_registry(remember_fn: Callable[[str], Any] | None = None,
+                      llm: LLMClient | None = None,
+                      max_subagent_workers: int = 4) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
@@ -131,5 +137,26 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None) -> ToolReg
                         "required": ["content"]},
             fn=lambda content: (remember_fn(content), f"Remembered: {content}")[1],
             keywords={"remember", "memory", "note", "save", "preference"},
+        ))
+    if llm is not None:
+        def _spawn_subagents(tasks: list[str]) -> str:
+            start = time.monotonic()
+            results = run_subagents(llm, tasks, max_workers=max_subagent_workers)
+            return format_results(results, time.monotonic() - start)
+
+        reg.register(Tool(
+            name="spawn_subagents",
+            description=(
+                "Run multiple independent subtasks concurrently as isolated subagents "
+                "(no shared context between them). Most effective against a vLLM "
+                "backend, whose continuous batching processes concurrent requests "
+                "together for near-parallel throughput."
+            ),
+            parameters={"type": "object",
+                        "properties": {"tasks": {"type": "array",
+                                                  "items": {"type": "string"}}},
+                        "required": ["tasks"]},
+            fn=_spawn_subagents,
+            keywords={"parallel", "subagent", "subagents", "spawn", "batch", "concurrent"},
         ))
     return reg
