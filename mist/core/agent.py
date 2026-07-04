@@ -36,7 +36,6 @@ from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.registry import ToolRegistry
 
-MAX_TOOL_STEPS = 8
 MAX_DECISION_RETRIES = 2
 
 SYSTEM_TEMPLATE = """You are Mist, a precise local agent. Follow instructions exactly.
@@ -179,7 +178,7 @@ class MistAgent:
         messages = _fit_budget(messages, self.cfg.context.token_budget)
 
         trace: list[str] = []
-        for _ in range(MAX_TOOL_STEPS):
+        for _ in range(self.cfg.context.max_tool_steps):
             raw = self.llm.complete(messages, json_schema=schema)
             try:
                 action = parse_json_relaxed(raw)
@@ -241,7 +240,7 @@ class MistAgent:
         )
 
         trace: list[str] = []
-        for _ in range(MAX_TOOL_STEPS):
+        for _ in range(self.cfg.context.max_tool_steps):
             action = None
             for _attempt in range(MAX_DECISION_RETRIES):
                 raw = await self.llm.acomplete(messages, json_schema=schema)

@@ -1,16 +1,20 @@
 import asyncio
 import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from mist.config import MistConfig
 from mist.core.agent import MistAgent
-from mist.core.subagent import run_subagents
+from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.registry import default_registry
 from mist.llm.client import parse_json_relaxed
+from mist.wiki import init_wiki
 
 
 class FakeLLM:
@@ -40,6 +44,16 @@ class FakeEmbeddings:
         return [[1.0, 0.0] if t == self.GIT_WORKFLOW_TEXT else [0.9, 0.1] for t in texts]
 
 
+def _isolated_skills_library(tmp_path) -> Path:
+    """A skills_library containing only the git-workflow example skill,
+    isolated from whatever else has since been added to the real
+    skills_library/ (e.g. pentest-wiki) — these routing tests assert on
+    exact rank/threshold behavior against a single known skill."""
+    dest = tmp_path / "skills_library"
+    shutil.copytree(Path("skills_library") / "example", dest / "example")
+    return dest
+
+
 def make_agent(tmp_path, replies):
     cfg = MistConfig()
     cfg.memory.db_path = str(tmp_path / "test.db")
@@ -57,8 +71,8 @@ def test_memory_fts_roundtrip(tmp_path):
     assert any("Python" in h for h in hits)
 
 
-def test_skill_routing():
-    router = SkillRouter("skills_library")
+def test_skill_routing(tmp_path):
+    router = SkillRouter(_isolated_skills_library(tmp_path))
     hits = router.route("help me commit my git changes")
     assert hits and hits[0].name == "git-workflow"
     assert router.route("bake a chocolate cake") == []
@@ -106,24 +120,24 @@ def test_parse_json_relaxed_fenced():
 
 # -- embedding fallback for skill routing --------------------------------
 
-def test_skill_routing_falls_back_to_embeddings_when_lexical_fails():
-    router = SkillRouter("skills_library", embeddings=FakeEmbeddings(),
+def test_skill_routing_falls_back_to_embeddings_when_lexical_fails(tmp_path):
+    router = SkillRouter(_isolated_skills_library(tmp_path), embeddings=FakeEmbeddings(),
                          embedding_threshold=0.5)
     # Shares no tokens with the git-workflow skill's name/description.
     hits = router.route("how do I track changes to my project over time")
     assert hits and hits[0].name == "git-workflow"
 
 
-def test_skill_routing_embedding_fallback_respects_threshold():
-    router = SkillRouter("skills_library", embeddings=FakeEmbeddings(),
+def test_skill_routing_embedding_fallback_respects_threshold(tmp_path):
+    router = SkillRouter(_isolated_skills_library(tmp_path), embeddings=FakeEmbeddings(),
                          embedding_threshold=0.999)
     assert router.route("how do I track changes to my project over time") == []
 
 
-def test_skill_routing_prefers_lexical_over_embeddings():
+def test_skill_routing_prefers_lexical_over_embeddings(tmp_path):
     # Lexical match exists, so the (deliberately wrong) fake embeddings must
     # never be consulted.
-    router = SkillRouter("skills_library", embeddings=FakeEmbeddings())
+    router = SkillRouter(_isolated_skills_library(tmp_path), embeddings=FakeEmbeddings())
     hits = router.route("help me commit my git changes")
     assert hits and hits[0].name == "git-workflow"
 
@@ -203,6 +217,172 @@ def test_default_registry_exposes_spawn_subagents_with_llm():
     assert tool is not None
     out = tool.run(tasks=["do x"])
     assert "do x" in out and "handled: do x" in out
+
+
+# -- tool-enabled subagents (mist.core.subagent.run_tool_subagents) ------
+
+class ToolEchoLLM:
+    """Thread-safe fake LLM for the tool-enabled subagent loop: on the task
+    message it requests the shell tool (echoing the task text back), then on
+    the tool result it responds with that result. Keyed off message content,
+    not call order, so it's safe under concurrent callers."""
+    def complete(self, messages, json_schema=None):
+        last = messages[-1]["content"]
+        if last.startswith("Tool result:"):
+            return json.dumps({"action": "respond", "response": last})
+        return json.dumps({"action": "use_tool", "tool": "shell",
+                            "arguments": {"command": f"echo {last}"}})
+
+
+def test_run_tool_subagents_concurrent_with_shell():
+    tools = default_registry(remember_fn=lambda c: None)
+    tasks = ["alpha", "beta", "gamma"]
+    results = run_tool_subagents(ToolEchoLLM(), tools, tasks, max_workers=3, max_steps=3)
+    assert {r.task for r in results} == set(tasks)
+    for r in results:
+        assert r.error is None
+        assert r.task in r.response  # echoed back via the shell tool result
+
+
+def test_run_tool_subagents_empty_tasks():
+    tools = default_registry(remember_fn=lambda c: None)
+    assert run_tool_subagents(ToolEchoLLM(), tools, [], max_workers=4) == []
+
+
+def test_default_registry_omits_write_skill_without_skills():
+    tools = default_registry(remember_fn=lambda c: None)
+    assert tools.get("write_skill") is None
+
+
+def test_default_registry_exposes_write_skill_with_skills(tmp_path):
+    router = SkillRouter(tmp_path / "skills_library")
+    tools = default_registry(remember_fn=lambda c: None, skills=router)
+    assert tools.get("write_skill") is not None
+
+
+# -- self-growing skill wiki (write_skill tool + SkillRouter.reload) -----
+
+def test_skill_router_reload_picks_up_new_skill(tmp_path):
+    library = tmp_path / "skills_library"
+    router = SkillRouter(library)
+    assert router.route("exploit a confirmed sql injection") == []
+
+    skill_dir = library / "sql-injection"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: sql-injection\ndescription: confirmed sql injection exploit\n---\n\nbody",
+        encoding="utf-8",
+    )
+    # Not loaded yet — the router only re-scans on reload().
+    assert router.route("exploit a confirmed sql injection") == []
+
+    router.reload()
+    hits = router.route("exploit a confirmed sql injection")
+    assert hits and hits[0].name == "sql-injection"
+
+
+def test_write_skill_tool_writes_file_and_is_immediately_routable(tmp_path):
+    library = tmp_path / "skills_library"
+    router = SkillRouter(library)
+    tools = default_registry(remember_fn=lambda c: None, skills=router)
+    tool = tools.get("write_skill")
+
+    result = tool.run(name="SQL Injection Basics",
+                      description="confirmed basic sql injection technique",
+                      body="1. Identify the vulnerable parameter.\n2. Confirm with a payload.")
+    assert "Wrote skill" in result
+    written = library / "sql-injection-basics" / "SKILL.md"
+    assert written.is_file()
+    assert "confirmed basic sql injection technique" in written.read_text()
+
+    # write_skill reloads internally, so it's routable without a manual call.
+    hits = router.route("confirmed basic sql injection technique")
+    assert hits and hits[0].name == "sql-injection-basics"
+
+
+def test_write_skill_rejects_invalid_name(tmp_path):
+    library = tmp_path / "skills_library"
+    router = SkillRouter(library)
+    tools = default_registry(remember_fn=lambda c: None, skills=router)
+    tool = tools.get("write_skill")
+
+    result = tool.run(name="   ", description="x", body="y")
+    assert result.startswith("ERROR")
+    assert not library.exists() or not any(library.iterdir())
+
+
+# -- memory store concurrency (mist.memory.store.MemoryStore) -----------
+
+def test_memory_store_concurrent_writes_dont_corrupt(tmp_path):
+    store = MemoryStore(tmp_path / "concurrent.db")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: store.remember(f"memory {i}"), range(50)))
+    count = store.conn.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
+    assert count == 50
+
+
+# -- llm-wiki: search_files tool -----------------------------------------
+
+def test_search_files_finds_matching_line_with_file_and_lineno(tmp_path):
+    (tmp_path / "entities").mkdir()
+    (tmp_path / "entities" / "target-a.md").write_text(
+        "---\ntitle: Target A\n---\n\nRunning nginx 1.18.0 on port 80.\n", encoding="utf-8"
+    )
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+    out = tools.get("search_files").run(query="nginx")
+    assert "entities/target-a.md:5:" in out
+    assert "nginx 1.18.0" in out
+
+
+def test_search_files_respects_max_results(tmp_path):
+    for i in range(5):
+        (tmp_path / f"page{i}.md").write_text("needle\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+    out = tools.get("search_files").run(query="needle", max_results=2)
+    assert len(out.splitlines()) == 2
+
+
+def test_search_files_no_matches_returns_message(tmp_path):
+    (tmp_path / "page.md").write_text("nothing relevant here\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+    assert tools.get("search_files").run(query="needle") == "No matches."
+
+
+def test_search_files_missing_root_returns_error():
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=None)
+    out = tools.get("search_files").run(query="anything")
+    assert out.startswith("ERROR")
+
+
+def test_default_registry_exposes_search_files():
+    tools = default_registry(remember_fn=lambda c: None)
+    assert tools.get("search_files") is not None
+
+
+# -- llm-wiki: init_wiki scaffold ----------------------------------------
+
+def test_init_wiki_creates_expected_skeleton(tmp_path):
+    root = tmp_path / "wiki"
+    created = init_wiki(root)
+    assert set(created) == {
+        "raw/", "entities/", "concepts/", "comparisons/", "queries/",
+        "SCHEMA.md", "index.md", "log.md",
+    }
+    for sub in ("raw", "entities", "concepts", "comparisons", "queries"):
+        assert (root / sub).is_dir()
+    for name in ("SCHEMA.md", "index.md", "log.md"):
+        assert (root / name).is_file()
+
+
+def test_init_wiki_is_idempotent_and_does_not_clobber(tmp_path):
+    root = tmp_path / "wiki"
+    init_wiki(root)
+    custom = "# My custom schema\ntag: my-custom-tag\n"
+    (root / "SCHEMA.md").write_text(custom, encoding="utf-8")
+
+    second_run = init_wiki(root)
+    assert second_run == []
+    assert (root / "SCHEMA.md").read_text(encoding="utf-8") == custom
 
 
 # -- streaming turn interface (mist.core.agent.MistAgent.astream_turn) ---

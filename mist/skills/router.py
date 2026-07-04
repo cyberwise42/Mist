@@ -47,19 +47,30 @@ class SkillRouter:
     def __init__(self, library_path: str | Path,
                  embeddings: EmbeddingClient | None = None,
                  embedding_threshold: float = 0.35):
-        self.skills: list[Skill] = []
+        self.library_path = Path(library_path)
         self.embeddings = embeddings
         self.embedding_threshold = embedding_threshold
+        self.skills: list[Skill] = []
         self._skill_vecs: list[list[float]] | None = None
-        root = Path(library_path)
-        if root.is_dir():
-            for md in sorted(root.rglob("SKILL.md")):
+        self._load()
+
+    def _load(self) -> None:
+        self.skills = []
+        if self.library_path.is_dir():
+            for md in sorted(self.library_path.rglob("SKILL.md")):
                 meta = _parse_frontmatter(md.read_text(encoding="utf-8"))
                 self.skills.append(Skill(
                     name=meta.get("name", md.parent.name),
                     description=meta.get("description", ""),
                     path=md,
                 ))
+
+    def reload(self) -> None:
+        """Re-scan the skills library and drop the stale embedding cache.
+        Called after `write_skill` writes a new SKILL.md so it becomes
+        routable in the same process, without a restart."""
+        self._load()
+        self._skill_vecs = None
 
     def _skill_text(self, skill: Skill) -> str:
         return f"{skill.name}: {skill.description}"

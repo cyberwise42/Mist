@@ -12,6 +12,8 @@ class ContextConfig(BaseModel):
     token_budget: int = 6000
     history_turns: int = 6
     max_tool_output_chars: int = 2000
+    max_tool_steps: int = 8  # bound on tool calls per turn; raise for longer chains
+                             # (multi-step recon, full llm-wiki ingest) on stronger models
 
 
 class MemoryConfig(BaseModel):
@@ -24,6 +26,10 @@ class MemoryConfig(BaseModel):
 class SkillsConfig(BaseModel):
     library_path: str = "skills_library"
     max_candidates: int = 4
+
+
+class WikiConfig(BaseModel):
+    root_path: str = "~/.mist/wiki"
 
 
 class EmbeddingConfig(BaseModel):
@@ -42,6 +48,8 @@ class ToolsConfig(BaseModel):
 class SubagentConfig(BaseModel):
     enabled: bool = True
     max_workers: int = 4    # concurrent subagent calls; raise this against vLLM
+    tools_enabled: bool = True  # give subagents their own read/write/shell/remember loop
+    max_steps: int = 6      # bounded tool-loop length per subagent task
 
 
 class GenerationConfig(BaseModel):
@@ -57,6 +65,7 @@ class MistConfig(BaseModel):
     context: ContextConfig = Field(default_factory=ContextConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    wiki: WikiConfig = Field(default_factory=WikiConfig)
     embeddings: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
@@ -65,6 +74,10 @@ class MistConfig(BaseModel):
     @property
     def db_path(self) -> Path:
         return Path(os.path.expanduser(self.memory.db_path))
+
+    @property
+    def wiki_root(self) -> Path:
+        return Path(os.path.expanduser(self.wiki.root_path))
 
 
 def load_config(path: str | None = None) -> MistConfig:

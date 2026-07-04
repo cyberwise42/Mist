@@ -7,6 +7,7 @@ query terms come from the current user message.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -46,13 +47,16 @@ class MemoryStore:
     def __init__(self, db_path: str | Path):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False: the streaming TUI calls into this store via
-        # asyncio.to_thread (a different worker thread per call) to avoid
-        # blocking the event loop. Access is always sequential — one turn in
-        # flight at a time — never truly concurrent, so this is safe here.
+        # asyncio.to_thread (a different worker thread per call), and
+        # tool-enabled subagents now call `remember`/`add_turn` from a
+        # ThreadPoolExecutor genuinely concurrently. check_same_thread=False
+        # only lifts sqlite3's thread-affinity check — it does not serialize
+        # writes, so `_lock` below guards every write path.
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self._lock = threading.Lock()
 
     def _migrate(self) -> None:
         """Add columns introduced after a DB's initial creation. CREATE TABLE
@@ -67,19 +71,21 @@ class MemoryStore:
 
     # -- sessions ------------------------------------------------------
     def new_session(self, title: str = "") -> int:
-        cur = self.conn.execute(
-            "INSERT INTO sessions (created_at, title) VALUES (?, ?)",
-            (time.time(), title),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO sessions (created_at, title) VALUES (?, ?)",
+                (time.time(), title),
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
     def add_turn(self, session_id: int, role: str, content: str) -> None:
-        self.conn.execute(
-            "INSERT INTO turns (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, time.time()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO turns (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, time.time()),
+            )
+            self.conn.commit()
 
     def recent_turns(self, session_id: int, limit: int) -> list[dict]:
         rows = self.conn.execute(
@@ -114,17 +120,19 @@ class MemoryStore:
         return ids[keep_recent:]
 
     def mark_compacted(self, session_id: int) -> None:
-        self.conn.execute("UPDATE sessions SET compacted = 1 WHERE id = ?", (session_id,))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("UPDATE sessions SET compacted = 1 WHERE id = ?", (session_id,))
+            self.conn.commit()
 
     # -- memories ------------------------------------------------------
     def remember(self, content: str, kind: str = "note") -> int:
-        cur = self.conn.execute(
-            "INSERT INTO memories (content, kind, created_at) VALUES (?, ?, ?)",
-            (content, kind, time.time()),
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO memories (content, kind, created_at) VALUES (?, ?, ?)",
+                (content, kind, time.time()),
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
     def search(self, query: str, top_k: int = 3) -> list[str]:
         """FTS5 search; falls back to recency if the query has no usable terms."""

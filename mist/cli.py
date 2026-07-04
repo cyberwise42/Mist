@@ -1,6 +1,8 @@
 """Mist CLI."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 from rich.console import Console
 
@@ -12,6 +14,7 @@ from mist.llm.embeddings import EmbeddingClient
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.registry import default_registry
+from mist.wiki import init_wiki
 
 app = typer.Typer(add_completion=False, help="Mist — context-frugal agent for small local LLMs")
 console = Console()
@@ -46,6 +49,10 @@ def _build_agent(config_path: str | None, backend: str | None,
         remember_fn=store.remember,
         llm=llm if cfg.subagents.enabled else None,
         max_subagent_workers=cfg.subagents.max_workers,
+        skills=skills,
+        max_subagent_steps=cfg.subagents.max_steps,
+        subagent_tools_enabled=cfg.subagents.tools_enabled,
+        wiki_root=cfg.wiki_root,
     )
     return MistAgent(cfg, llm, store, skills, tools)
 
@@ -111,6 +118,22 @@ def compact(config: str = typer.Option(None, help="Path to config.yaml"),
                   f"memor{'y' if total == 1 else 'ies'}.")
     for r in results:
         console.print(f"  [dim]session {r.session_id}: {r.memories_written} memories[/]")
+
+
+@app.command(name="wiki-init")
+def wiki_init(config: str = typer.Option(None, help="Path to config.yaml"),
+              root: str = typer.Option(None, help="Override the configured wiki root")):
+    """Scaffold the wiki skeleton (SCHEMA.md, index.md, log.md, and
+    raw/entities/concepts/comparisons/queries dirs) if not already present."""
+    cfg = load_config(config)
+    target = Path(root).expanduser() if root else cfg.wiki_root
+    created = init_wiki(target)
+    if not created:
+        console.print(f"[dim]Wiki already initialized at {target}.[/]")
+        return
+    console.print(f"Initialized wiki at {target}:")
+    for path in created:
+        console.print(f"  [dim]created {path}[/]")
 
 
 @app.command()

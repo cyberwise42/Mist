@@ -22,6 +22,9 @@ context:
   token_budget: 6000       # hard cap on assembled prompt
   history_turns: 6         # recent turns kept verbatim
   max_tool_output_chars: 2000  # tool results truncated beyond this
+  max_tool_steps: 8        # tool calls allowed per turn before giving up;
+                           # raise this on stronger models or for long tool
+                           # chains (multi-step recon, a full llm-wiki ingest)
 
 memory:
   db_path: ~/.mist/mist.db
@@ -32,6 +35,9 @@ memory:
 skills:
   library_path: skills_library
   max_candidates: 4        # skill descriptions surfaced per turn
+
+wiki:
+  root_path: ~/.mist/wiki   # run `mist wiki-init` once to scaffold it
 
 embeddings:
   enabled: true
@@ -47,6 +53,8 @@ tools:
 subagents:
   enabled: true
   max_workers: 4            # concurrent subagent calls; raise this against vLLM
+  tools_enabled: true       # give each subagent its own read/write/shell/remember loop
+  max_steps: 6              # bounded tool-loop length per subagent task
 
 generation:
   temperature: 0.2
