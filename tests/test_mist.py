@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mist.config import MistConfig
+from mist.config import MistConfig, ShellConfig, ShellSSHConfig
 from mist.core.agent import MistAgent
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
@@ -357,6 +357,62 @@ def test_search_files_missing_root_returns_error():
 def test_default_registry_exposes_search_files():
     tools = default_registry(remember_fn=lambda c: None)
     assert tools.get("search_files") is not None
+
+
+# -- opt-in tool allow-list + SSH shell backend --------------------------
+
+def test_default_registry_enabled_allowlist_restricts_tools(tmp_path):
+    skills = SkillRouter(tmp_path / "skills_library")
+    tools = default_registry(remember_fn=lambda c: None, llm=EchoLLM(), skills=skills,
+                             enabled=["read_file"])
+    assert tools.get("read_file") is not None
+    assert tools.get("write_file") is None
+    assert tools.get("shell") is None
+    assert tools.get("write_skill") is None
+    assert tools.get("spawn_subagents") is None
+
+
+def test_default_registry_enabled_none_preserves_default_behavior():
+    tools = default_registry(remember_fn=lambda c: None, llm=EchoLLM())
+    assert tools.get("read_file") is not None
+    assert tools.get("shell") is not None
+    assert tools.get("remember") is not None
+    assert tools.get("spawn_subagents") is not None
+
+
+def test_shell_local_backend_unaffected_by_shell_config_none():
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    out = tools.get("shell").run(command="echo local-backend-test")
+    assert "local-backend-test" in out
+
+
+def test_shell_ssh_backend_builds_correct_command(monkeypatch):
+    captured = {}
+
+    class FakeCompleted:
+        stdout = "remote-host\n"
+        stderr = ""
+
+    def fake_run(args, capture_output, text, timeout):
+        captured["args"] = args
+        captured["timeout"] = timeout
+        return FakeCompleted()
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.run", fake_run)
+
+    shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(
+        host="10.0.0.5", user="kali", port=2222, key_path="~/.ssh/id_ed25519", timeout=90,
+    ))
+    tools = default_registry(remember_fn=lambda c: None, shell_config=shell_cfg)
+    out = tools.get("shell").run(command="hostname")
+
+    assert "remote-host" in out
+    args = captured["args"]
+    assert args[0] == "ssh"
+    assert "-p" in args and args[args.index("-p") + 1] == "2222"
+    assert "kali@10.0.0.5" in args
+    assert args[-1] == "hostname"
+    assert captured["timeout"] == 90
 
 
 # -- llm-wiki: init_wiki scaffold ----------------------------------------

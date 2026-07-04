@@ -53,6 +53,8 @@ def _build_agent(config_path: str | None, backend: str | None,
         max_subagent_steps=cfg.subagents.max_steps,
         subagent_tools_enabled=cfg.subagents.tools_enabled,
         wiki_root=cfg.wiki_root,
+        enabled=cfg.tools.enabled,
+        shell_config=cfg.tools.shell,
     )
     return MistAgent(cfg, llm, store, skills, tools)
 

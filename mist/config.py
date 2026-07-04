@@ -41,8 +41,24 @@ class EmbeddingConfig(BaseModel):
     similarity_threshold: float = 0.35  # min cosine similarity to accept a semantic match
 
 
+class ShellSSHConfig(BaseModel):
+    host: str = ""
+    user: str = ""
+    port: int = 22
+    key_path: str = ""
+    timeout: int = 120  # higher than the local backend's 60s: SSH round-trips
+                        # plus real recon commands need more headroom
+
+
+class ShellConfig(BaseModel):
+    backend: str = "local"   # local | ssh
+    ssh: ShellSSHConfig = Field(default_factory=ShellSSHConfig)
+
+
 class ToolsConfig(BaseModel):
     max_exposed: int = 5
+    enabled: list[str] | None = None  # opt-in allow-list; None = every tool Mist supports
+    shell: ShellConfig = Field(default_factory=ShellConfig)
 
 
 class SubagentConfig(BaseModel):

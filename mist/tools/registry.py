@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from mist.config import ShellConfig
 from mist.core.subagent import format_results, run_subagents, run_tool_subagents
 from mist.llm.client import LLMClient
 from mist.skills.router import SkillRouter
@@ -42,6 +43,9 @@ class ToolRegistry:
 
     def all(self) -> list[Tool]:
         return list(self._tools.values())
+
+    def keep_only(self, names: set[str]) -> None:
+        self._tools = {n: t for n, t in self._tools.items() if n in names}
 
     def select(self, query: str, max_exposed: int = 5) -> list[Tool]:
         """Keyword-overlap ranking, same cheap strategy as skill routing.
@@ -137,6 +141,25 @@ def _shell(command: str) -> str:
         return "ERROR: command timed out after 60s"
 
 
+def _make_shell(shell_cfg: ShellConfig | None) -> Callable[..., str]:
+    if shell_cfg is None or shell_cfg.backend == "local":
+        return _shell
+
+    ssh = shell_cfg.ssh
+
+    def _shell_ssh(command: str) -> str:
+        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        if ssh.key_path:
+            args += ["-i", str(Path(ssh.key_path).expanduser())]
+        args += ["-p", str(ssh.port), f"{ssh.user}@{ssh.host}" if ssh.user else ssh.host, command]
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=ssh.timeout)
+            return (out.stdout + out.stderr)[:4000] or "(no output)"
+        except subprocess.TimeoutExpired:
+            return f"ERROR: command timed out after {ssh.timeout}s"
+    return _shell_ssh
+
+
 def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
@@ -184,7 +207,9 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       skills: SkillRouter | None = None,
                       max_subagent_steps: int = 6,
                       subagent_tools_enabled: bool = True,
-                      wiki_root: str | Path | None = None) -> ToolRegistry:
+                      wiki_root: str | Path | None = None,
+                      enabled: list[str] | None = None,
+                      shell_config: ShellConfig | None = None) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
@@ -221,7 +246,7 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
         parameters={"type": "object",
                     "properties": {"command": {"type": "string"}},
                     "required": ["command"]},
-        fn=_shell,
+        fn=_make_shell(shell_config),
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
     ))
     if remember_fn is not None:
@@ -254,7 +279,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
             start = time.monotonic()
             if subagent_tools_enabled:
                 subagent_tools = default_registry(remember_fn=remember_fn, llm=None, skills=None,
-                                                  wiki_root=wiki_root)
+                                                  wiki_root=wiki_root, enabled=enabled,
+                                                  shell_config=shell_config)
                 results = run_tool_subagents(llm, subagent_tools, tasks,
                                              max_workers=max_subagent_workers,
                                              max_steps=max_subagent_steps)
@@ -284,4 +310,6 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
             fn=_spawn_subagents,
             keywords={"parallel", "subagent", "subagents", "spawn", "batch", "concurrent"},
         ))
+    if enabled is not None:
+        reg.keep_only(set(enabled))
     return reg

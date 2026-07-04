@@ -49,6 +49,16 @@ embeddings:
 
 tools:
   max_exposed: 5           # tools exposed to the model per call
+  # enabled: [read_file, write_file, shell, search_files, remember, write_skill, spawn_subagents]
+  #   ^ opt-in allow-list; omit (default) to expose every tool Mist supports
+  shell:
+    backend: local          # local | ssh
+    ssh:
+      host: ""
+      user: ""
+      port: 22
+      key_path: ~/.ssh/id_ed25519
+      timeout: 120
 
 subagents:
   enabled: true
