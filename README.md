@@ -102,6 +102,11 @@ Key knobs:
   fallback for skill routing when keyword overlap is empty
 - `tools.max_exposed` — tools exposed per call (default 5)
 - `subagents.enabled` / `subagents.max_workers` — concurrent subtask fan-out
+- `generation.think` — Ollama only; controls `<think>` reasoning on reasoning-capable models (Qwen3,
+  DeepSeek-R1, ...) for the free-text answer step (default `true` — the model reasons fully over
+  tool output/memory/wiki context; the trace is filtered out of the displayed stream, not the
+  generation). Tool-decision calls always force reasoning off regardless, since valid JSON there is
+  a hard requirement.
 
 ## Subagents
 
@@ -145,6 +150,71 @@ This is powered by `MistAgent.astream_turn()`, an async generator that
 decides respond-vs-tool with one small constrained call and then streams the
 answer as free text (see design principle 7 above); `mist chat`/`mist ask`
 still use the original synchronous `turn()`.
+
+### Commands
+
+Both `mist tui` and `mist chat` show a welcome banner and accept the same
+`/`-prefixed commands at the prompt:
+
+| Command           | Description                                          |
+|-------------------|-------------------------------------------------------|
+| `/help`           | Show the command reference                            |
+| `/clear`          | Clear the visible transcript                           |
+| `/new`            | Start a fresh session (new memory context)             |
+| `/models`         | List models available on the backend (`*` = active)    |
+| `/model [name]`   | Show the active model, or switch to `<name>`           |
+| `/mission <goal>` | Work an objective autonomously until done (`mist tui` only) |
+| `/pause`          | Pause the running mission after its current step        |
+| `/resume`         | Resume a paused mission                                 |
+| `/kill`           | Stop the running mission immediately (Ctrl+C also works)|
+| `/compact`        | Fold old sessions into long-term memory now             |
+| `/quit`, `/exit`  | Quit                                                    |
+
+`/model <name>` switches the model **immediately, mid-session** — useful for
+an operator who has pulled many Ollama models for different purposes (e.g. a
+fast triage model vs. a larger one for exploit reasoning). It doesn't touch
+session memory, so history and retrieved context carry over to the new
+model. If the name isn't in `/models`' listing it warns but switches anyway
+(the next turn fails if the model actually isn't servable).
+
+### Mission mode: autonomous objective completion
+
+`/mission <goal>` (in `mist tui`) drives `MistAgent.astream_mission`: an
+autonomous, multi-turn loop that keeps working an objective — e.g. "enumerate
+and fully compromise 10.129.30.111" — without waiting for per-turn
+confirmation. Each time the model would otherwise stop and report a status,
+the mission synthesizes the next turn itself and keeps going, until:
+
+- the model calls `finish_objective` (a tool always available during a
+  mission, regardless of keyword routing) because the goal is genuinely met;
+- it hits `mission.max_turns` or `mission.max_seconds`;
+- it repeats the exact same tool call `mission.stuck_repeat_threshold` times
+  in a row, in which case it auto-pauses for operator review rather than
+  looping forever; or
+- the operator intervenes.
+
+**Operator controls, while a mission runs:**
+- **Pause / resume** (`/pause`, `/resume`) are cooperative — checked only
+  between turns, so an in-flight tool call always finishes cleanly rather
+  than being cut off mid-command.
+- **Kill** (`/kill`, or Ctrl+C) stops immediately, including terminating a
+  live subprocess (e.g. a long nmap scan) — cancelling the asyncio task alone
+  can't do that, since a blocking subprocess in a worker thread keeps running
+  regardless, so the shell tool registers its process with a
+  `ProcessRegistry` that kill reaches into directly.
+- **Steering**: plain typed messages (no leading `/`) while a mission is
+  running are folded in as operator notes for its *next* step, instead of
+  starting a separate ad hoc turn against the same session.
+
+**Guaranteed documentation**: every tool call and result during a mission is
+appended to `<wiki_root>/missions/<id>.md` automatically, regardless of
+whether the model also chose to `remember` or `write_file` a curated page —
+so a mission's actions are never silently lost even if the model doesn't
+bother to document them itself.
+
+Mission mode is TUI-only: `mist chat`'s plain synchronous REPL can't run a
+turn in the background while also accepting `/pause` input, so `/mission`
+there just points you at `mist tui`.
 
 ## Status
 

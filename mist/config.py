@@ -71,6 +71,14 @@ class SubagentConfig(BaseModel):
 class GenerationConfig(BaseModel):
     temperature: float = 0.2
     max_tokens: int = 1024
+    think: bool = True  # reasoning-model <think> traces on the free-text answer step;
+                        # forced off regardless on schema-constrained calls (see LLMClient)
+
+
+class MissionConfig(BaseModel):
+    max_turns: int = 40          # autonomous turns before a mission force-stops
+    max_seconds: float = 3600.0  # wall-clock budget before a mission force-stops
+    stuck_repeat_threshold: int = 3  # identical tool+args calls in a row -> auto-pause
 
 
 class MistConfig(BaseModel):
@@ -86,6 +94,7 @@ class MistConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
+    mission: MissionConfig = Field(default_factory=MissionConfig)
 
     @property
     def db_path(self) -> Path:

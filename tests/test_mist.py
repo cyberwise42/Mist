@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -8,11 +9,12 @@ import pytest
 
 from mist.config import MistConfig, ShellConfig, ShellSSHConfig
 from mist.core.agent import MistAgent
+from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
-from mist.tools.registry import default_registry
+from mist.tools.registry import ProcessRegistry, default_registry
 from mist.llm.client import parse_json_relaxed
 from mist.wiki import init_wiki
 
@@ -389,16 +391,17 @@ def test_shell_local_backend_unaffected_by_shell_config_none():
 def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     captured = {}
 
-    class FakeCompleted:
-        stdout = "remote-host\n"
-        stderr = ""
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text):
+            captured["args"] = args
+            captured["shell"] = shell
+            self.returncode = 0
 
-    def fake_run(args, capture_output, text, timeout):
-        captured["args"] = args
-        captured["timeout"] = timeout
-        return FakeCompleted()
+        def communicate(self, timeout=None):
+            captured["timeout"] = timeout
+            return ("remote-host\n", None)
 
-    monkeypatch.setattr("mist.tools.registry.subprocess.run", fake_run)
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
 
     shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(
         host="10.0.0.5", user="kali", port=2222, key_path="~/.ssh/id_ed25519", timeout=90,
@@ -413,6 +416,47 @@ def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     assert "kali@10.0.0.5" in args
     assert args[-1] == "hostname"
     assert captured["timeout"] == 90
+    assert captured["shell"] is False
+
+
+# -- process registry (operator kill actually terminates a running command) -
+
+def test_process_registry_kill_active_terminates_running_process():
+    proc = subprocess.Popen(["sleep", "5"])
+    registry = ProcessRegistry()
+    registry.set(proc)
+    assert registry.kill_active() is True
+    proc.wait(timeout=3)
+    assert proc.returncode is not None and proc.returncode != 0
+
+
+def test_process_registry_kill_active_returns_false_when_nothing_running():
+    registry = ProcessRegistry()
+    assert registry.kill_active() is False
+
+
+def test_shell_tool_registers_and_clears_process_registry():
+    registry = ProcessRegistry()
+    tools = default_registry(remember_fn=lambda c: None, process_registry=registry)
+    out = tools.get("shell").run(command="echo hi")
+    assert "hi" in out
+    assert registry.kill_active() is False  # cleared after completion
+
+
+def test_finish_objective_tool_always_registered():
+    tools = default_registry(remember_fn=lambda c: None)
+    tool = tools.get("finish_objective")
+    assert tool is not None
+    assert "done" in tool.run(summary="user + root flags captured").lower() or \
+        "complete" in tool.run(summary="user + root flags captured").lower()
+
+
+def test_tool_select_always_forces_inclusion_regardless_of_ranking():
+    tools = default_registry(remember_fn=lambda c: None)
+    selected = tools.select("totally unrelated query about baking",
+                            max_exposed=2, always={"finish_objective"})
+    assert any(t.name == "finish_objective" for t in selected)
+    assert len(selected) == 2
 
 
 # -- llm-wiki: init_wiki scaffold ----------------------------------------
@@ -465,6 +509,20 @@ class GatedAsyncLLM:
         await self.release.wait()
         for c in chunks:
             yield c
+
+
+class ScriptedAsyncLLM:
+    """Async fake LLM that pops scripted decisions in call order and streams
+    a fixed reply — enough to drive multiple astream_turn() calls across an
+    astream_mission() run without racing against real time."""
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+
+    async def acomplete(self, messages, json_schema=None):
+        return self.decisions.pop(0)
+
+    async def astream(self, messages):
+        yield "status"
 
 
 def make_async_agent(tmp_path, llm):
@@ -636,6 +694,191 @@ async def test_tui_ctrl_c_interrupts_without_quitting():
             assert app.is_running  # Ctrl+C must not have quit the app
 
 
+# -- streaming TUI: mission mode (/mission, /pause, /resume, kill) -------
+
+class GatedMissionLLM:
+    """Async fake LLM for mission tests: acomplete() blocks on a manually
+    released gate until told otherwise, giving deterministic, race-free
+    control over exactly when each mission turn's decision resolves —
+    wall-clock sleeps would race against Textual pilot overhead, which
+    varies enough to make fixed delays unreliable. release() lets exactly
+    the next call through; release_all() stops gating for the rest of the
+    run once precise control is no longer needed."""
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.gate = asyncio.Event()
+        self.auto = False
+
+    async def acomplete(self, messages, json_schema=None):
+        if not self.auto:
+            await self.gate.wait()
+            self.gate.clear()
+        return self.decisions.pop(0)
+
+    async def astream(self, messages):
+        yield "status"
+
+    def release(self) -> None:
+        self.gate.set()
+
+    def release_all(self) -> None:
+        self.auto = True
+        self.gate.set()
+
+
+def make_mission_tui_agent(tmp_path, llm):
+    from mist.tools.registry import ProcessRegistry
+
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    registry = ProcessRegistry()
+    tools = default_registry(remember_fn=store.remember, wiki_root=cfg.wiki_root,
+                             process_registry=registry)
+    return MistAgent(cfg, llm, store, skills, tools, process_registry=registry)
+
+
+async def test_tui_mission_runs_autonomously_across_turns(tmp_path):
+    agent = make_mission_tui_agent(tmp_path, ScriptedAsyncLLM([
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo recon"}}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "done"}}),
+        json.dumps({"action": "respond"}),
+    ]))
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission pwn the box":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        for _ in range(50):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+        text = _transcript_text(app)
+        assert "mission started" in text
+        assert "mission finished" in text
+        assert app._mission_task is None  # cleared once the mission concludes
+
+
+async def test_tui_mission_pause_and_resume(tmp_path):
+    llm = GatedMissionLLM([
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent = make_mission_tui_agent(tmp_path, llm)
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission long objective":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        # Let turn 1's decision resolve, then wait until turn 2 is blocked on
+        # its own decision call — this is the deterministic signal that turn
+        # 1 fully completed, with no wall-clock guessing involved.
+        llm.release()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if len(llm.decisions) == 3:
+                break
+        assert len(llm.decisions) == 3
+
+        for ch in "/pause":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+        assert app._mission_control is not None and app._mission_control.paused
+
+        # Releasing now lets turn 2's in-flight decision finish (an in-flight
+        # step always completes even when paused) — but turn 3 must NOT
+        # start, since the pause is checked before the next turn begins.
+        llm.release()
+        for _ in range(100):
+            await pilot.pause(0.02)
+            if len(llm.decisions) == 2:
+                break
+        assert len(llm.decisions) == 2
+        await pilot.pause(0.2)
+        assert len(llm.decisions) == 2  # still blocked — turn 3 never started
+
+        llm.release_all()
+        for ch in "/resume":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+        assert "mission finished" in _transcript_text(app)
+
+
+async def test_tui_plain_message_becomes_mission_note_while_running(tmp_path):
+    llm = GatedMissionLLM([
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent = make_mission_tui_agent(tmp_path, llm)
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission slow objective":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)  # mission is now blocked waiting on turn 1's decision
+
+        for ch in "skip recon, go straight to the web app":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+        assert "noted" in _transcript_text(app)
+        assert app.queue.qsize() == 0  # no separate ad hoc turn was queued
+        assert app._mission_control.notes == ["skip recon, go straight to the web app"]
+
+        llm.release_all()
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+
+
+async def test_tui_ctrl_c_kills_mission_and_terminates_subprocess(tmp_path):
+    agent = make_mission_tui_agent(tmp_path, ScriptedAsyncLLM([
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "sleep 5"}}),
+    ]))
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission run a slow command":
+            await pilot.press(ch)
+        await pilot.press("enter")
+
+        # Wait until the shell tool has actually registered the live `sleep 5` process.
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if agent.process_registry._proc is not None:
+                break
+        assert agent.process_registry._proc is not None
+        proc = agent.process_registry._proc
+
+        await pilot.press("ctrl+c")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+        assert app._mission_task is None
+        assert "mission killed" in _transcript_text(app)
+        proc.wait(timeout=3)
+        assert proc.returncode != 0  # terminated, not a natural 5s completion
+
+
 # -- LLMClient async streaming wire format (mist.llm.client) --------------
 
 import httpx  # noqa: E402
@@ -682,3 +925,120 @@ async def test_ollama_acomplete_returns_full_content():
     result = await client.acomplete([{"role": "user", "content": "hi"}],
                                      json_schema={"type": "object"})
     assert json.loads(result) == {"action": "respond"}
+
+
+# -- mission mode (mist.core.agent.MistAgent.astream_mission) ------------
+
+def make_mission_agent(tmp_path, decisions):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember, wiki_root=cfg.wiki_root)
+    return MistAgent(cfg, ScriptedAsyncLLM(decisions), store, skills, tools)
+
+
+async def test_mission_auto_continues_without_operator_input(tmp_path):
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo recon"}}),
+        json.dumps({"action": "respond"}),   # turn 1 ends with an interim status
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "done"}}),
+        json.dumps({"action": "respond"}),   # turn 2 ends
+    ])
+    control = MissionControl()
+    events = [e async for e in agent.astream_mission("test objective", control, max_turns=10)]
+    kinds = [e.kind for e in events]
+    assert kinds.count("turn_start") == 2  # continued into turn 2 with no operator input
+    assert "finished" in kinds
+    assert any(e.tool == "finish_objective" for e in events)
+
+
+async def test_mission_writes_deterministic_log_regardless_of_model(tmp_path):
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo recon"}}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "done"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    control = MissionControl()
+    async for _ in agent.astream_mission("test objective", control, max_turns=10):
+        pass
+    log_files = list((agent.cfg.wiki_root / "missions").glob("*.md"))
+    assert len(log_files) == 1
+    text = log_files[0].read_text()
+    assert "test objective" in text
+    assert "echo recon" in text
+    # No `remember` or `write_file` call was ever made by the model — the raw
+    # tool transcript must still be captured on disk.
+    assert "shell" in text and "finish_objective" in text
+
+
+async def test_mission_stops_at_max_turns(tmp_path):
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "respond"}) for _ in range(6)
+    ])
+    control = MissionControl()
+    events = [e async for e in agent.astream_mission("loop forever", control, max_turns=3)]
+    finished = [e for e in events if e.kind == "finished"]
+    assert finished and "turn" in finished[0].text and "limit" in finished[0].text
+    assert [e.kind for e in events].count("turn_start") == 3
+
+
+async def test_mission_auto_pauses_on_repeated_identical_tool_call(tmp_path):
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.stuck_repeat_threshold = 2
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("ping until responsive", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert control.paused
+    control.resume()
+    await task
+    assert "finished" in [e.kind for e in events]
+
+
+async def test_mission_finish_objective_reachable_even_off_topic(tmp_path):
+    # finish_objective shares no keywords with this message, so it would be
+    # ranked out of the default top-5 tools if not force-included.
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "irrelevant wording on purpose"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    control = MissionControl()
+    events = [e async for e in agent.astream_mission(
+        "talk about baking bread and cooking pasta recipes", control, max_turns=5
+    )]
+    assert any(e.tool == "finish_objective" for e in events)
+    assert agent.always_exposed == set()  # cleared again once the mission ends
+
+
+def test_mission_control_pause_resume_and_notes():
+    control = MissionControl()
+    assert not control.paused
+    control.pause()
+    assert control.paused
+    control.add_note("a")
+    control.add_note("b")
+    assert control.pop_notes() == ["a", "b"]
+    assert control.pop_notes() == []  # drained
+    control.resume()
+    assert not control.paused

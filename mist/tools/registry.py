@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,44 @@ from mist.config import ShellConfig
 from mist.core.subagent import format_results, run_subagents, run_tool_subagents
 from mist.llm.client import LLMClient
 from mist.skills.router import SkillRouter
+
+
+class ProcessRegistry:
+    """Tracks the current foreground subprocess (if any) so an operator kill
+    can actually terminate a running command, not just stop Mist from
+    awaiting it. Cancelling the asyncio task driving a turn/mission does NOT
+    stop a blocking subprocess already running in a worker thread — Python
+    threads can't be preempted — so the shell tool registers its live Popen
+    handle here, and ``kill_active`` reaches in and terminates it directly."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def set(self, proc: subprocess.Popen | None) -> None:
+        with self._lock:
+            self._proc = proc
+
+    def clear(self) -> None:
+        with self._lock:
+            self._proc = None
+
+    def kill_active(self) -> bool:
+        """Terminates the currently-registered process, if any is still
+        running. Returns True if something was actually killed."""
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        return True
 
 
 @dataclass
@@ -47,16 +86,25 @@ class ToolRegistry:
     def keep_only(self, names: set[str]) -> None:
         self._tools = {n: t for n, t in self._tools.items() if n in names}
 
-    def select(self, query: str, max_exposed: int = 5) -> list[Tool]:
+    def select(self, query: str, max_exposed: int = 5,
+               always: set[str] | None = None) -> list[Tool]:
         """Keyword-overlap ranking, same cheap strategy as skill routing.
         Tools with no overlap still qualify via generic fallback ordering so
-        the model always has *something* — but never more than max_exposed."""
+        the model always has *something* — but never more than max_exposed.
+
+        ``always`` force-includes specific tools regardless of their
+        ranking (e.g. `finish_objective` during a mission — it may share no
+        keywords with a given turn's message, but the model must always be
+        able to reach for it)."""
+        always = always or set()
         q = set(re.findall(r"[a-z0-9]+", query.lower()))
         scored = sorted(
             self._tools.values(),
             key=lambda t: -len(q & (t.keywords | set(re.findall(r"[a-z0-9]+", t.description.lower())))),
         )
-        return scored[:max_exposed]
+        forced = [t for t in scored if t.name in always]
+        rest = [t for t in scored if t.name not in always]
+        return forced + rest[:max(0, max_exposed - len(forced))]
 
     # ------------------------------------------------------------------
     def action_schema(self, tools: list[Tool]) -> dict[str, Any]:
@@ -131,19 +179,39 @@ def _make_write_file(default_root: Path | str | None) -> Callable[..., str]:
     return _write_file
 
 
-def _shell(command: str) -> str:
+def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
+                     registry: ProcessRegistry | None) -> str:
+    """Runs a command via Popen (not subprocess.run) so the live process can
+    be registered for an operator kill — cancelling the asyncio task awaiting
+    this (via asyncio.to_thread) does not stop a subprocess already running
+    in a worker thread, since Python threads can't be preempted."""
+    proc = subprocess.Popen(args, shell=shell, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    if registry is not None:
+        registry.set(proc)
     try:
-        out = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=60
-        )
-        return (out.stdout + out.stderr)[:4000] or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 60s"
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            return (out or "")[:4000] + f"\nERROR: command timed out after {timeout:.0f}s"
+    finally:
+        if registry is not None:
+            registry.clear()
+    if proc.returncode is not None and proc.returncode < 0:
+        return (out or "")[:4000] + "\nERROR: command was killed by the operator"
+    return out[:4000] if out else "(no output)"
 
 
-def _make_shell(shell_cfg: ShellConfig | None) -> Callable[..., str]:
+def _shell(command: str, registry: ProcessRegistry | None = None) -> str:
+    return _run_subprocess(command, shell=True, timeout=60, registry=registry)
+
+
+def _make_shell(shell_cfg: ShellConfig | None,
+                registry: ProcessRegistry | None = None) -> Callable[..., str]:
     if shell_cfg is None or shell_cfg.backend == "local":
-        return _shell
+        return lambda command: _shell(command, registry)
 
     ssh = shell_cfg.ssh
 
@@ -152,11 +220,7 @@ def _make_shell(shell_cfg: ShellConfig | None) -> Callable[..., str]:
         if ssh.key_path:
             args += ["-i", str(Path(ssh.key_path).expanduser())]
         args += ["-p", str(ssh.port), f"{ssh.user}@{ssh.host}" if ssh.user else ssh.host, command]
-        try:
-            out = subprocess.run(args, capture_output=True, text=True, timeout=ssh.timeout)
-            return (out.stdout + out.stderr)[:4000] or "(no output)"
-        except subprocess.TimeoutExpired:
-            return f"ERROR: command timed out after {ssh.timeout}s"
+        return _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry)
     return _shell_ssh
 
 
@@ -209,7 +273,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       subagent_tools_enabled: bool = True,
                       wiki_root: str | Path | None = None,
                       enabled: list[str] | None = None,
-                      shell_config: ShellConfig | None = None) -> ToolRegistry:
+                      shell_config: ShellConfig | None = None,
+                      process_registry: ProcessRegistry | None = None) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
@@ -246,8 +311,21 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
         parameters={"type": "object",
                     "properties": {"command": {"type": "string"}},
                     "required": ["command"]},
-        fn=_make_shell(shell_config),
+        fn=_make_shell(shell_config, process_registry),
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
+    ))
+    reg.register(Tool(
+        name="finish_objective",
+        description=(
+            "Call this ONLY once the current objective is fully, concretely achieved "
+            "(e.g. you have the flag/root/the exact output that was asked for) — it "
+            "signals that no further work is needed. Do not call this for a routine "
+            "status update or partial progress; keep working instead."
+        ),
+        parameters={"type": "object", "properties": {"summary": {"type": "string"}},
+                    "required": ["summary"]},
+        fn=lambda summary: f"Objective marked complete: {summary}",
+        keywords={"finish", "complete", "done", "objective", "mission", "flag", "root"},
     ))
     if remember_fn is not None:
         reg.register(Tool(
@@ -280,7 +358,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
             if subagent_tools_enabled:
                 subagent_tools = default_registry(remember_fn=remember_fn, llm=None, skills=None,
                                                   wiki_root=wiki_root, enabled=enabled,
-                                                  shell_config=shell_config)
+                                                  shell_config=shell_config,
+                                                  process_registry=process_registry)
                 results = run_tool_subagents(llm, subagent_tools, tasks,
                                              max_workers=max_subagent_workers,
                                              max_steps=max_subagent_steps)

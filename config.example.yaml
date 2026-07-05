@@ -69,3 +69,16 @@ subagents:
 generation:
   temperature: 0.2
   max_tokens: 1024
+  think: true  # Ollama only. Reasoning models (Qwen3, DeepSeek-R1, ...) emit a
+               # <think> block. It's always forced off on schema-constrained
+               # tool-decision calls (valid JSON is mandatory there regardless
+               # of this setting). This flag controls the free-text answer
+               # step only: true (default) lets the model reason fully over
+               # tool output/memory/wiki context before answering, with the
+               # <think> trace filtered out of the displayed stream; set to
+               # false to disable reasoning there too (faster, shallower).
+
+mission:
+  max_turns: 40         # autonomous turns before a mission force-stops
+  max_seconds: 3600     # wall-clock budget before a mission force-stops
+  stuck_repeat_threshold: 3  # identical tool+args calls in a row -> auto-pause

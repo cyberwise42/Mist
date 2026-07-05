@@ -6,6 +6,15 @@
   dispatched one at a time as soon as the current turn finishes.
 - Ctrl+C interrupts (cancels) the in-flight turn — it does not quit the app.
   Ctrl+Q quits.
+- `/mission <objective>` drives MistAgent.astream_mission: an autonomous
+  multi-turn loop that keeps working the objective without asking for
+  per-turn confirmation, until it calls `finish_objective`, hits a safety
+  limit, or the operator intervenes. While one is running, Ctrl+C (or
+  `/kill`) stops it immediately — including terminating a live subprocess,
+  not just abandoning the wait on it — `/pause` and `/resume` control it
+  cooperatively (the current step always finishes cleanly first), and plain
+  typed messages are folded in as steering notes for its next step instead
+  of starting a separate ad hoc turn.
 """
 from __future__ import annotations
 
@@ -15,7 +24,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
+from mist.banner import BANNER, TAGLINE, help_lines
 from mist.core.agent import MistAgent
+from mist.core.mission import MissionControl
+from mist.core.summarizer import BatchSummarizer
 
 
 class MistTUI(App):
@@ -44,7 +56,8 @@ class MistTUI(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "interrupt", "Interrupt turn", priority=True),
+        Binding("ctrl+c", "interrupt", "Interrupt/Kill", priority=True),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
     def __init__(self, agent: MistAgent):
@@ -53,6 +66,10 @@ class MistTUI(App):
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._turn_task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
+        self._mission_task: asyncio.Task | None = None
+        self._mission_control: MissionControl | None = None
+        self._mission_objective: str = ""
+        self._mission_turn: int = 0
 
     # ------------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -60,12 +77,14 @@ class MistTUI(App):
         yield RichLog(id="transcript", wrap=True, markup=True, highlight=False)
         yield Static("", id="typing")
         yield Static("", id="status")
-        yield Input(placeholder="Message Mist… (Ctrl+C interrupts, Ctrl+Q quits)", id="input")
+        yield Input(placeholder="Message Mist… (/help for commands, Ctrl+C interrupts, Ctrl+Q quits)",
+                    id="input")
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = "Mist"
         self.sub_title = f"{self.agent.cfg.backend} / {self.agent.cfg.model} (session {self.agent.session_id})"
+        self._write_welcome()
         self._refresh_status("idle")
         self._dispatch_task = asyncio.create_task(self._dispatch_loop())
         self.query_one("#input", Input).focus()
@@ -75,8 +94,27 @@ class MistTUI(App):
             self._dispatch_task.cancel()
         if self._turn_task is not None:
             self._turn_task.cancel()
+        if self._mission_task is not None:
+            self._mission_task.cancel()
 
     # ------------------------------------------------------------------
+    def _write_welcome(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        log.write(f"[bold cyan]{BANNER}[/]")
+        log.write(f"[dim]{TAGLINE}[/]")
+        log.write("")
+        log.write(f"[dim]{self.agent.cfg.backend} / {self.agent.cfg.model} "
+                  f"(session {self.agent.session_id})[/]")
+        log.write("")
+        self._write_help(log)
+        log.write("[dim]Type a message to talk to Mist, or a /command above.[/]")
+        log.write("")
+
+    def _write_help(self, log: RichLog) -> None:
+        log.write("[bold]Commands[/]")
+        for line in help_lines():
+            log.write(f"  [dim]{line}[/]")
+
     def _refresh_status(self, state: str) -> None:
         n = self.queue.qsize()
         suffix = f"  ·  {n} queued" if n else ""
@@ -87,9 +125,146 @@ class MistTUI(App):
         event.input.value = ""
         if not text:
             return
+        if text.startswith("/"):
+            self._handle_command(text)
+            return
+        if self._mission_task is not None and not self._mission_task.done():
+            self._mission_control.add_note(text)
+            self.query_one("#transcript", RichLog).write(
+                f"[bold green]you ›[/] {text}\n"
+                f"  [dim]‹ noted — will steer the mission's next step ›[/]"
+            )
+            return
         self.query_one("#transcript", RichLog).write(f"[bold green]you ›[/] {text}")
         self.queue.put_nowait(text)
         self._refresh_status("thinking…" if self._turn_task else "idle")
+
+    # ------------------------------------------------------------------
+    def _handle_command(self, text: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        name, _, rest = text[1:].partition(" ")
+        name, rest = name.lower(), rest.strip()
+        if name in ("quit", "exit"):
+            self.exit()
+            return
+        if name == "help":
+            self._write_help(log)
+            return
+        if name == "clear":
+            log.clear()
+            return
+        if name == "new":
+            self.agent.session_id = self.agent.store.new_session()
+            self.sub_title = (f"{self.agent.cfg.backend} / {self.agent.cfg.model} "
+                              f"(session {self.agent.session_id})")
+            log.write(f"[dim]Started new session {self.agent.session_id}.[/]")
+            return
+        if name == "models":
+            asyncio.create_task(self._run_models_list())
+            return
+        if name == "model":
+            if not rest:
+                log.write(f"[dim]{self.agent.cfg.backend} / {self.agent.llm.model} "
+                          f"(session {self.agent.session_id})[/]")
+                return
+            asyncio.create_task(self._run_model_switch(rest))
+            return
+        if name == "compact":
+            log.write("[dim]Compacting old sessions…[/]")
+            asyncio.create_task(self._run_compact())
+            return
+        if name == "mission":
+            self._handle_mission_command(rest, log)
+            return
+        if name == "pause":
+            if self._mission_task is not None and not self._mission_task.done():
+                self._mission_control.pause()
+                log.write("[dim]Pausing after the mission's current step…[/]")
+            else:
+                log.write("[dim]No mission is running.[/]")
+            return
+        if name == "resume":
+            if self._mission_control is not None and self._mission_control.paused:
+                self._mission_control.resume()
+                log.write("[dim]Resumed.[/]")
+            else:
+                log.write("[dim]No paused mission to resume.[/]")
+            return
+        if name == "kill":
+            if self._mission_task is not None and not self._mission_task.done():
+                self._kill_mission()
+            else:
+                log.write("[dim]No mission is running.[/]")
+            return
+        log.write(f"[red]Unknown command /{name}. Type /help for a list.[/]")
+
+    def _handle_mission_command(self, objective: str, log: RichLog) -> None:
+        if self._mission_task is not None and not self._mission_task.done():
+            if not objective:
+                state = "paused" if self._mission_control.paused else "running"
+                log.write(f"[dim]Mission {state} (turn {self._mission_turn}): "
+                         f"{self._mission_objective}[/]")
+            else:
+                log.write("[yellow]A mission is already running — /kill it first to start "
+                          "a new one.[/]")
+            return
+        if not objective:
+            log.write("[red]Usage: /mission <objective>[/]")
+            return
+        if self._turn_task is not None and not self._turn_task.done():
+            log.write("[yellow]An ad hoc turn is still running — wait for it to finish "
+                      "before starting a mission.[/]")
+            return
+        self._mission_objective = objective
+        self._mission_control = MissionControl()
+        self._mission_turn = 0
+        self._mission_task = asyncio.create_task(self._run_mission(objective))
+
+    def _kill_mission(self) -> None:
+        if self.agent.process_registry is not None:
+            self.agent.process_registry.kill_active()
+        if self._mission_task is not None:
+            self._mission_task.cancel()
+
+    async def _run_models_list(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        try:
+            models = await asyncio.to_thread(self.agent.llm.list_models)
+        except Exception as exc:
+            log.write(f"[red]Failed to list models: {exc}[/]")
+            return
+        if not models:
+            log.write("[dim]No models found on the backend.[/]")
+            return
+        current = self.agent.llm.model
+        for m in models:
+            marker = "[bold green]*[/]" if m == current else " "
+            log.write(f" {marker} {m}")
+
+    async def _run_model_switch(self, name: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        try:
+            available = await asyncio.to_thread(self.agent.llm.list_models)
+        except Exception:
+            available = None
+        if available is not None and name not in available:
+            log.write(f"[yellow]Warning: {name!r} isn't in the backend's model list "
+                      f"— switching anyway (pull it first if the next turn fails).[/]")
+        self.agent.llm.model = name
+        self.agent.cfg.model = name
+        self.sub_title = f"{self.agent.cfg.backend} / {name} (session {self.agent.session_id})"
+        log.write(f"[dim]Switched active model to {name}.[/]")
+
+    async def _run_compact(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        summarizer = BatchSummarizer(self.agent.llm, self.agent.store)
+        results = await asyncio.to_thread(
+            summarizer.compact_old_sessions,
+            keep_recent=self.agent.cfg.memory.keep_recent_sessions,
+            min_turns=self.agent.cfg.memory.compact_min_turns,
+        )
+        total = sum(r.memories_written for r in results)
+        log.write(f"[dim]Compacted {len(results)} session(s) into {total} memories.[/]")
 
     # ------------------------------------------------------------------
     async def _dispatch_loop(self) -> None:
@@ -113,29 +288,78 @@ class MistTUI(App):
     async def _run_turn(self, user_msg: str) -> None:
         log = self.query_one("#transcript", RichLog)
         typing = self.query_one("#typing", Static)
-        buffer = ""
+        buffer = [""]
         try:
             async for event in self.agent.astream_turn(user_msg):
-                if event.kind == "delta":
-                    buffer += event.text
-                    typing.update(f"[bold cyan]mist ›[/] {buffer}")
-                elif event.kind == "tool_start":
-                    self._refresh_status(f"tool: {event.tool}")
-                    log.write(f"  [dim]⚙ {event.tool}({event.detail})[/]")
-                elif event.kind == "tool_result":
-                    log.write(f"  [dim]→ {event.text[:200]}[/]")
-                    self._refresh_status("thinking…")
-                elif event.kind == "done":
-                    # Move the finished answer from the ephemeral "typing"
-                    # widget into the permanent transcript.
-                    log.write(f"[bold cyan]mist ›[/] {event.text}")
-                elif event.kind == "error":
-                    log.write(f"[red]error: {event.text}[/]")
+                self._render_turn_event(event, log, typing, buffer)
         finally:
             typing.update("")
 
+    def _render_turn_event(self, event, log: RichLog, typing: Static, buffer: list[str]) -> None:
+        """Renders one TurnEvent-shaped event (kind: delta/tool_start/
+        tool_result/done/error) — shared by ad hoc turns and mission turns
+        (via MissionEvent, which forwards the same kinds) so both render
+        identically. `buffer` is a single-element list so callers can share
+        mutable accumulation state across repeated calls."""
+        if event.kind == "delta":
+            buffer[0] += event.text
+            typing.update(f"[bold cyan]mist ›[/] {buffer[0]}")
+        elif event.kind == "tool_start":
+            self._refresh_status(f"tool: {event.tool}")
+            log.write(f"  [dim]⚙ {event.tool}({event.detail})[/]")
+        elif event.kind == "tool_result":
+            log.write(f"  [dim]→ {event.text[:200]}[/]")
+            self._refresh_status("thinking…")
+        elif event.kind == "done":
+            # Move the finished answer from the ephemeral "typing" widget
+            # into the permanent transcript.
+            log.write(f"[bold cyan]mist ›[/] {event.text}")
+            typing.update("")
+            buffer[0] = ""
+        elif event.kind == "error":
+            log.write(f"[red]error: {event.text}[/]")
+            typing.update("")
+            buffer[0] = ""
+
+    # ------------------------------------------------------------------
+    async def _run_mission(self, objective: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        typing = self.query_one("#typing", Static)
+        buffer = [""]
+        control = self._mission_control
+        log.write(f"[bold magenta]‹ mission started ›[/] {objective}")
+        self._refresh_status("mission: turn 0")
+        try:
+            async for event in self.agent.astream_mission(
+                objective, control,
+                max_turns=self.agent.cfg.mission.max_turns,
+                max_seconds=self.agent.cfg.mission.max_seconds,
+                stuck_repeat_threshold=self.agent.cfg.mission.stuck_repeat_threshold,
+            ):
+                if event.kind == "turn_start":
+                    self._mission_turn += 1
+                    self._refresh_status(f"mission: turn {self._mission_turn}")
+                elif event.kind == "finished":
+                    log.write(f"[bold magenta]‹ mission finished ›[/] {event.text}")
+                elif event.kind == "stuck":
+                    log.write(f"[yellow]‹ mission paused ›[/] {event.text}")
+                    self._refresh_status(f"mission: paused (turn {self._mission_turn})")
+                else:
+                    self._render_turn_event(event, log, typing, buffer)
+        except asyncio.CancelledError:
+            log.write("[red]‹ mission killed by operator ›[/]")
+        finally:
+            typing.update("")
+            self._mission_task = None
+            self._mission_control = None
+            self._mission_turn = 0
+            self._refresh_status("idle")
+
     # ------------------------------------------------------------------
     def action_interrupt(self) -> None:
+        if self._mission_task is not None and not self._mission_task.done():
+            self._kill_mission()
+            return
         if self._turn_task is not None and not self._turn_task.done():
             self._turn_task.cancel()
         else:
