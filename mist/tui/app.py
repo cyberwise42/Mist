@@ -15,19 +15,86 @@
   cooperatively (the current step always finishes cleanly first), and plain
   typed messages are folded in as steering notes for its next step instead
   of starting a separate ad hoc turn.
+- Every submitted line (message or /command) is recorded to a persistent
+  history file shared with `mist chat`. Up/Down recall previous entries;
+  ghost-text autofill suggests the most recent matching entry as you type
+  (accept with End or Right-arrow-at-end-of-line, both already built into
+  Textual's Input).
 """
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.suggester import Suggester
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from mist.banner import BANNER, TAGLINE, help_lines
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
 from mist.core.summarizer import BatchSummarizer
+from mist.history import HistoryStore
+
+
+class HistorySuggester(Suggester):
+    """Ghost-text autofill from persistent input history: suggests the most
+    recent entry whose prefix matches what's currently typed."""
+    def __init__(self, history: HistoryStore):
+        super().__init__(use_cache=False, case_sensitive=False)
+        self.history = history
+
+    async def get_suggestion(self, value: str) -> str | None:
+        if not value:
+            return None
+        for entry in reversed(self.history.all()):
+            if entry.casefold().startswith(value) and entry.casefold() != value:
+                return entry
+        return None
+
+
+class HistoryInput(Input):
+    """An Input with shell-style Up/Down history recall, layered on top of
+    Textual's own ghost-text suggestion mechanism (via HistorySuggester)."""
+    BINDINGS = [
+        Binding("up", "history_prev", show=False),
+        Binding("down", "history_next", show=False),
+    ]
+
+    def __init__(self, history: HistoryStore, **kwargs):
+        super().__init__(suggester=HistorySuggester(history), **kwargs)
+        self._history = history
+        self._nav_index: int | None = None
+        self._draft = ""
+
+    def action_history_prev(self) -> None:
+        entries = self._history.all()
+        if not entries:
+            return
+        if self._nav_index is None:
+            self._draft = self.value
+            self._nav_index = len(entries) - 1
+        elif self._nav_index > 0:
+            self._nav_index -= 1
+        self.value = entries[self._nav_index]
+        self.action_end()
+
+    def action_history_next(self) -> None:
+        if self._nav_index is None:
+            return
+        entries = self._history.all()
+        self._nav_index += 1
+        if self._nav_index >= len(entries):
+            self._nav_index = None
+            self.value = self._draft
+        else:
+            self.value = entries[self._nav_index]
+        self.action_end()
+
+    def reset_history_nav(self) -> None:
+        self._nav_index = None
+        self._draft = ""
 
 
 class MistTUI(App):
@@ -63,6 +130,7 @@ class MistTUI(App):
     def __init__(self, agent: MistAgent):
         super().__init__()
         self.agent = agent
+        self.history = HistoryStore(agent.cfg.history_file)
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self._turn_task: asyncio.Task | None = None
         self._dispatch_task: asyncio.Task | None = None
@@ -70,6 +138,7 @@ class MistTUI(App):
         self._mission_control: MissionControl | None = None
         self._mission_objective: str = ""
         self._mission_turn: int = 0
+        self._mission_log_path: str | None = None
 
     # ------------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -77,8 +146,10 @@ class MistTUI(App):
         yield RichLog(id="transcript", wrap=True, markup=True, highlight=False)
         yield Static("", id="typing")
         yield Static("", id="status")
-        yield Input(placeholder="Message Mist… (/help for commands, Ctrl+C interrupts, Ctrl+Q quits)",
-                    id="input")
+        yield HistoryInput(self.history,
+                           placeholder="Message Mist… (/help for commands, "
+                                       "↑↓ history, Ctrl+C interrupts, Ctrl+Q quits)",
+                           id="input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -107,7 +178,8 @@ class MistTUI(App):
                   f"(session {self.agent.session_id})[/]")
         log.write("")
         self._write_help(log)
-        log.write("[dim]Type a message to talk to Mist, or a /command above.[/]")
+        log.write("[dim]Type a message to talk to Mist, or a /command above. "
+                  "↑/↓ recall history, ghost text autofills a past match.[/]")
         log.write("")
 
     def _write_help(self, log: RichLog) -> None:
@@ -125,6 +197,9 @@ class MistTUI(App):
         event.input.value = ""
         if not text:
             return
+        self.history.add(text)
+        if isinstance(event.input, HistoryInput):
+            event.input.reset_history_nav()
         if text.startswith("/"):
             self._handle_command(text)
             return
@@ -336,11 +411,18 @@ class MistTUI(App):
                 max_seconds=self.agent.cfg.mission.max_seconds,
                 stuck_repeat_threshold=self.agent.cfg.mission.stuck_repeat_threshold,
             ):
-                if event.kind == "turn_start":
+                if event.kind == "started":
+                    self._mission_log_path = event.text
+                elif event.kind == "turn_start":
                     self._mission_turn += 1
                     self._refresh_status(f"mission: turn {self._mission_turn}")
                 elif event.kind == "finished":
                     log.write(f"[bold magenta]‹ mission finished ›[/] {event.text}")
+                elif event.kind == "debrief":
+                    log.write(f"[dim]{event.text}[/]")
+                elif event.kind == "recovering":
+                    log.write(f"[cyan]‹ recovering ›[/] {event.text}")
+                    self._refresh_status(f"mission: recovering (turn {self._mission_turn})")
                 elif event.kind == "stuck":
                     log.write(f"[yellow]‹ mission paused ›[/] {event.text}")
                     self._refresh_status(f"mission: paused (turn {self._mission_turn})")
@@ -348,11 +430,19 @@ class MistTUI(App):
                     self._render_turn_event(event, log, typing, buffer)
         except asyncio.CancelledError:
             log.write("[red]‹ mission killed by operator ›[/]")
+            if self._mission_log_path is not None:
+                log.write("[dim]Debriefing what was accomplished before the kill…[/]")
+                debrief = await asyncio.to_thread(
+                    self.agent.debrief_mission, objective, "killed by the operator",
+                    Path(self._mission_log_path),
+                )
+                log.write(f"[dim]{debrief.summary()}[/]")
         finally:
             typing.update("")
             self._mission_task = None
             self._mission_control = None
             self._mission_turn = 0
+            self._mission_log_path = None
             self._refresh_status("idle")
 
     # ------------------------------------------------------------------

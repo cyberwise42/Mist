@@ -47,9 +47,12 @@ class MissionEvent:
 
     kind: forwards every ``TurnEvent`` kind ("delta", "tool_start",
     "tool_result", "done", "error") as-is, plus mission-level kinds:
-    "turn_start" (a new autonomous turn began), "paused", "resumed",
-    "stuck" (repeated the same tool call — auto-paused for review),
-    "finished" (objective complete or a limit was hit).
+    "started" (mission log path, emitted once at the start), "turn_start"
+    (a new autonomous turn began), "recovering" (repeated the same tool
+    call — attempting one reasoning-assisted self-recovery before
+    escalating), "stuck" (still stuck after that — auto-paused for
+    operator review), "finished" (objective complete or a limit was hit),
+    "debrief" (findings persisted at mission end).
     """
     kind: str
     text: str = ""

@@ -57,27 +57,46 @@ class LLMClient:
         # model from generating it — this hides the trace, it doesn't
         # suppress the thinking itself.
         self.think = think
+        # Models known (learned at runtime, see _astream_ollama) not to
+        # support Ollama's thinking mode at all — sending "think": true to
+        # one of these isn't silently ignored, Ollama hard-rejects the whole
+        # request with a 400 ("<model> does not support thinking"), which
+        # broke every conversational reply for non-reasoning models like
+        # qwen2.5:14b. Keyed by model name so switching models re-probes.
+        self._think_unsupported: set[str] = set()
         self._client = httpx.Client(timeout=timeout)
         self._aclient = httpx.AsyncClient(timeout=timeout)
 
+    def _effective_think(self) -> bool:
+        return self.think and self.model not in self._think_unsupported
+
     # ------------------------------------------------------------------
     def complete(self, messages: list[dict[str, str]],
-                 json_schema: dict[str, Any] | None = None) -> str:
+                 json_schema: dict[str, Any] | None = None,
+                 force_think: bool = False) -> str:
         if self.backend == "ollama":
-            return self._ollama(messages, json_schema)
+            return self._ollama(messages, json_schema, force_think)
         if self.backend == "vllm":
             return self._vllm(messages, json_schema)
         raise ValueError(f"Unknown backend: {self.backend}")
 
     # ------------------------------------------------------------------
-    def _ollama(self, messages, json_schema) -> str:
+    def _ollama(self, messages, json_schema, force_think: bool = False) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            # Schema-constrained calls need guaranteed-clean JSON; reasoning
-            # is forced off for those regardless of the `think` setting.
-            "think": False if json_schema is not None else self.think,
+            # Schema-constrained calls force reasoning off by default —
+            # Ollama returns thinking in its own "thinking" field (separate
+            # from "content", confirmed by inspecting the raw wire format),
+            # so it doesn't corrupt JSON output the way an inline <think>
+            # tag would; the real risk is a small max_tokens budget being
+            # exhausted by reasoning before any content is produced. Still
+            # off by default for routine decisions (cheap, fast, no need to
+            # deliberate over "which tool"); `force_think` opts a specific
+            # call back in for exactly the moments non-reasoning
+            # decision-making has demonstrably failed (stuck-loop recovery).
+            "think": self._effective_think() if (force_think or json_schema is None) else False,
             "options": {
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,
@@ -134,19 +153,20 @@ class LLMClient:
     # Async / streaming (used by the TUI's live turn loop)
     # ------------------------------------------------------------------
     async def acomplete(self, messages: list[dict[str, str]],
-                         json_schema: dict[str, Any] | None = None) -> str:
+                         json_schema: dict[str, Any] | None = None,
+                         force_think: bool = False) -> str:
         if self.backend == "ollama":
-            return await self._aollama(messages, json_schema)
+            return await self._aollama(messages, json_schema, force_think)
         if self.backend == "vllm":
             return await self._avllm(messages, json_schema)
         raise ValueError(f"Unknown backend: {self.backend}")
 
-    async def _aollama(self, messages, json_schema) -> str:
+    async def _aollama(self, messages, json_schema, force_think: bool = False) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "think": False if json_schema is not None else self.think,
+            "think": self._effective_think() if (force_think or json_schema is None) else False,
             "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
         }
         if json_schema is not None:
@@ -193,27 +213,59 @@ class LLMClient:
             yield chunk
 
     async def _astream_ollama(self, messages) -> AsyncIterator[str]:
+        think = self._effective_think()
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": True,
-            "think": self.think,
+            "think": think,
             "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
         }
         async with self._aclient.stream(
             "POST", f"{self.base_url}/api/chat", json=payload
         ) as resp:
+            if think and resp.status_code == 400:
+                body = await resp.aread()
+                if b"does not support thinking" in body:
+                    # Not every model has a thinking mode at all — asking for
+                    # one isn't ignored, Ollama hard-rejects the request.
+                    # Remember it so later turns with this model skip
+                    # straight to think=False instead of failing every time.
+                    self._think_unsupported.add(self.model)
+                    async for chunk in self._astream_ollama(messages):
+                        yield chunk
+                    return
             resp.raise_for_status()
+            # Ollama's native thinking mode puts reasoning tokens in their
+            # own "thinking" field, entirely separate from "content" — not
+            # inline <think> tags (that's a different, older/other-backend
+            # convention, still handled defensively by _filter_thinking).
+            # "content" stays empty for the whole reasoning phase and only
+            # starts once the model moves on to its actual answer, so if
+            # generation.max_tokens is too small for a big/broad request the
+            # model can exhaust its whole budget reasoning and never reach
+            # "content" at all — silently returning nothing left the operator
+            # with a bare "(empty response)" and no clue why.
+            saw_thinking = False
+            saw_content = False
             async for line in resp.aiter_lines():
                 line = line.strip()
                 if not line:
                     continue
                 obj = json.loads(line)
-                content = obj.get("message", {}).get("content", "")
+                message = obj.get("message", {})
+                if message.get("thinking"):
+                    saw_thinking = True
+                content = message.get("content", "")
                 if content:
+                    saw_content = True
                     yield content
                 if obj.get("done"):
                     break
+            if saw_thinking and not saw_content:
+                yield ("[Mist: the model ran out of tokens while still \"thinking\" and "
+                      "never produced a visible answer. Try raising generation.max_tokens, "
+                      "or set generation.think: false for a more concise reply.]")
 
     async def _astream_vllm(self, messages) -> AsyncIterator[str]:
         headers = {}
@@ -257,6 +309,7 @@ async def _filter_thinking(source: AsyncIterator[str]) -> AsyncIterator[str]:
     """
     buf = ""
     in_think = False
+    yielded_anything = False
     async for chunk in source:
         buf += chunk
         while True:
@@ -271,15 +324,27 @@ async def _filter_thinking(source: AsyncIterator[str]) -> AsyncIterator[str]:
             if idx == -1:
                 safe_len = max(len(buf) - (len(_THINK_OPEN) - 1), 0)
                 if safe_len:
+                    yielded_anything = True
                     yield buf[:safe_len]
                 buf = buf[safe_len:]
                 break
             if idx:
+                yielded_anything = True
                 yield buf[:idx]
             buf = buf[idx + len(_THINK_OPEN):]
             in_think = True
     if buf and not in_think:
+        yielded_anything = True
         yield buf
+    if in_think and not yielded_anything:
+        # The stream ended while still inside an unterminated <think> block —
+        # the model spent its entire token budget reasoning and never got to
+        # a visible answer. Silently returning nothing here left the operator
+        # with a bare "(empty response)" and no clue why; a max_tokens bump
+        # (or generation.think: false) is the actual fix, so say so.
+        yield ("[Mist: the model ran out of tokens while still \"thinking\" and never "
+              "produced a visible answer. Try raising generation.max_tokens, or set "
+              "generation.think: false for a more concise reply.]")
 
 
 def parse_json_relaxed(text: str) -> dict[str, Any]:

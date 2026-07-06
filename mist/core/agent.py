@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from mist.config import MistConfig
+from mist.core.debrief import DebriefResult, MissionDebriefer
 from mist.core.mission import MissionControl, MissionEvent
 from mist.llm.client import LLMClient, parse_json_relaxed
 from mist.memory.store import MemoryStore
@@ -41,25 +42,6 @@ from mist.skills.router import SkillRouter
 from mist.tools.registry import ProcessRegistry, ToolRegistry
 
 MAX_DECISION_RETRIES = 2
-
-SYSTEM_TEMPLATE = """You are Mist, an autonomous penetration-testing operator. Follow instructions exactly.
-
-You must reply with a single JSON object matching this shape:
-- To answer the user:   {{"action": "respond", "response": "<your answer>"}}
-- To use a tool:        {{"action": "use_tool", "tool": "<name>", "arguments": {{...}}}}
-
-Available tools:
-{tools}
-{skill_section}{memory_section}Rules:
-- If the request requires performing an action (a scan, exploit, command, or reading/writing a
-  file), you MUST use a tool to actually do it yourself — never just describe steps for the user
-  to run manually.
-- Only respond directly when no action is needed: answering a question, explaining a concept, or
-  reporting results you already produced.
-- After a tool call produces a meaningful finding (open ports, a credential, a vulnerability, a
-  working technique), persist it with `remember` or `write_file` (under the wiki root) before your
-  final response, so it survives this session.
-- One action per reply. No text outside the JSON object."""
 
 DECISION_SYSTEM_TEMPLATE = """You are Mist, an autonomous penetration-testing operator. Follow instructions exactly.
 
@@ -73,11 +55,21 @@ Available tools:
 - If the request requires performing an action (a scan, exploit, command, or reading/writing a
   file), you MUST use a tool to actually do it yourself — never just describe steps for the user
   to run manually.
+- A broad or multi-phase request ("pentest this machine", "get the flags") is still a request that
+  requires action: decide `use_tool` for the next concrete step now. Deciding `respond` here means
+  the operator gets a description instead of progress — only do that when no action is needed.
 - Only decide to respond directly when no action is needed: answering a question, explaining a
   concept, or reporting results you already produced.
 - After a tool call produces a meaningful finding (open ports, a credential, a vulnerability, a
   working technique), persist it with `remember` or `write_file` (under the wiki root) before you
   respond.
+- `shell` runs commands on your OWN local machine, not the target. The target is only reachable
+  over the network (curl/nmap/ftp/ssh aimed at its IP) — a target's web assets, source, or files
+  are never sitting directly on your local disk. Do not run broad local filesystem searches
+  (`find /`, recursive grep over `/root`, `/home`, etc.) hunting for "the target's files" — if a
+  local search seems tempting, that's a sign to re-check whether you actually need a network
+  request against the target instead. Absolute file paths outside the wiki/workspace roots are
+  refused by read_file/write_file/search_files for this reason.
 - Do not write the answer itself here — a separate step does that.
 - One action per reply. No text outside the JSON object."""
 
@@ -95,7 +87,14 @@ This is not a request for a plan — decide the single next concrete step yourse
 with a tool right now. Do not ask the operator what to do next. Give a brief status update only
 if you have nothing further to do this step. If the objective is fully achieved, call
 `finish_objective` with a summary. If you are genuinely stuck and need the operator's judgment
-(a missing credential, an ambiguous scope decision), say so plainly instead of guessing."""
+(a missing credential, an ambiguous scope decision), say so plainly instead of guessing.
+
+If you confirm something is a genuine dead end (a path that doesn't exist, a technique that
+doesn't apply here) or land on a working technique, persist it immediately with `remember` — it
+gets retrieved automatically in later turns, so you won't rediscover the same dead end twice.
+Separately, `search_files` the wiki for existing reference knowledge (methodology, known
+techniques, past engagements) relevant to whatever service or technology you're dealing with
+right now — that's real material worth consulting, not just your own session history."""
 
 
 def _now() -> str:
@@ -193,13 +192,6 @@ class MistAgent:
 
         return tool_lines, skill_section, memory_section, exposed
 
-    def _build_system(self, user_msg: str) -> tuple[str, list]:
-        tool_lines, skill_section, memory_section, exposed = self._assemble_context(user_msg)
-        system = SYSTEM_TEMPLATE.format(
-            tools=tool_lines, skill_section=skill_section, memory_section=memory_section
-        )
-        return system, exposed
-
     def _build_decision_system(self, user_msg: str) -> tuple[str, list]:
         tool_lines, skill_section, memory_section, exposed = self._assemble_context(user_msg)
         system = DECISION_SYSTEM_TEMPLATE.format(
@@ -222,17 +214,37 @@ class MistAgent:
 
     # ------------------------------------------------------------------
     def turn(self, user_msg: str) -> TurnResult:
-        system, exposed = self._build_system(user_msg)
-        schema = self.tools.action_schema(exposed)
-        history = self._history()
+        """Synchronous turn, used by `mist chat` / `mist ask`. Structured the
+        same way as astream_turn: a small constrained decision (respond vs.
+        use_tool, no `response` field) followed — only once "respond" is
+        chosen — by a separate, unconstrained call that generates the actual
+        answer text.
 
-        messages = [{"role": "system", "content": system}, *history,
-                    {"role": "user", "content": user_msg}]
-        messages = _fit_budget(messages, self.cfg.context.token_budget)
+        This split matters more than it looks: a combined schema (decide AND
+        provide `response` in the same JSON object) was found in practice to
+        make the model default to filling in `response` with a description
+        of what it *would* do for any broad or ambiguous request, rather
+        than committing to `use_tool` — reliably reproduced across repeated
+        attempts with a real target/model, while the two-step decision-only
+        schema below did not exhibit it."""
+        history = self._history()
+        system, exposed = self._build_decision_system(user_msg)
+        schema = self.tools.decision_schema(exposed)
+        messages = _fit_budget(
+            [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
+            self.cfg.context.token_budget,
+        )
 
         trace: list[str] = []
+        tool_context: list[dict[str, str]] = []
         for _ in range(self.cfg.context.max_tool_steps):
-            raw = self.llm.complete(messages, json_schema=schema)
+            try:
+                raw = self.llm.complete(messages, json_schema=schema)
+            except Exception as exc:  # network/backend errors must not crash the caller
+                response = f"ERROR: LLM call failed: {exc}"
+                self.store.add_turn(self.session_id, "user", user_msg)
+                self.store.add_turn(self.session_id, "assistant", response)
+                return TurnResult(response=response, tool_trace=trace)
             try:
                 action = parse_json_relaxed(raw)
             except (ValueError, json.JSONDecodeError):
@@ -241,11 +253,8 @@ class MistAgent:
                                  "content": "Invalid JSON. Reply with ONLY the JSON object."})
                 continue
 
-            if action.get("action") == "respond" or "tool" not in action:
-                response = action.get("response", "").strip() or "(empty response)"
-                self.store.add_turn(self.session_id, "user", user_msg)
-                self.store.add_turn(self.session_id, "assistant", response)
-                return TurnResult(response=response, tool_trace=trace)
+            if action.get("action") != "use_tool" or "tool" not in action:
+                return self._answer(user_msg, history, tool_context, trace)
 
             tool = self.tools.get(action.get("tool", ""))
             if tool is None:
@@ -254,8 +263,9 @@ class MistAgent:
                                             f"Choose from the listed tools or respond."})
                 continue
 
+            args = action.get("arguments") or {}
             try:
-                result = tool.run(**(action.get("arguments") or {}))
+                result = tool.run(**args)
             except TypeError as exc:
                 result = f"ERROR: bad arguments: {exc}"
             except Exception as exc:  # tool errors go back to the model, not up
@@ -267,6 +277,8 @@ class MistAgent:
             # to history, so it never bloats future turns.
             messages.append({"role": "assistant", "content": json.dumps(action)})
             messages.append({"role": "user", "content": f"Tool result:\n{result}"})
+            tool_context.append({"role": "assistant", "content": f"Ran {tool.name}({args})."})
+            tool_context.append({"role": "user", "content": f"Tool result:\n{result}"})
 
         # Ran out of steps — persist a summary line, not the full trace.
         summary = "I hit the tool-step limit. Trace: " + "; ".join(trace[-3:])
@@ -274,13 +286,33 @@ class MistAgent:
         self.store.add_turn(self.session_id, "assistant", summary)
         return TurnResult(response=summary, tool_trace=trace)
 
+    def _answer(self, user_msg: str, history: list[dict[str, str]],
+                tool_context: list[dict[str, str]], trace: list[str]) -> TurnResult:
+        system = self._build_answer_system(user_msg)
+        messages = _fit_budget(
+            [{"role": "system", "content": system}, *history,
+             {"role": "user", "content": user_msg}, *tool_context],
+            self.cfg.context.token_budget,
+        )
+        try:
+            response = self.llm.complete(messages).strip() or "(empty response)"
+        except Exception as exc:
+            response = f"ERROR: LLM call failed: {exc}"
+        self.store.add_turn(self.session_id, "user", user_msg)
+        self.store.add_turn(self.session_id, "assistant", response)
+        return TurnResult(response=response, tool_trace=trace)
+
     # ------------------------------------------------------------------
     # Streaming interface (mist tui)
     # ------------------------------------------------------------------
-    async def astream_turn(self, user_msg: str) -> AsyncIterator[TurnEvent]:
+    async def astream_turn(self, user_msg: str, force_think: bool = False) -> AsyncIterator[TurnEvent]:
         """Async generator form of a turn: yields TurnEvents as they happen so
         a caller (the TUI) can render tokens live and — since this is a plain
-        asyncio coroutine — cancel it cleanly (Ctrl+C) at any await point."""
+        asyncio coroutine — cancel it cleanly (Ctrl+C) at any await point.
+
+        `force_think` opts the (normally non-reasoning) tool-decision calls
+        back into full reasoning for this turn specifically — see
+        astream_mission's stuck-recovery escalation for why."""
         history = self._history()
         # Context assembly can make a network call (embedding fallback in
         # skill routing); push it to a thread so a slow/unreachable embedding
@@ -301,8 +333,14 @@ class MistAgent:
         tool_context: list[dict[str, str]] = []
         for _ in range(self.cfg.context.max_tool_steps):
             action = None
+            last_error: Exception | None = None
             for _attempt in range(MAX_DECISION_RETRIES):
-                raw = await self.llm.acomplete(messages, json_schema=schema)
+                try:
+                    raw = await self.llm.acomplete(messages, json_schema=schema,
+                                                   force_think=force_think)
+                except Exception as exc:  # network/backend errors: retry, don't crash
+                    last_error = exc
+                    continue
                 try:
                     action = parse_json_relaxed(raw)
                     break
@@ -311,7 +349,10 @@ class MistAgent:
                     messages.append({"role": "user",
                                      "content": "Invalid JSON. Reply with ONLY the JSON object."})
             if action is None:
-                yield TurnEvent(kind="error", text="Model failed to produce valid JSON.")
+                if last_error is not None:
+                    yield TurnEvent(kind="error", text=f"LLM call failed: {last_error}")
+                else:
+                    yield TurnEvent(kind="error", text="Model failed to produce valid JSON.")
                 return
 
             if action.get("action") != "use_tool" or "tool" not in action:
@@ -359,11 +400,20 @@ class MistAgent:
             self.cfg.context.token_budget,
         )
         chunks: list[str] = []
-        async for delta in self.llm.astream(messages):
-            if not delta:
-                continue
-            chunks.append(delta)
-            yield TurnEvent(kind="delta", text=delta)
+        try:
+            async for delta in self.llm.astream(messages):
+                if not delta:
+                    continue
+                chunks.append(delta)
+                yield TurnEvent(kind="delta", text=delta)
+        except Exception as exc:  # network/backend errors must not crash the caller
+            partial = "".join(chunks).strip()
+            note = f"[interrupted: LLM call failed mid-stream: {exc}]"
+            response = f"{partial}\n{note}" if partial else f"ERROR: LLM call failed mid-stream: {exc}"
+            self.store.add_turn(self.session_id, "user", user_msg)
+            self.store.add_turn(self.session_id, "assistant", response)
+            yield TurnEvent(kind="error", text=f"LLM call failed mid-stream: {exc}")
+            return
         response = "".join(chunks).strip() or "(empty response)"
         self.store.add_turn(self.session_id, "user", user_msg)
         self.store.add_turn(self.session_id, "assistant", response)
@@ -391,6 +441,16 @@ class MistAgent:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(entry)
 
+    def debrief_mission(self, objective: str, status: str, log_path: Path) -> DebriefResult:
+        """Deterministically persists whatever a mission accomplished —
+        called at every end state (finished, limit hit, or killed) rather
+        than left to the model's own initiative, which in practice never
+        once called remember/write_file/write_skill across real runs."""
+        write_skill_tool = self.tools.get("write_skill")
+        write_skill_fn = write_skill_tool.run if write_skill_tool is not None else None
+        debriefer = MissionDebriefer(self.llm, self.store, self.cfg.wiki_root, write_skill_fn)
+        return debriefer.debrief(objective, status, log_path)
+
     async def astream_mission(self, objective: str, control: MissionControl,
                                max_turns: int | None = None,
                                max_seconds: float | None = None,
@@ -411,6 +471,10 @@ class MistAgent:
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
         self._mission_log_init(log_path, objective)
+        # Lets a driver (the TUI) recover the log path after killing this
+        # generator, since a kill runs debrief_mission separately rather
+        # than from inside the cancelled generator (see mist.tui.app).
+        yield MissionEvent(kind="started", text=str(log_path))
 
         self.always_exposed.add("finish_objective")
         try:
@@ -419,14 +483,20 @@ class MistAgent:
             user_msg = objective
             last_signature: str | None = None
             occurrences = 0
+            next_turn_think = False
+            recovered_once = False
 
             while True:
                 await control.wait_while_paused()
 
                 turns += 1
                 yield MissionEvent(kind="turn_start", text=f"turn {turns}")
+                use_think = next_turn_think
+                next_turn_think = False
                 finished = False
-                async for event in self.astream_turn(user_msg):
+                stuck = False
+                error_text: str | None = None
+                async for event in self.astream_turn(user_msg, force_think=use_think):
                     yield MissionEvent(kind=event.kind, text=event.text,
                                        tool=event.tool, detail=event.detail)
                     if event.kind == "tool_start":
@@ -438,21 +508,83 @@ class MistAgent:
                         sig = f"{event.tool}:{event.detail}"
                         occurrences = occurrences + 1 if sig == last_signature else 1
                         last_signature = sig
+                        if occurrences >= stuck_threshold:
+                            # Break out of astream_turn's own tool loop
+                            # immediately — a single turn can run up to
+                            # max_tool_steps tool calls on its own, so
+                            # checking only after the turn ends would let a
+                            # runaway repeat hammer the target far more than
+                            # stuck_threshold times before ever catching it.
+                            stuck = True
+                            break
                     elif event.kind == "tool_result":
                         self._mission_log_append(log_path, f"```\n{event.text}\n```\n")
+                    elif event.kind == "error":
+                        # A crashed LLM/network call ends astream_turn's own
+                        # generator, but the mission loop must not just spin
+                        # into an immediate retry — a dead backend would
+                        # otherwise burn through the whole turn budget in
+                        # seconds. Treat it like a stuck loop: pause and let
+                        # the operator see what happened.
+                        error_text = event.text
 
                 if finished:
                     self._mission_log_append(
                         log_path, f"\n**Finished** at {_now()}: objective complete.\n"
                     )
                     yield MissionEvent(kind="finished", text="Objective marked complete.")
+                    debrief = await asyncio.to_thread(
+                        self.debrief_mission, objective, "completed successfully", log_path
+                    )
+                    yield MissionEvent(kind="debrief", text=debrief.summary())
                     return
 
-                if occurrences >= stuck_threshold:
+                if stuck:
+                    if not recovered_once:
+                        # First time stuck on this streak: give it one
+                        # genuine reasoning pass instead of immediately
+                        # pausing for an operator. Every stuck-loop observed
+                        # in real runs was fixed by a human saying "stop and
+                        # actually think about why this isn't working" —
+                        # this is that same nudge, but resolved by the model
+                        # itself rather than requiring a human every time.
+                        self._mission_log_append(
+                            log_path,
+                            f"\n**Recovering** at {_now()}: repeated the same tool call "
+                            f"{occurrences}x in a row ({last_signature}) — attempting a "
+                            "reasoning-assisted recovery before pausing.\n",
+                        )
+                        yield MissionEvent(
+                            kind="recovering",
+                            text=(f"Repeated the same tool call {occurrences}x in a row "
+                                  f"({last_signature}) — reasoning through a different "
+                                  "approach before giving up."),
+                        )
+                        nudge = (f"You've repeated the same tool call ({last_signature}) "
+                                f"{occurrences} times in a row with no new result. Stop and "
+                                "actually think through why this specific approach isn't "
+                                "working, then commit to a genuinely different next step — "
+                                "not a minor variation of the same command.")
+                        user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
+                        occurrences = 0
+                        recovered_once = True
+                        next_turn_think = True
+                        continue
+
+                    # Already tried a reasoning-assisted recovery for this
+                    # streak and got stuck again — that didn't work either,
+                    # so this now genuinely needs an operator.
                     control.pause()
+                    self._mission_log_append(
+                        log_path,
+                        f"\n**Paused** at {_now()}: still stuck after a reasoning-assisted "
+                        f"recovery attempt — repeated the same tool call {occurrences}x in "
+                        f"a row again ({last_signature}).\n",
+                    )
                     yield MissionEvent(
                         kind="stuck",
-                        text=(f"Repeated the same tool call {occurrences}x in a row "
+                        text=(f"Still stuck after trying to reason through it — repeated "
+                              f"the same tool call {occurrences}x in a row again "
                               f"({last_signature}) — paused for operator review."),
                     )
                     nudge = (f"You've repeated the same tool call ({last_signature}) "
@@ -461,6 +593,22 @@ class MistAgent:
                             "blocked on if you need the operator's judgment.")
                     user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
                     occurrences = 0
+                    recovered_once = False
+                    continue
+
+                if error_text is not None:
+                    control.pause()
+                    self._mission_log_append(
+                        log_path, f"\n**Paused** at {_now()}: turn errored: {error_text}\n"
+                    )
+                    yield MissionEvent(
+                        kind="stuck",
+                        text=f"Turn failed ({error_text}) — paused for operator review.",
+                    )
+                    user_msg = _mission_continue_message(
+                        objective, control.pop_notes(),
+                        nudge=f"Your previous attempt failed: {error_text}. Try again.",
+                    )
                     continue
 
                 if turns >= max_turns:
@@ -468,6 +616,10 @@ class MistAgent:
                         log_path, f"\n**Stopped** at {_now()}: hit the {max_turns}-turn limit.\n"
                     )
                     yield MissionEvent(kind="finished", text=f"Hit the {max_turns}-turn mission limit.")
+                    debrief = await asyncio.to_thread(
+                        self.debrief_mission, objective, f"hit the {max_turns}-turn limit", log_path
+                    )
+                    yield MissionEvent(kind="debrief", text=debrief.summary())
                     return
 
                 if (time.monotonic() - start) >= max_seconds:
@@ -476,8 +628,16 @@ class MistAgent:
                     )
                     yield MissionEvent(kind="finished",
                                        text=f"Hit the {max_seconds:.0f}s mission time limit.")
+                    debrief = await asyncio.to_thread(
+                        self.debrief_mission, objective,
+                        f"hit the {max_seconds:.0f}s time limit", log_path
+                    )
+                    yield MissionEvent(kind="debrief", text=debrief.summary())
                     return
 
+                # Made it through a normal turn — any future stuck streak is
+                # a fresh problem and deserves its own recovery attempt.
+                recovered_once = False
                 user_msg = _mission_continue_message(objective, control.pop_notes())
         finally:
             self.always_exposed.discard("finish_objective")

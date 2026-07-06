@@ -17,6 +17,7 @@ backend: ollama            # ollama | vllm
 model: qwen2.5:14b # 'ollama pull qwen2.5:14b'
 base_url: http://localhost:11434   # vllm example: http://localhost:8000/v1
 api_key: ""                # only needed for secured vLLM deployments
+history_path: ~/.mist/history  # shared recall/autofill history for `mist chat` + `mist tui`
 
 context:
   token_budget: 6000       # hard cap on assembled prompt
@@ -38,6 +39,14 @@ skills:
 
 wiki:
   root_path: ~/.mist/wiki   # run `mist wiki-init` once to scaffold it
+
+workspace:
+  root_path: ~/.mist/workspace  # shell's cwd (local backend) — keeps downloaded files,
+                                 # scan output, etc. out of wherever mist happens to be
+                                 # launched from. Also the only place read_file/write_file/
+                                 # search_files honor an absolute path outside the wiki root —
+                                 # anywhere else on disk is refused, even if the model asks
+                                 # for it directly.
 
 embeddings:
   enabled: true

@@ -17,6 +17,11 @@ from mist.skills.router import SkillRouter
 from mist.tools.registry import ProcessRegistry, default_registry
 from mist.wiki import init_wiki
 
+try:
+    import readline  # noqa: F401 — importing wires it into input() as the line editor
+except ImportError:  # pragma: no cover - not available on stock Windows
+    readline = None
+
 app = typer.Typer(add_completion=False, help="Mist — context-frugal agent for small local LLMs")
 console = Console()
 
@@ -56,6 +61,7 @@ def _build_agent(config_path: str | None, backend: str | None,
         max_subagent_steps=cfg.subagents.max_steps,
         subagent_tools_enabled=cfg.subagents.tools_enabled,
         wiki_root=cfg.wiki_root,
+        workspace_root=cfg.workspace_root,
         enabled=cfg.tools.enabled,
         shell_config=cfg.tools.shell,
         process_registry=process_registry,
@@ -152,22 +158,41 @@ def chat(config: str = typer.Option(None, help="Path to config.yaml"),
     """Interactive chat session."""
     agent = _build_agent(config, backend, model, base_url)
     _print_welcome(agent)
-    while True:
+    history_path = agent.cfg.history_file
+    if readline is not None:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            user_msg = console.input("[bold green]you ›[/] ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\nbye")
-            break
-        if not user_msg:
-            continue
-        if user_msg.startswith("/"):
-            if _handle_command(user_msg, agent):
+            readline.read_history_file(history_path)
+        except OSError:
+            pass  # no history yet, or an unreadable/foreign-format file — start fresh
+        readline.set_history_length(500)
+    try:
+        while True:
+            try:
+                user_msg = console.input("[bold green]you ›[/] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\nbye")
                 break
-            continue
-        result = agent.turn(user_msg)
-        for step in result.tool_trace:
-            console.print(f"  [dim]⚙ {step}[/]")
-        console.print(f"[bold cyan]mist ›[/] {result.response}\n")
+            if not user_msg:
+                continue
+            if user_msg.startswith("/"):
+                if _handle_command(user_msg, agent):
+                    break
+                continue
+            try:
+                result = agent.turn(user_msg)
+            except Exception as exc:  # a crashed turn must not kill the whole REPL/session
+                console.print(f"[red]turn crashed: {exc}[/]\n")
+                continue
+            for step in result.tool_trace:
+                console.print(f"  [dim]⚙ {step}[/]")
+            console.print(f"[bold cyan]mist ›[/] {result.response}\n")
+    finally:
+        if readline is not None:
+            try:
+                readline.write_history_file(history_path)
+            except OSError:
+                pass
 
 
 @app.command()
@@ -178,7 +203,11 @@ def ask(prompt: str,
         base_url: str = typer.Option(None)):
     """One-shot question."""
     agent = _build_agent(config, backend, model, base_url)
-    result = agent.turn(prompt)
+    try:
+        result = agent.turn(prompt)
+    except Exception as exc:
+        console.print(f"[red]turn crashed: {exc}[/]")
+        raise typer.Exit(1) from exc
     console.print(result.response)
 
 

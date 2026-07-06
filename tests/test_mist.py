@@ -24,14 +24,14 @@ class FakeLLM:
     def __init__(self, replies):
         self.replies = list(replies)
 
-    def complete(self, messages, json_schema=None):
+    def complete(self, messages, json_schema=None, force_think=False):
         return self.replies.pop(0)
 
 
 class EchoLLM:
     """Thread-safe fake LLM: replies based on the last message's content
     instead of call order, so it's safe to use from concurrent callers."""
-    def complete(self, messages, json_schema=None):
+    def complete(self, messages, json_schema=None, force_think=False):
         return json.dumps({"response": f"handled: {messages[-1]['content']}"})
 
 
@@ -88,7 +88,14 @@ def test_tool_selection_capped(tmp_path):
 
 
 def test_agent_respond(tmp_path):
-    agent = make_agent(tmp_path, [json.dumps({"action": "respond", "response": "hi"})])
+    # turn() is now two calls: a decision-only call (no `response` field —
+    # see the module docstring on why that field being present in the same
+    # schema made the model default to describing instead of acting), then
+    # a separate unconstrained call that generates the actual answer text.
+    agent = make_agent(tmp_path, [
+        json.dumps({"action": "respond"}),
+        "hi",
+    ])
     result = agent.turn("hello")
     assert result.response == "hi"
     # persisted to history
@@ -100,7 +107,8 @@ def test_agent_tool_loop(tmp_path):
     agent = make_agent(tmp_path, [
         json.dumps({"action": "use_tool", "tool": "shell",
                     "arguments": {"command": "echo mist-test"}}),
-        json.dumps({"action": "respond", "response": "done"}),
+        json.dumps({"action": "respond"}),
+        "done",
     ])
     result = agent.turn("run echo")
     assert result.response == "done"
@@ -110,7 +118,8 @@ def test_agent_tool_loop(tmp_path):
 def test_agent_recovers_from_bad_json(tmp_path):
     agent = make_agent(tmp_path, [
         "not json at all",
-        json.dumps({"action": "respond", "response": "recovered"}),
+        json.dumps({"action": "respond"}),
+        "recovered",
     ])
     assert agent.turn("hi").response == "recovered"
 
@@ -228,7 +237,7 @@ class ToolEchoLLM:
     message it requests the shell tool (echoing the task text back), then on
     the tool result it responds with that result. Keyed off message content,
     not call order, so it's safe under concurrent callers."""
-    def complete(self, messages, json_schema=None):
+    def complete(self, messages, json_schema=None, force_think=False):
         last = messages[-1]["content"]
         if last.startswith("Tool result:"):
             return json.dumps({"action": "respond", "response": last})
@@ -313,6 +322,45 @@ def test_write_skill_rejects_invalid_name(tmp_path):
     assert not library.exists() or not any(library.iterdir())
 
 
+# -- raw/ immutability (mist.tools.registry write_file) ------------------
+
+def test_write_file_refuses_to_overwrite_existing_raw_source(tmp_path):
+    # SCHEMA.md documents raw/ as "read but never modify these once
+    # written", but nothing in code ever enforced it — a write_file call
+    # could silently clobber a curated source. Now it's actually blocked.
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "course-notes.md").write_text("original content\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+
+    out = tools.get("write_file").run(path="raw/course-notes.md", content="clobbered")
+    assert out.startswith("ERROR")
+    assert "immutable" in out
+    assert (raw / "course-notes.md").read_text(encoding="utf-8") == "original content\n"
+
+
+def test_write_file_still_allows_new_files_under_raw(tmp_path):
+    # Ingesting a new source into raw/ must still work — only overwriting an
+    # existing file is blocked.
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+    out = tools.get("write_file").run(path="raw/new-source.md", content="fresh content")
+    assert out.startswith("Wrote")
+    assert (tmp_path / "raw" / "new-source.md").read_text(encoding="utf-8") == "fresh content"
+
+
+def test_write_file_unaffected_outside_raw(tmp_path):
+    # Curated pages elsewhere in the wiki can still be freely created and
+    # overwritten — the restriction is specific to raw/.
+    entities = tmp_path / "entities"
+    entities.mkdir()
+    (entities / "target.md").write_text("old\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+
+    out = tools.get("write_file").run(path="entities/target.md", content="updated")
+    assert out.startswith("Wrote")
+    assert (entities / "target.md").read_text(encoding="utf-8") == "updated"
+
+
 # -- memory store concurrency (mist.memory.store.MemoryStore) -----------
 
 def test_memory_store_concurrent_writes_dont_corrupt(tmp_path):
@@ -356,6 +404,43 @@ def test_search_files_missing_root_returns_error():
     assert out.startswith("ERROR")
 
 
+def test_search_files_root_param_anchors_to_wiki_root_like_read_write(tmp_path):
+    # Regression test for a real bug: `root` was used as-is (relative to the
+    # process's cwd), unlike read_file/write_file's `path`, which anchors
+    # relative paths to the wiki root. A model passing root="entities"
+    # expecting <wiki_root>/entities got an unrelated (or nonexistent) cwd
+    # path instead. (Not testing with root="missions" here — that directory
+    # is now unconditionally excluded regardless of anchoring, see below.)
+    (tmp_path / "entities").mkdir()
+    (tmp_path / "entities" / "target.md").write_text("needle here\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+    out = tools.get("search_files").run(query="needle", root="entities")
+    assert "needle here" in out
+
+
+def test_search_files_excludes_missions_directory_regardless_of_root(tmp_path):
+    # Regression test for a real incident: the deterministic mission log
+    # lives under <wiki_root>/missions/ and grows live during the mission
+    # that might search it — a query matches its own previously-logged
+    # search for that same query, which gets logged, which the next search
+    # matches again, producing unbounded self-referential noise (observed
+    # as exponentially nested quoted blocks in a real run). The missions
+    # directory must never be searchable, no matter how `root` is set.
+    (tmp_path / "missions").mkdir()
+    (tmp_path / "missions" / "40-123.md").write_text("needle in the live log\n", encoding="utf-8")
+    (tmp_path / "entities").mkdir()
+    (tmp_path / "entities" / "real.md").write_text("needle in real content\n", encoding="utf-8")
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=tmp_path)
+
+    out = tools.get("search_files").run(query="needle")
+    assert "real content" in out
+    assert "live log" not in out
+
+    # Even an explicit attempt to search the missions dir directly finds nothing.
+    out2 = tools.get("search_files").run(query="needle", root="missions")
+    assert out2 == "No matches."
+
+
 def test_default_registry_exposes_search_files():
     tools = default_registry(remember_fn=lambda c: None)
     assert tools.get("search_files") is not None
@@ -392,9 +477,10 @@ def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     captured = {}
 
     class FakePopen:
-        def __init__(self, args, shell, stdout, stderr, text):
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
             captured["args"] = args
             captured["shell"] = shell
+            captured["cwd"] = cwd
             self.returncode = 0
 
         def communicate(self, timeout=None):
@@ -417,6 +503,110 @@ def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     assert args[-1] == "hostname"
     assert captured["timeout"] == 90
     assert captured["shell"] is False
+
+
+def test_shell_local_backend_uses_dedicated_workspace_cwd(tmp_path, monkeypatch):
+    # Regression test for a real incident: with no dedicated cwd, shell ran
+    # from wherever the mist process happened to be launched, and a mission
+    # wandered via relative paths into an unrelated sibling project
+    # directory (agent-zero) that happened to sit next to the launch dir.
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["cwd"] = cwd
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    workspace = tmp_path / "workspace"
+    tools = default_registry(remember_fn=lambda c: None, workspace_root=workspace)
+    tools.get("shell").run(command="pwd")
+
+    assert captured["cwd"] == workspace
+    assert workspace.is_dir()  # created on first use
+
+
+def test_shell_ssh_backend_cds_into_workspace_first(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["args"] = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(host="10.0.0.5"))
+    tools = default_registry(remember_fn=lambda c: None, shell_config=shell_cfg,
+                             workspace_root="/home/kali/.mist/workspace")
+    tools.get("shell").run(command="ls")
+
+    remote_command = captured["args"][-1]
+    assert "cd '/home/kali/.mist/workspace'" in remote_command
+    assert remote_command.endswith("&& ls")
+
+
+def test_read_file_rejects_absolute_path_outside_wiki_and_workspace_roots(tmp_path):
+    # The actual regression: read_file hit "not a file" on a wiki-relative
+    # path, the model retried with an absolute path "to avoid relative path
+    # errors", and that succeeded — reading an unrelated local project's
+    # source file that happened to share the same machine as mist itself.
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    outside = tmp_path / "some-other-project" / "secrets.py"
+    outside.parent.mkdir()
+    outside.write_text("API_KEY = 'sk-real-secret'")
+
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=wiki_root)
+    out = tools.get("read_file").run(path=str(outside))
+
+    assert "sk-real-secret" not in out
+    assert "outside Mist's wiki/workspace roots" in out
+
+
+def test_read_file_allows_absolute_path_inside_workspace_root(tmp_path):
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    scratch = workspace_root / "capture_notes.txt"
+    scratch.write_text("hello from the sandbox")
+
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=wiki_root,
+                             workspace_root=workspace_root)
+    out = tools.get("read_file").run(path=str(scratch))
+
+    assert "hello from the sandbox" in out
+
+
+def test_write_file_rejects_absolute_path_outside_roots(tmp_path):
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    outside = tmp_path / "unrelated-project" / "notes.md"
+
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=wiki_root)
+    out = tools.get("write_file").run(path=str(outside), content="whatever")
+
+    assert "outside Mist's wiki/workspace roots" in out
+    assert not outside.exists()
+
+
+def test_search_files_rejects_absolute_root_outside_wiki_and_workspace(tmp_path):
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    outside = tmp_path / "unrelated-project"
+    outside.mkdir()
+    (outside / "notes.md").write_text("some secret content here")
+
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=wiki_root)
+    out = tools.get("search_files").run(query="secret", root=str(outside))
+
+    assert "outside Mist's wiki/workspace roots" in out
 
 
 # -- process registry (operator kill actually terminates a running command) -
@@ -456,7 +646,41 @@ def test_tool_select_always_forces_inclusion_regardless_of_ranking():
     selected = tools.select("totally unrelated query about baking",
                             max_exposed=2, always={"finish_objective"})
     assert any(t.name == "finish_objective" for t in selected)
-    assert len(selected) == 2
+    assert len(selected) == 3  # 2 ranked + 1 forced (additive, see next test)
+
+
+def test_tool_select_always_is_additive_not_subtracted_from_cap():
+    # A forced tool must not crowd out ranked tools — otherwise raising
+    # max_exposed's floor for a forced set silently shrinks the ranked
+    # pool's own budget (the bug that made `remember` unreachable during
+    # early mission testing: max_exposed=5 minus 1 forced slot left only 4
+    # of {read_file, write_file, search_files, shell, remember}).
+    tools = default_registry(remember_fn=lambda c: None)
+    selected = tools.select("totally unrelated query about baking",
+                            max_exposed=5, always={"finish_objective"})
+    assert len(selected) == 6  # 5 ranked + 1 forced, not 5 total
+    names = {t.name for t in selected}
+    assert "finish_objective" in names
+    assert {"read_file", "write_file", "search_files", "shell", "remember"} <= names
+
+
+def test_finish_objective_never_selected_without_always_even_with_keyword_overlap():
+    # Regression test for a real incident: finish_objective's own keywords
+    # ("complete", "root", "objective", ...) let it outrank and displace
+    # `remember` on an ordinary ad hoc chat message ("perform a complete
+    # pentest ... get the user and root flags") that was never a mission —
+    # it must never appear in the ranked pool unless explicitly forced via
+    # `always` (i.e. only during astream_mission).
+    tools = default_registry(remember_fn=lambda c: None)
+    selected = tools.select(
+        "perform a complete pentest of the HTB machine named CAP at "
+        "10.129.30.111 to get the user and root flags",
+        max_exposed=5,
+    )
+    names = {t.name for t in selected}
+    assert "finish_objective" not in names
+    assert "shell" in names
+    assert "remember" in names
 
 
 # -- llm-wiki: init_wiki scaffold ----------------------------------------
@@ -500,7 +724,7 @@ class GatedAsyncLLM:
         self.release.set()  # unblocked by default; tests can .clear() to gate
         self.stream_calls = 0
 
-    async def acomplete(self, messages, json_schema=None):
+    async def acomplete(self, messages, json_schema=None, force_think=False):
         return self.decisions.pop(0)
 
     async def astream(self, messages):
@@ -518,7 +742,7 @@ class ScriptedAsyncLLM:
     def __init__(self, decisions):
         self.decisions = list(decisions)
 
-    async def acomplete(self, messages, json_schema=None):
+    async def acomplete(self, messages, json_schema=None, force_think=False):
         return self.decisions.pop(0)
 
     async def astream(self, messages):
@@ -581,6 +805,173 @@ async def test_astream_turn_errors_on_persistent_bad_json(tmp_path):
     agent = make_async_agent(tmp_path, llm)
     events = [e async for e in agent.astream_turn("hi")]
     assert events[-1].kind == "error"
+
+
+# -- resilience: a crashed LLM/network call must not crash the caller ----
+
+class RaisingLLM:
+    """Fake LLM whose calls always raise — simulates a network/backend
+    failure (timeout, connection reset, HTTP error) partway through a turn."""
+    def complete(self, messages, json_schema=None, force_think=False):
+        raise ConnectionError("backend unreachable")
+
+    async def acomplete(self, messages, json_schema=None, force_think=False):
+        raise ConnectionError("backend unreachable")
+
+    async def astream(self, messages):
+        raise ConnectionError("backend unreachable")
+        yield ""  # pragma: no cover - unreachable, makes this an async generator
+
+
+class RaisingMidStreamLLM:
+    async def acomplete(self, messages, json_schema=None, force_think=False):
+        return json.dumps({"action": "respond"})
+
+    async def astream(self, messages):
+        yield "partial "
+        raise ConnectionError("connection reset mid-stream")
+
+
+def test_turn_survives_llm_call_exception(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    agent = MistAgent(cfg, RaisingLLM(), store, skills, tools)
+
+    result = agent.turn("scan the target")
+    assert "ERROR" in result.response and "backend unreachable" in result.response
+    # Must still persist something — an empty, turn-less session is exactly
+    # what a crash used to leave behind.
+    turns = agent.store.recent_turns(agent.session_id, 10)
+    assert turns and turns[-1]["content"] == result.response
+
+
+async def test_astream_turn_survives_llm_call_exception(tmp_path):
+    agent = make_async_agent(tmp_path, RaisingLLM())
+    events = [e async for e in agent.astream_turn("scan the target")]
+    assert events[-1].kind == "error"
+    assert "backend unreachable" in events[-1].text
+
+
+async def test_stream_answer_survives_mid_stream_exception(tmp_path):
+    agent = make_async_agent(tmp_path, RaisingMidStreamLLM())
+    events = [e async for e in agent.astream_turn("hi")]
+    assert events[-1].kind == "error"
+    assert "connection reset" in events[-1].text
+    # The partial text generated before the crash isn't silently discarded.
+    turns = agent.store.recent_turns(agent.session_id, 10)
+    assert turns and "partial" in turns[-1]["content"]
+
+
+async def test_mission_pauses_on_turn_error_instead_of_spinning(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember, wiki_root=cfg.wiki_root)
+    agent = MistAgent(cfg, RaisingLLM(), store, skills, tools)
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("recon", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert control.paused
+    # Must not have burned through the whole 10-turn budget in a tight loop.
+    assert [e.kind for e in events].count("turn_start") == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_chat_repl_survives_llm_failure_via_graceful_turn_result(tmp_path, monkeypatch):
+    """agent.turn() now catches LLM/network failures itself (see
+    test_turn_survives_llm_call_exception), so `mist chat` should show a
+    clean ERROR reply and keep prompting — not crash the process. This was
+    a real incident: `mist chat` had no exception handling around
+    agent.turn() at all, found via ~/.mist/mist.db showing five sessions
+    created back-to-back with zero turns in any of them, consistent with
+    repeated crash-and-restart cycles."""
+    from mist import cli as cli_module
+
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    agent = MistAgent(cfg, RaisingLLM(), store, skills, tools)
+
+    monkeypatch.setattr(cli_module, "_build_agent", lambda *a, **k: agent)
+
+    inputs = iter(["hello", "still alive?"])
+
+    def fake_input(prompt=""):
+        try:
+            return next(inputs)
+        except StopIteration:
+            raise EOFError
+
+    monkeypatch.setattr(cli_module.console, "input", fake_input)
+    printed: list[str] = []
+    monkeypatch.setattr(cli_module.console, "print",
+                        lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+
+    cli_module.chat(config=None, backend=None, model=None, base_url=None)  # must not raise
+
+    text = "\n".join(printed)
+    assert text.count("ERROR: LLM call failed") == 2  # both turns failed gracefully
+    assert "bye" in text  # reached the clean EOF exit afterward, session still alive
+    turns = agent.store.recent_turns(agent.session_id, 10)
+    assert len(turns) == 4  # both crashed turns were still persisted, not lost
+
+
+def test_chat_repl_survives_unexpected_non_llm_exception(tmp_path, monkeypatch):
+    """Defense in depth: even a bug unrelated to the LLM call (e.g. inside
+    tool selection or memory search) must not kill the whole REPL — this
+    exercises `chat()`'s own try/except around agent.turn(), independent of
+    turn()'s internal LLM-failure handling."""
+    from mist import cli as cli_module
+
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    agent = MistAgent(cfg, RaisingLLM(), store, skills, tools)
+    monkeypatch.setattr(agent, "turn",
+                        lambda user_msg: (_ for _ in ()).throw(RuntimeError("unrelated bug")))
+
+    monkeypatch.setattr(cli_module, "_build_agent", lambda *a, **k: agent)
+
+    inputs = iter(["hello", "still alive?"])
+
+    def fake_input(prompt=""):
+        try:
+            return next(inputs)
+        except StopIteration:
+            raise EOFError
+
+    monkeypatch.setattr(cli_module.console, "input", fake_input)
+    printed: list[str] = []
+    monkeypatch.setattr(cli_module.console, "print",
+                        lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+
+    cli_module.chat(config=None, backend=None, model=None, base_url=None)  # must not raise
+
+    text = "\n".join(printed)
+    assert text.count("turn crashed") == 2
+    assert "bye" in text
 
 
 async def test_astream_turn_can_be_cancelled_mid_stream(tmp_path):
@@ -667,7 +1058,7 @@ async def test_tui_queues_messages_submitted_mid_turn():
 
 async def test_tui_ctrl_c_interrupts_without_quitting():
     class InfiniteLLM:
-        async def acomplete(self, messages, json_schema=None):
+        async def acomplete(self, messages, json_schema=None, force_think=False):
             return json.dumps({"action": "respond"})
 
         async def astream(self, messages):
@@ -709,7 +1100,7 @@ class GatedMissionLLM:
         self.gate = asyncio.Event()
         self.auto = False
 
-    async def acomplete(self, messages, json_schema=None):
+    async def acomplete(self, messages, json_schema=None, force_think=False):
         if not self.auto:
             await self.gate.wait()
             self.gate.clear()
@@ -879,6 +1270,42 @@ async def test_tui_ctrl_c_kills_mission_and_terminates_subprocess(tmp_path):
         assert proc.returncode != 0  # terminated, not a natural 5s completion
 
 
+async def test_tui_kill_triggers_debrief(tmp_path):
+    # A killed mission must still be debriefed — whatever it found before
+    # being stopped shouldn't be silently lost, same as a natural finish.
+    class DebriefableLLM(ScriptedAsyncLLM):
+        def complete(self, messages, json_schema=None, force_think=False):
+            return json.dumps({"memories": [{"content": "confirmed something before being killed"}]})
+
+    agent = make_mission_tui_agent(tmp_path, DebriefableLLM([
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "sleep 5"}}),
+    ]))
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission run a slow command":
+            await pilot.press(ch)
+        await pilot.press("enter")
+
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if agent.process_registry._proc is not None:
+                break
+        assert agent.process_registry._proc is not None
+
+        await pilot.press("ctrl+c")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+        assert app._mission_task is None
+        text = _transcript_text(app)
+        assert "mission killed" in text
+        assert "Debrief:" in text
+        assert any("confirmed something before being killed" in h
+                   for h in agent.store.search("confirmed something"))
+
+
 # -- LLMClient async streaming wire format (mist.llm.client) --------------
 
 import httpx  # noqa: E402
@@ -899,6 +1326,151 @@ async def test_ollama_astream_parses_ndjson_deltas():
     client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
     assert "".join(chunks) == "Hello"
+
+
+async def test_ollama_astream_ignores_thinking_field_and_yields_content():
+    # Ollama's native thinking mode puts reasoning in its own "thinking"
+    # field, entirely separate from "content" — not inline <think> tags.
+    def handler(request):
+        lines = [
+            json.dumps({"message": {"content": "", "thinking": "let me consider..."},
+                       "done": False}),
+            json.dumps({"message": {"content": "", "thinking": " done reasoning"},
+                       "done": False}),
+            json.dumps({"message": {"content": "OK"}, "done": False}),
+            json.dumps({"message": {"content": ""}, "done": True}),
+        ]
+        return httpx.Response(200, content="\n".join(lines) + "\n")
+
+    client = LLMClient("ollama", "http://fake", "m", think=True)
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
+    assert "".join(chunks) == "OK"  # reasoning text never leaks into the visible stream
+
+
+async def test_ollama_astream_diagnoses_thinking_that_exhausts_the_token_budget():
+    # Regression test for a real incident: qwen3.6:35b-a3b, asked to "perform
+    # a complete pentest ... get the user and root flags" with
+    # generation.max_tokens: 1024, spent its whole budget in the "thinking"
+    # field and never produced any "content" at all — the operator saw a
+    # bare "(empty response)" with no indication that raising max_tokens (or
+    # disabling `think`) was the fix.
+    def handler(request):
+        lines = [
+            json.dumps({"message": {"content": "", "thinking": "reasoning that never finishes"},
+                       "done": False}),
+            json.dumps({"message": {"content": ""}, "done": True, "done_reason": "length"}),
+        ]
+        return httpx.Response(200, content="\n".join(lines) + "\n")
+
+    client = LLMClient("ollama", "http://fake", "m", think=True)
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
+    text = "".join(chunks)
+    assert "ran out of tokens" in text
+    assert "max_tokens" in text
+
+
+async def test_ollama_astream_falls_back_when_model_lacks_thinking():
+    # Regression test for a real incident: qwen2.5:14b (the default model)
+    # doesn't support Ollama's thinking mode at all. Sending "think": true
+    # isn't silently ignored — Ollama hard-rejects the whole request with a
+    # 400, which broke every conversational reply (found via a real
+    # ~/.mist/mist.db turn containing "ERROR: LLM call failed mid-stream:
+    # 400 Bad Request"). The client must detect this and retry without
+    # thinking, then remember not to try again for that model.
+    calls: list[bool | None] = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body.get("think"))
+        if body.get("think"):
+            payload = json.dumps({"error": '"m" does not support thinking'}).encode()
+            return httpx.Response(400, content=payload)
+        lines = [
+            json.dumps({"message": {"content": "OK"}, "done": False}),
+            json.dumps({"message": {"content": ""}, "done": True}),
+        ]
+        return httpx.Response(200, content="\n".join(lines) + "\n")
+
+    client = LLMClient("ollama", "http://fake", "m", think=True)
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
+    assert "".join(chunks) == "OK"
+    assert calls == [True, False]  # one failed attempt, then a clean retry
+    assert client._think_unsupported == {"m"}
+
+    calls.clear()
+    chunks2 = [c async for c in client.astream([{"role": "user", "content": "again"}])]
+    assert "".join(chunks2) == "OK"
+    assert calls == [False]  # cached — no wasted failing request this time
+
+
+async def test_acomplete_force_think_overrides_schema_default_off():
+    # Schema-constrained calls force thinking off by default (routine
+    # decisions don't need it and it's slower), but stuck-loop recovery
+    # opts back in for one call via force_think — confirmed on the real
+    # server that Ollama's native thinking mode keeps `content` clean even
+    # under a JSON schema (reasoning lives in a separate "thinking" field),
+    # so this doesn't reintroduce the JSON-corruption risk.
+    think_values = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        think_values.append(body.get("think"))
+        return httpx.Response(200, json={"message": {"content": '{"action": "respond"}'}})
+
+    client = LLMClient("ollama", "http://fake", "m", think=True)
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}}
+
+    await client.acomplete([{"role": "user", "content": "hi"}], json_schema=schema)
+    await client.acomplete([{"role": "user", "content": "hi"}], json_schema=schema, force_think=True)
+
+    assert think_values == [False, True]
+
+
+# -- _filter_thinking (mist.llm.client) -----------------------------------
+
+from mist.llm.client import _filter_thinking  # noqa: E402
+
+
+async def _agen(chunks):
+    for c in chunks:
+        yield c
+
+
+async def test_filter_thinking_hides_a_normal_terminated_block():
+    out = [c async for c in _filter_thinking(_agen(
+        ["<think>reasoning here</think>", "the real answer"]
+    ))]
+    assert "".join(out) == "the real answer"
+
+
+async def test_filter_thinking_surfaces_diagnostic_when_think_never_closes():
+    # Regression test for a real incident: qwen3.6:35b-a3b spent its entire
+    # generation.max_tokens budget reasoning about a broad request
+    # ("perform a complete pentest ... get the user and root flags") and
+    # never emitted a closing </think> — the operator saw a bare
+    # "(empty response)" with zero indication that raising max_tokens (or
+    # disabling `think`) was the actual fix.
+    out = [c async for c in _filter_thinking(_agen(
+        ["<think>", "reasoning that goes on and on and never finishes..."]
+    ))]
+    text = "".join(out)
+    assert "ran out of tokens" in text
+    assert "max_tokens" in text
+
+
+async def test_filter_thinking_no_diagnostic_when_something_was_already_shown():
+    # If the model DID produce a real answer before a later, separate think
+    # span gets cut off (unusual, but shouldn't happen), don't tack on a
+    # confusing diagnostic after real content.
+    out = [c async for c in _filter_thinking(_agen(
+        ["the real answer", "<think>", "unterminated"]
+    ))]
+    assert "".join(out) == "the real answer"
 
 
 async def test_vllm_astream_parses_sse_deltas():
@@ -975,6 +1547,159 @@ async def test_mission_writes_deterministic_log_regardless_of_model(tmp_path):
     assert "shell" in text and "finish_objective" in text
 
 
+# -- mission debrief (mist.core.debrief.MissionDebriefer) -----------------
+
+from mist.core.debrief import MissionDebriefer  # noqa: E402
+
+
+def test_mission_debriefer_persists_memories_entity_and_skill(tmp_path):
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("### shell(nmap)\n```\n21/tcp open ftp vsftpd 3.0.3\n```\n",
+                        encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([json.dumps({
+        "memories": [{"content": "Cap (10.129.30.111): vsftpd 3.0.3 on 21/tcp"}],
+        "entity_page": {"title": "Cap", "body": "FTP: vsftpd 3.0.3."},
+        "skill": {"name": "FTP Cleartext Creds via PCAP",
+                  "description": "confirmed pcap capture reveals ftp creds",
+                  "body": "1. Download /capture repeatedly. 2. tshark -Y ftp."},
+    })])
+    written_skills = []
+    debriefer = MissionDebriefer(
+        llm, store, tmp_path,
+        write_skill_fn=lambda name, desc, body: written_skills.append((name, desc, body)) or "Wrote skill",
+    )
+
+    result = debriefer.debrief("pwn Cap", "completed successfully", log_path)
+
+    assert result.memories_written == 1
+    assert any("vsftpd" in h for h in store.search("Cap ftp"))
+    assert result.entity_page == "entities/cap.md"
+    assert (tmp_path / "entities" / "cap.md").read_text(encoding="utf-8").startswith("# Cap")
+    assert result.skill_written == "Wrote skill"
+    assert written_skills and written_skills[0][0] == "FTP Cleartext Creds via PCAP"
+
+
+def test_mission_debriefer_appends_to_existing_entity_page_without_clobbering(tmp_path):
+    (tmp_path / "entities").mkdir()
+    existing = tmp_path / "entities" / "cap.md"
+    existing.write_text("# Cap\n\noriginal findings\n", encoding="utf-8")
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("some transcript\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([json.dumps({
+        "memories": [],
+        "entity_page": {"title": "Cap", "body": "new findings from a later mission"},
+    })])
+    debriefer = MissionDebriefer(llm, store, tmp_path)
+
+    debriefer.debrief("pwn Cap again", "completed successfully", log_path)
+
+    text = existing.read_text(encoding="utf-8")
+    assert "original findings" in text  # not clobbered
+    assert "new findings from a later mission" in text  # appended
+
+
+def test_mission_debriefer_omits_skill_when_none_confirmed(tmp_path):
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("transcript with no confirmed wins\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([json.dumps({"memories": [{"content": "no progress made"}]})])
+    written_skills = []
+    debriefer = MissionDebriefer(
+        llm, store, tmp_path,
+        write_skill_fn=lambda name, desc, body: written_skills.append(name) or "Wrote skill",
+    )
+
+    result = debriefer.debrief("pwn Cap", "hit the turn limit", log_path)
+
+    assert result.memories_written == 1
+    assert result.skill_written is None
+    assert not written_skills  # never called when the model omits `skill`
+
+
+def test_mission_debriefer_survives_llm_failure(tmp_path):
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("some transcript\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    debriefer = MissionDebriefer(RaisingLLM(), store, tmp_path)
+
+    result = debriefer.debrief("pwn Cap", "killed by the operator", log_path)
+    assert result.memories_written == 0  # degrades to a no-op, doesn't crash
+
+
+def test_mission_debriefer_survives_memories_as_plain_strings(tmp_path):
+    # Regression test for a real incident: a live debrief against
+    # qwen3.6:35b-a3b returned `memories` as a list of plain strings instead
+    # of the schema's [{"content": ...}] shape, crashing with
+    # AttributeError('str' object has no attribute 'get') outside the
+    # try/except that was supposed to guard against exactly this.
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("some transcript\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([json.dumps({"memories": ["plain string memory one", "plain string memory two"]})])
+    debriefer = MissionDebriefer(llm, store, tmp_path)
+
+    result = debriefer.debrief("pwn Cap", "killed by the operator", log_path)  # must not raise
+    assert result.memories_written == 2
+    assert any("plain string memory one" in h for h in store.search("plain string memory"))
+
+
+def test_mission_debriefer_survives_malformed_entity_and_skill_shapes(tmp_path):
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("some transcript\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([json.dumps({
+        "memories": [{"content": "ok"}],
+        "entity_page": "not an object",
+        "skill": ["also", "not", "an", "object"],
+    })])
+    debriefer = MissionDebriefer(llm, store, tmp_path, write_skill_fn=lambda n, d, b: "Wrote skill")
+
+    result = debriefer.debrief("pwn Cap", "killed by the operator", log_path)  # must not raise
+    assert result.memories_written == 1
+    assert result.entity_page is None
+    assert result.skill_written is None
+
+
+def test_mission_debriefer_skips_empty_transcript(tmp_path):
+    log_path = tmp_path / "empty.md"
+    log_path.write_text("", encoding="utf-8")
+    store = MemoryStore(tmp_path / "m.db")
+    llm = FakeLLM([])  # must never be called
+    debriefer = MissionDebriefer(llm, store, tmp_path)
+
+    result = debriefer.debrief("pwn Cap", "killed by the operator", log_path)
+    assert result.memories_written == 0
+    assert llm.replies == []  # untouched — confirms no LLM call was made
+
+
+async def test_astream_mission_debriefs_on_natural_finish(tmp_path):
+    class DebriefableLLM(ScriptedAsyncLLM):
+        def complete(self, messages, json_schema=None, force_think=False):
+            return json.dumps({"memories": [{"content": "confirmed a finding"}]})
+
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember, wiki_root=cfg.wiki_root)
+    agent = MistAgent(cfg, DebriefableLLM([
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "done"}}),
+        json.dumps({"action": "respond"}),
+    ]), store, skills, tools)
+
+    control = MissionControl()
+    events = [e async for e in agent.astream_mission("test objective", control, max_turns=10)]
+    kinds = [e.kind for e in events]
+    assert kinds[0] == "started"  # log path emitted first, for a driver to capture
+    assert "debrief" in kinds
+    debrief_event = next(e for e in events if e.kind == "debrief")
+    assert "1 memory" in debrief_event.text
+    assert any("confirmed a finding" in h for h in store.search("confirmed finding"))
+
+
 async def test_mission_stops_at_max_turns(tmp_path):
     agent = make_mission_agent(tmp_path, [
         json.dumps({"action": "respond"}) for _ in range(6)
@@ -987,11 +1712,16 @@ async def test_mission_stops_at_max_turns(tmp_path):
 
 
 async def test_mission_auto_pauses_on_repeated_identical_tool_call(tmp_path):
+    # With stuck_repeat_threshold=2: the first 2-in-a-row triggers a
+    # reasoning-assisted recovery attempt (auto-continues, no real pause);
+    # repeating again after that triggers a genuine pause. See the two-tier
+    # escalation tests below for a focused check of that behavior — this
+    # test just confirms a real pause is still reachable end-to-end.
     agent = make_mission_agent(tmp_path, [
         json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
-        json.dumps({"action": "respond"}),
         json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
-        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
         json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
         json.dumps({"action": "respond"}),
     ])
@@ -1009,10 +1739,100 @@ async def test_mission_auto_pauses_on_repeated_identical_tool_call(tmp_path):
         if any(e.kind == "stuck" for e in events):
             break
         await asyncio.sleep(0.01)
-    assert control.paused
+    assert any(e.kind == "recovering" for e in events)  # tried to self-recover first
+    assert control.paused  # then genuinely paused once that also failed
     control.resume()
     await task
     assert "finished" in [e.kind for e in events]
+
+    # Regression test for a real gap found in live use: the stuck-pause
+    # itself was never written to the deterministic mission log, only tool
+    # calls were — an operator reviewing the log file afterward would see it
+    # cut off mid-command with no explanation of why the mission stopped
+    # there.
+    log_files = list((agent.cfg.wiki_root / "missions").glob("*.md"))
+    assert log_files
+    text = log_files[0].read_text()
+    assert "**Paused**" in text and "repeated the same tool call" in text
+
+
+async def test_mission_stuck_detection_fires_mid_turn_not_after_full_tool_budget(tmp_path):
+    # Regression test for a real bug found during live testing: the same
+    # failing command repeated many times within a *single* turn's own
+    # tool-step loop (no intervening "respond") only got caught after the
+    # whole turn finished, because the stuck-check lived outside
+    # astream_turn's inner loop. It must fire as soon as
+    # stuck_repeat_threshold is hit, not wait for the turn's full
+    # max_tool_steps budget to be exhausted. With the two-tier escalation,
+    # the same fake LLM (which ignores force_think and just keeps returning
+    # the identical scripted call) hits the threshold twice — once
+    # triggering a reasoning-assisted recovery attempt, then again
+    # triggering a real pause — so 2x stuck_repeat_threshold calls total,
+    # still far short of the 10 scripted here or the 20-step turn budget.
+    same_call = json.dumps({"action": "use_tool", "tool": "shell",
+                            "arguments": {"command": "echo no_output"}})
+    agent = make_mission_agent(tmp_path, [same_call] * 10)
+    agent.cfg.mission.stuck_repeat_threshold = 3
+    agent.cfg.context.max_tool_steps = 20
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("recon the target", control, max_turns=5):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+
+    tool_starts = [e for e in events if e.kind == "tool_start"]
+    assert len(tool_starts) == 6  # one recovery attempt (3) + one real escalation (3), not 10
+    assert any(e.kind == "recovering" for e in events)
+    stuck = [e for e in events if e.kind == "stuck"]
+    assert stuck and "3x" in stuck[0].text
+    assert control.paused  # stays paused until the operator resumes/kills it
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
+    # The reasoning-assisted recovery attempt must actually request thinking
+    # for that one turn (force_think=True), and only that turn — not every
+    # decision, which would make every routine turn needlessly slow (a real
+    # decision call with thinking enabled took ~13s in practice vs
+    # sub-second without).
+    class RecordingLLM(ScriptedAsyncLLM):
+        def __init__(self, decisions):
+            super().__init__(decisions)
+            self.force_think_calls: list[bool] = []
+
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            self.force_think_calls.append(force_think)
+            return self.decisions.pop(0)
+
+    llm = RecordingLLM([
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "respond"}),  # the recovery turn's own decision
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "ok"}}),  # a normal turn afterward
+        json.dumps({"action": "respond"}),
+    ])
+    agent = make_mission_agent(tmp_path, [])
+    agent.llm = llm
+    agent.cfg.mission.stuck_repeat_threshold = 2
+    control = MissionControl()
+
+    events = [e async for e in agent.astream_mission("ping until responsive", control, max_turns=10)]
+
+    assert any(e.kind == "recovering" for e in events)
+    assert "finished" in [e.kind for e in events]
+    assert llm.force_think_calls == [False, False, True, False, False]
 
 
 async def test_mission_finish_objective_reachable_even_off_topic(tmp_path):
@@ -1042,3 +1862,95 @@ def test_mission_control_pause_resume_and_notes():
     assert control.pop_notes() == []  # drained
     control.resume()
     assert not control.paused
+
+
+# -- persistent input history (mist.history.HistoryStore) ----------------
+
+from mist.history import HistoryStore  # noqa: E402
+
+
+def test_history_store_roundtrips_across_instances(tmp_path):
+    path = tmp_path / "history"
+    store = HistoryStore(path)
+    store.add("nmap -sV 10.129.30.111")
+    store.add("/model qwen3.6:35b-a3b")
+
+    reloaded = HistoryStore(path)
+    assert reloaded.all() == ["nmap -sV 10.129.30.111", "/model qwen3.6:35b-a3b"]
+
+
+def test_history_store_resubmitting_entry_moves_it_to_most_recent(tmp_path):
+    store = HistoryStore(tmp_path / "history")
+    store.add("first")
+    store.add("second")
+    store.add("first")
+    assert store.all() == ["second", "first"]  # no stale duplicate left behind
+
+
+def test_history_store_ignores_blank_entries(tmp_path):
+    store = HistoryStore(tmp_path / "history")
+    store.add("   ")
+    store.add("")
+    assert store.all() == []
+
+
+def test_history_store_caps_at_max_entries(tmp_path):
+    store = HistoryStore(tmp_path / "history", max_entries=3)
+    for i in range(5):
+        store.add(f"entry {i}")
+    assert store.all() == ["entry 2", "entry 3", "entry 4"]
+
+
+def test_history_store_starts_empty_when_no_file_exists(tmp_path):
+    store = HistoryStore(tmp_path / "does-not-exist")
+    assert store.all() == []
+
+
+# -- streaming TUI: history recall + ghost-text autofill ------------------
+
+from mist.tui.app import HistoryInput, HistorySuggester  # noqa: E402
+
+
+async def test_history_suggester_matches_most_recent_prefix():
+    history = HistoryStore.__new__(HistoryStore)  # bypass file I/O for a pure unit test
+    history._entries = ["nmap -sV 10.0.0.1", "nmap -sS -p- 10.0.0.1"]
+    suggester = HistorySuggester(history)
+    assert await suggester.get_suggestion("nmap") == "nmap -sS -p- 10.0.0.1"
+    assert await suggester.get_suggestion("nmap -sV") is None  # exact match, nothing to add
+    assert await suggester.get_suggestion("") is None
+    assert await suggester.get_suggestion("gobuster") is None
+
+
+async def test_tui_up_down_recalls_history(tmp_path):
+    agent = make_async_agent(tmp_path, ScriptedAsyncLLM([
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "respond"}),
+    ]))
+    agent.cfg.history_path = str(tmp_path / "history")
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        input_widget = app.query_one("#input", HistoryInput)
+        assert isinstance(input_widget, HistoryInput)
+
+        await pilot.click("#input")
+        for ch in "first command":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        for ch in "second command":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        await pilot.pause(0.05)
+
+        await pilot.press("up")
+        assert input_widget.value == "second command"
+        await pilot.press("up")
+        assert input_widget.value == "first command"
+        await pilot.press("up")  # already at the oldest entry — stays put
+        assert input_widget.value == "first command"
+
+        await pilot.press("down")
+        assert input_widget.value == "second command"
+        await pilot.press("down")
+        assert input_widget.value == ""  # past the newest entry -> back to the draft

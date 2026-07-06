@@ -216,6 +216,19 @@ Mission mode is TUI-only: `mist chat`'s plain synchronous REPL can't run a
 turn in the background while also accepting `/pause` input, so `/mission`
 there just points you at `mist tui`.
 
+### Input history and autofill
+
+Every line submitted — a message or a `/command` — is recorded to
+`history_path` (default `~/.mist/history`), shared between `mist tui` and
+`mist chat`:
+
+- **`mist tui`**: `↑`/`↓` recall previous entries (shell-style); as you type,
+  the most recent matching entry appears as ghost text, accepted with `End`
+  or `→` at the end of the line (Textual's built-in suggestion mechanism).
+- **`mist chat`**: backed by GNU `readline` — the same `↑`/`↓` recall works
+  because Python's `input()` picks up `readline` automatically once it's
+  imported, so no separate implementation was needed there.
+
 ## Status
 
 Early scaffold. Core loop, memory store, skill router, batch summarizer,

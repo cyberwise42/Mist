@@ -32,6 +32,12 @@ class WikiConfig(BaseModel):
     root_path: str = "~/.mist/wiki"
 
 
+class WorkspaceConfig(BaseModel):
+    root_path: str = "~/.mist/workspace"  # shell's cwd, and the only absolute-path
+                                          # escape hatch read_file/write_file/search_files
+                                          # allow outside the wiki root
+
+
 class EmbeddingConfig(BaseModel):
     enabled: bool = True
     backend: str = "ollama"          # ollama | vllm
@@ -86,15 +92,21 @@ class MistConfig(BaseModel):
     model: str = "qwen2.5:14b"
     base_url: str = "http://localhost:11434"
     api_key: str = ""
+    history_path: str = "~/.mist/history"  # shared recall/autofill, mist chat + mist tui
     context: ContextConfig = Field(default_factory=ContextConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     embeddings: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     mission: MissionConfig = Field(default_factory=MissionConfig)
+
+    @property
+    def history_file(self) -> Path:
+        return Path(os.path.expanduser(self.history_path))
 
     @property
     def db_path(self) -> Path:
@@ -103,6 +115,10 @@ class MistConfig(BaseModel):
     @property
     def wiki_root(self) -> Path:
         return Path(os.path.expanduser(self.wiki.root_path))
+
+    @property
+    def workspace_root(self) -> Path:
+        return Path(os.path.expanduser(self.workspace.root_path))
 
 
 def load_config(path: str | None = None) -> MistConfig:
