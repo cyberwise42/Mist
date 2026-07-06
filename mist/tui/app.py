@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -31,11 +32,14 @@ from textual.binding import Binding
 from textual.suggester import Suggester
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
-from mist.banner import BANNER, TAGLINE, help_lines
+from mist.banner import help_lines
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
 from mist.core.summarizer import BatchSummarizer
 from mist.history import HistoryStore
+from mist.tui.onboarding import build_onboarding_panel
+from mist.tui.render import format_status, format_tool_call
+from mist.tui.theme import ACCENT, ERROR, MIST_THEME, SUCCESS, WARNING
 
 
 class HistorySuggester(Suggester):
@@ -98,29 +102,7 @@ class HistoryInput(Input):
 
 
 class MistTUI(App):
-    CSS = """
-    Screen {
-        layout: vertical;
-    }
-    #transcript {
-        height: 1fr;
-        border: round $accent;
-        margin: 0 1;
-    }
-    #typing {
-        height: auto;
-        margin: 0 2;
-        color: $text;
-    }
-    #status {
-        height: 1;
-        margin: 0 2;
-        color: $text-muted;
-    }
-    #input {
-        margin: 0 1 1 1;
-    }
-    """
+    CSS_PATH = "app.tcss"
 
     BINDINGS = [
         Binding("ctrl+c", "interrupt", "Interrupt/Kill", priority=True),
@@ -129,6 +111,8 @@ class MistTUI(App):
 
     def __init__(self, agent: MistAgent):
         super().__init__()
+        self.register_theme(MIST_THEME)
+        self.theme = "mist-dark"
         self.agent = agent
         self.history = HistoryStore(agent.cfg.history_file)
         self.queue: asyncio.Queue[str] = asyncio.Queue()
@@ -139,6 +123,12 @@ class MistTUI(App):
         self._mission_objective: str = ""
         self._mission_turn: int = 0
         self._mission_log_path: str | None = None
+        # Status-line state: `_status_state` is the free-text phase ("idle",
+        # "thinking…", "tool: shell", ...); `_turn_started_at` (wall-clock,
+        # via time.monotonic) drives the live elapsed-time counter and is
+        # only non-None while a turn or mission is actually in flight.
+        self._status_state: str = "idle"
+        self._turn_started_at: float | None = None
 
     # ------------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -155,9 +145,11 @@ class MistTUI(App):
     def on_mount(self) -> None:
         self.title = "Mist"
         self.sub_title = f"{self.agent.cfg.backend} / {self.agent.cfg.model} (session {self.agent.session_id})"
+        self.query_one("#transcript", RichLog).border_title = f" mist · session {self.agent.session_id} "
         self._write_welcome()
         self._refresh_status("idle")
         self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+        self.set_interval(1.0, self._tick_status)
         self.query_one("#input", Input).focus()
 
     async def on_unmount(self) -> None:
@@ -171,15 +163,11 @@ class MistTUI(App):
     # ------------------------------------------------------------------
     def _write_welcome(self) -> None:
         log = self.query_one("#transcript", RichLog)
-        log.write(f"[bold cyan]{BANNER}[/]")
-        log.write(f"[dim]{TAGLINE}[/]")
+        log.write(build_onboarding_panel(self.agent))
         log.write("")
-        log.write(f"[dim]{self.agent.cfg.backend} / {self.agent.cfg.model} "
-                  f"(session {self.agent.session_id})[/]")
-        log.write("")
-        self._write_help(log)
         log.write("[dim]Type a message to talk to Mist, or a /command above. "
-                  "↑/↓ recall history, ghost text autofills a past match.[/]")
+                  "↑/↓ recall history, ghost text autofills a past match. "
+                  "/help for the full command list.[/]")
         log.write("")
 
     def _write_help(self, log: RichLog) -> None:
@@ -188,9 +176,32 @@ class MistTUI(App):
             log.write(f"  [dim]{line}[/]")
 
     def _refresh_status(self, state: str) -> None:
-        n = self.queue.qsize()
-        suffix = f"  ·  {n} queued" if n else ""
-        self.query_one("#status", Static).update(f"[dim]{state}{suffix}[/]")
+        self._status_state = state
+        if state == "idle":
+            self._turn_started_at = None
+        elif self._turn_started_at is None:
+            self._turn_started_at = time.monotonic()
+        self._render_status()
+
+    def _render_status(self) -> None:
+        elapsed = (time.monotonic() - self._turn_started_at
+                  if self._turn_started_at is not None else None)
+        text = format_status(
+            state=self._status_state,
+            elapsed=elapsed,
+            model=self.agent.cfg.model,
+            used_tokens=self.agent.last_context_tokens,
+            budget=self.agent.cfg.context.token_budget,
+            session_id=self.agent.session_id,
+            queued=self.queue.qsize(),
+        )
+        self.query_one("#status", Static).update(f"[dim]{text}[/]")
+
+    def _tick_status(self) -> None:
+        # Keeps the elapsed-time counter visibly live during a long-running
+        # tool call with no other events to trigger a re-render.
+        if self._turn_started_at is not None:
+            self._render_status()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -206,11 +217,11 @@ class MistTUI(App):
         if self._mission_task is not None and not self._mission_task.done():
             self._mission_control.add_note(text)
             self.query_one("#transcript", RichLog).write(
-                f"[bold green]you ›[/] {text}\n"
+                f"[bold {SUCCESS}]you ›[/] {text}\n"
                 f"  [dim]‹ noted — will steer the mission's next step ›[/]"
             )
             return
-        self.query_one("#transcript", RichLog).write(f"[bold green]you ›[/] {text}")
+        self.query_one("#transcript", RichLog).write(f"[bold {SUCCESS}]you ›[/] {text}")
         self.queue.put_nowait(text)
         self._refresh_status("thinking…" if self._turn_task else "idle")
 
@@ -378,21 +389,21 @@ class MistTUI(App):
         mutable accumulation state across repeated calls."""
         if event.kind == "delta":
             buffer[0] += event.text
-            typing.update(f"[bold cyan]mist ›[/] {buffer[0]}")
+            typing.update(f"[bold {ACCENT}]mist ›[/] {buffer[0]}")
         elif event.kind == "tool_start":
             self._refresh_status(f"tool: {event.tool}")
-            log.write(f"  [dim]⚙ {event.tool}({event.detail})[/]")
+            log.write(f"  [{ACCENT}]⚙ {format_tool_call(event.tool, event.detail)}[/]")
         elif event.kind == "tool_result":
-            log.write(f"  [dim]→ {event.text[:200]}[/]")
+            log.write(f"  [dim]  → {event.text[:200]}[/]")
             self._refresh_status("thinking…")
         elif event.kind == "done":
             # Move the finished answer from the ephemeral "typing" widget
             # into the permanent transcript.
-            log.write(f"[bold cyan]mist ›[/] {event.text}")
+            log.write(f"[bold {ACCENT}]mist ›[/] {event.text}")
             typing.update("")
             buffer[0] = ""
         elif event.kind == "error":
-            log.write(f"[red]error: {event.text}[/]")
+            log.write(f"[{ERROR}]error: {event.text}[/]")
             typing.update("")
             buffer[0] = ""
 
@@ -424,12 +435,12 @@ class MistTUI(App):
                     log.write(f"[cyan]‹ recovering ›[/] {event.text}")
                     self._refresh_status(f"mission: recovering (turn {self._mission_turn})")
                 elif event.kind == "stuck":
-                    log.write(f"[yellow]‹ mission paused ›[/] {event.text}")
+                    log.write(f"[{WARNING}]‹ mission paused ›[/] {event.text}")
                     self._refresh_status(f"mission: paused (turn {self._mission_turn})")
                 else:
                     self._render_turn_event(event, log, typing, buffer)
         except asyncio.CancelledError:
-            log.write("[red]‹ mission killed by operator ›[/]")
+            log.write(f"[{ERROR}]‹ mission killed by operator ›[/]")
             if self._mission_log_path is not None:
                 log.write("[dim]Debriefing what was accomplished before the kill…[/]")
                 debrief = await asyncio.to_thread(

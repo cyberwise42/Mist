@@ -1,0 +1,42 @@
+Screen {
+    layout: vertical;
+    background: $background;
+}
+
+#transcript {
+    height: 1fr;
+    border: round $accent;
+    background: $surface;
+    margin: 0 1;
+    scrollbar-color: $accent;
+}
+
+#typing {
+    height: auto;
+    margin: 0 2;
+    color: $foreground;
+}
+
+#status {
+    height: 1;
+    margin: 0 1;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+#input {
+    margin: 0 1 1 1;
+    border: round $boost;
+}
+#input:focus {
+    border: round $accent;
+}
+
+Header {
+    background: $panel;
+    color: $accent;
+}
+Footer {
+    background: $panel;
+}

@@ -1004,6 +1004,50 @@ def _transcript_text(app) -> str:
     return "\n".join(str(line) for line in log.lines)
 
 
+def test_format_tool_call_renders_compact_summary_not_raw_json():
+    from mist.tui.render import format_tool_call
+
+    out = format_tool_call("shell", '{"command": "ls -la"}')
+    assert out == "shell(command='ls -la')"
+    assert "{" not in out and "}" not in out
+
+
+def test_format_tool_call_falls_back_on_unparseable_detail():
+    from mist.tui.render import format_tool_call
+
+    assert format_tool_call("shell", "not json") == "shell(...)"
+    assert format_tool_call("shell", "") == "shell()"
+
+
+def test_format_status_includes_queued_and_context_usage():
+    from mist.tui.render import format_status
+
+    text = format_status(state="thinking…", elapsed=12.0, model="qwen2.5:14b",
+                         used_tokens=2048, budget=6000, session_id=44, queued=3)
+    assert "3 queued" in text
+    assert "ctx 34% (2048/6000)" in text
+    assert "session 44" in text
+
+    idle = format_status(state="idle", elapsed=None, model="qwen2.5:14b",
+                         used_tokens=0, budget=6000, session_id=1, queued=0)
+    assert "queued" not in idle
+    assert "ctx 0% (0/6000)" in idle
+
+
+async def test_tui_onboarding_panel_shows_tool_and_skill_counts():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = make_agent(Path(tmp), ["reply"])
+        app = MistTUI(agent)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = _transcript_text(app)
+            assert "tools · " in text
+            assert "skills · " in text
+            assert "Available Tools" in text
+
+
 async def test_tui_streams_response_live():
     llm = GatedAsyncLLM(decisions=[json.dumps({"action": "respond"})], streams=[["Hel", "lo"]])
     llm.release.clear()
@@ -1021,6 +1065,29 @@ async def test_tui_streams_response_live():
             llm.release.set()
             await pilot.pause(0.2)
             assert "Hello" in _transcript_text(app)
+
+
+async def test_tui_turn_populates_real_context_token_count():
+    # The status line shows agent.last_context_tokens, not a synthetic
+    # estimate — confirm a completed turn actually populates it (not just
+    # that the attribute exists at its zero default).
+    llm = GatedAsyncLLM(decisions=[json.dumps({"action": "respond"})], streams=[["hi"]])
+    llm.release.clear()
+
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        agent = make_async_agent(Path(tmp), llm)
+        assert agent.last_context_tokens == 0
+        app = MistTUI(agent)
+        async with app.run_test() as pilot:
+            await pilot.click("#input")
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await pilot.pause()
+            llm.release.set()
+            await pilot.pause(0.2)
+            assert agent.last_context_tokens > 0
 
 
 async def test_tui_queues_messages_submitted_mid_turn():

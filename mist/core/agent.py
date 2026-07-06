@@ -159,6 +159,9 @@ class MistAgent:
         # on kill — see mist.tools.registry.ProcessRegistry for why asyncio
         # task cancellation alone can't do that.
         self.process_registry = process_registry
+        # Real token count of the last assembled prompt (via _fit_budget,
+        # not a synthetic estimate) — surfaced by the TUI's status line.
+        self.last_context_tokens = 0
 
     # ------------------------------------------------------------------
     def _assemble_context(self, user_msg: str) -> tuple[str, str, str, list]:
@@ -234,6 +237,7 @@ class MistAgent:
             [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
             self.cfg.context.token_budget,
         )
+        self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
 
         trace: list[str] = []
         tool_context: list[dict[str, str]] = []
@@ -294,6 +298,7 @@ class MistAgent:
              {"role": "user", "content": user_msg}, *tool_context],
             self.cfg.context.token_budget,
         )
+        self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
         try:
             response = self.llm.complete(messages).strip() or "(empty response)"
         except Exception as exc:
@@ -323,6 +328,7 @@ class MistAgent:
             [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
             self.cfg.context.token_budget,
         )
+        self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
 
         trace: list[str] = []
         # Natural-language record of this turn's tool calls/results, separate
@@ -399,6 +405,7 @@ class MistAgent:
              {"role": "user", "content": user_msg}, *(tool_context or [])],
             self.cfg.context.token_budget,
         )
+        self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
         chunks: list[str] = []
         try:
             async for delta in self.llm.astream(messages):

@@ -24,6 +24,7 @@ class Skill:
     name: str
     description: str
     path: Path
+    category: str = "general"
 
     def body(self) -> str:
         return self.path.read_text(encoding="utf-8")
@@ -63,6 +64,7 @@ class SkillRouter:
                     name=meta.get("name", md.parent.name),
                     description=meta.get("description", ""),
                     path=md,
+                    category=meta.get("category", "general"),
                 ))
 
     def reload(self) -> None:
