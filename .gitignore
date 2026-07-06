@@ -10,3 +10,8 @@ venv/
 *.db
 config.yaml
 .mist/
+
+# Wiki instances are working data (real target IPs, findings, mission
+# transcripts), not source code — keep them out of git even if an operator
+# points wiki.root_path somewhere inside this repo for convenience.
+mist/wiki/mist-wiki/

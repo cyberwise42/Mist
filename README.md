@@ -105,8 +105,8 @@ Key knobs:
 - `generation.think` — Ollama only; controls `<think>` reasoning on reasoning-capable models (Qwen3,
   DeepSeek-R1, ...) for the free-text answer step (default `true` — the model reasons fully over
   tool output/memory/wiki context; the trace is filtered out of the displayed stream, not the
-  generation). Tool-decision calls always force reasoning off regardless, since valid JSON there is
-  a hard requirement.
+  generation). Tool-decision calls force reasoning off by default, with one deliberate exception:
+  a mission's reasoning-assisted stuck recovery (see Mission mode) opts back in for that one turn.
 
 ## Subagents
 
@@ -189,9 +189,17 @@ the mission synthesizes the next turn itself and keeps going, until:
   mission, regardless of keyword routing) because the goal is genuinely met;
 - it hits `mission.max_turns` or `mission.max_seconds`;
 - it repeats the exact same tool call `mission.stuck_repeat_threshold` times
-  in a row, in which case it auto-pauses for operator review rather than
-  looping forever; or
+  in a row — the first time, it gets one reasoning-assisted self-recovery
+  attempt (full `<think>` reasoning enabled for that turn only, instead of
+  the routine schema-constrained decision); only if it repeats again after
+  that does it genuinely auto-pause for operator review; or
 - the operator intervenes.
+
+At every one of those end states — finished, hit a limit, or killed —
+`MissionDebriefer` deterministically compresses the mission's own transcript
+into durable memories and, when there's enough to say, an `entities/` wiki
+page, regardless of whether the model bothered to document itself along the
+way (see Building your own wiki).
 
 **Operator controls, while a mission runs:**
 - **Pause / resume** (`/pause`, `/resume`) are cooperative — checked only
@@ -215,6 +223,48 @@ bother to document them itself.
 Mission mode is TUI-only: `mist chat`'s plain synchronous REPL can't run a
 turn in the background while also accepting `/pause` input, so `/mission`
 there just points you at `mist tui`.
+
+### Building your own wiki
+
+Mist's usefulness compounds with the wiki — a growing knowledge base of
+facts about targets, CVEs, and tools that persists across sessions (see
+`wiki.root_path` in Configuration). Building one from scratch:
+
+1. **Scaffold it**: `mist wiki-init` creates `SCHEMA.md`, `index.md`,
+   `log.md`, and `raw/`/`entities/`/`concepts/`/`comparisons/`/`queries/`
+   directories at `wiki.root_path` — idempotent, safe to re-run. Point
+   `wiki.root_path` at wherever you want it to live; the default
+   (`~/.mist/wiki`) keeps it outside any git repo entirely, which is the
+   simplest way to avoid accidentally committing engagement data (target
+   IPs, findings, recon output). If you do point it inside a repo (this
+   one keeps its example wiki at `mist/wiki/mist-wiki/`), add that path to
+   `.gitignore` — real wiki content is working data, not source code.
+2. **Let it grow automatically**: every mission (`/mission` in `mist tui`)
+   writes a full transcript to `<wiki_root>/missions/` regardless of model
+   behavior, and at every mission end (finished, hit a limit, or killed)
+   `MissionDebriefer` deterministically compresses that transcript into
+   durable memories and, when there's enough to say, an `entities/` page
+   for the target — no reliance on the model choosing to document itself.
+3. **Let it grow by hand**: outside missions, the `llm-wiki` skill
+   (`skills_library/llm-wiki/`) governs day-to-day ingest/query/audit —
+   it's a meta-skill describing the *process* (orient via `SCHEMA.md`/
+   `index.md`/`log.md`, capture sources into `raw/` with a sha256 and
+   frontmatter, promote a page only once an entity/concept has 2+ source
+   mentions, cross-link via `[[wikilinks]]`, log every action). It's
+   auto-loaded into context whenever a prompt's keywords match, same as
+   any other skill.
+4. **Know the difference between a wiki page and a skill**: a wiki page
+   records a *fact* ("target X runs vsftpd 3.0.3") — consulted on demand,
+   never auto-loaded. A skill records a confirmed reusable *procedure*
+   ("how to get a shell via vsftpd 3.0.3's backdoor") — auto-loaded by
+   keyword match. The `pentest-wiki` skill governs when a technique earns
+   promotion to `skills_library/` via `write_skill`: only after it's
+   directly confirmed working (a shell obtained, a flag read, a filter
+   bypassed), never speculatively.
+5. **`raw/` is append-only**: `write_file` refuses to overwrite a file
+   that already exists under `raw/` — source dumps are meant to be cited
+   from, not silently edited. New sources still write fine; re-ingesting
+   the same one is meant to bump the version/filename, not clobber it.
 
 ### Input history and autofill
 
