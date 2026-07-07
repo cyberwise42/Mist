@@ -394,7 +394,14 @@ class MistTUI(App):
             self._refresh_status(f"tool: {event.tool}")
             log.write(f"  [{ACCENT}]⚙ {format_tool_call(event.tool, event.detail)}[/]")
         elif event.kind == "tool_result":
-            log.write(f"  [dim]  → {event.text[:200]}[/]")
+            # No further truncation here — event.text is already bounded by
+            # cfg.context.max_tool_output_chars (agent.py), the same amount
+            # fed to the model. A prior hardcoded 200-char cut meant the
+            # operator saw much less than the model reasoned over (e.g. an
+            # nmap scan finding several ports would only show the first one
+            # in the live stream, even though the fuller output was already
+            # in the mission log file) — that gap is the bug, not a feature.
+            log.write(f"  [dim]  → {event.text}[/]")
             self._refresh_status("thinking…")
         elif event.kind == "done":
             # Move the finished answer from the ephemeral "typing" widget
