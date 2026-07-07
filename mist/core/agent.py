@@ -121,6 +121,25 @@ def _approx_tokens(text: str) -> int:
     return len(text) // 4  # cheap heuristic; good enough for budgeting
 
 
+def _truncate_tool_output(text: str, budget: int, head_ratio: float = 0.3) -> str:
+    """Keeps a head slice AND a tail slice, not just the head. Verbose recon
+    tools (nuclei, gobuster, nmap) front-load a banner/progress preamble and
+    print their actual findings and summary line near the end — a live run's
+    `nuclei` scan spent its entire 2000-char budget on template-loading
+    banner text and never reached the actual detections or "N matches
+    found" line, so the model was reasoning off a banner, not the scan
+    results, and had no way to notice a real finding even if there'd been
+    one. A plain head cut is fine for output that front-loads what matters
+    (a `curl` response body); this is a better default for the noisy CLI
+    scanners a pentest harness spends most of its tool calls running."""
+    if len(text) <= budget:
+        return text
+    head_chars = int(budget * head_ratio)
+    marker = f"\n...[{len(text) - budget} chars omitted]...\n"
+    tail_chars = budget - head_chars - len(marker)
+    return text[:head_chars] + marker + text[-tail_chars:]
+
+
 def _fit_budget(messages: list[dict[str, str]], budget: int) -> list[dict[str, str]]:
     """Enforce the token budget by dropping oldest history first (never the
     system prompt at [0] or the current user message at [-1])."""
@@ -341,7 +360,7 @@ class MistAgent:
             except Exception as exc:  # tool errors go back to the model, not up
                 result = f"ERROR: {exc}"
 
-            result = result[: self.cfg.context.max_tool_output_chars]
+            result = _truncate_tool_output(result, self.cfg.context.max_tool_output_chars)
             trace.append(f"{tool.name} -> {result[:120]}")
             # This turn's tool trace lives in messages only; it is NOT persisted
             # to history, so it never bloats future turns.
@@ -448,7 +467,7 @@ class MistAgent:
             except Exception as exc:  # tool errors go back to the model, not up
                 result = f"ERROR: {exc}"
 
-            result = result[: self.cfg.context.max_tool_output_chars]
+            result = _truncate_tool_output(result, self.cfg.context.max_tool_output_chars)
             trace.append(f"{tool.name} -> {result[:120]}")
             yield TurnEvent(kind="tool_result", tool=tool.name, text=result)
 

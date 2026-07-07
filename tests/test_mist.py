@@ -551,6 +551,49 @@ def test_shell_ssh_backend_cds_into_workspace_first(monkeypatch):
     assert remote_command.endswith("&& ls")
 
 
+def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):
+    # Regression case from a real run: `nuclei` puts its actual findings and
+    # "N matches found" summary on stdout, but its ASCII banner and
+    # template-loading chatter on stderr. The old behavior merged the two
+    # streams (stderr=subprocess.STDOUT), so that banner noise came first
+    # and crowded out — even truncated away — the real finding before the
+    # model ever saw it. stdout must survive in full when it fits, even
+    # behind a much larger stderr banner.
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["stdout_arg"] = stdout
+            captured["stderr_arg"] = stderr
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("CVE-2025-55182 critical finding\nScan completed. 1 matches found.",
+                    "banner noise " * 200)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    out = tools.get("shell").run(command="nuclei -u http://target:3000")
+
+    assert captured["stdout_arg"] is subprocess.PIPE
+    assert captured["stderr_arg"] is subprocess.PIPE  # not subprocess.STDOUT
+    assert "CVE-2025-55182" in out
+    assert "matches found" in out
+
+
+def test_combine_output_prioritizes_stdout_over_noisy_stderr():
+    from mist.tools.registry import _combine_output
+    stdout = "the actual finding"
+    stderr = "banner noise " * 500  # much larger than stdout
+    out = _combine_output(stdout, stderr, budget=200)
+    assert "the actual finding" in out
+
+
+def test_combine_output_passes_through_stdout_only_when_stderr_empty():
+    from mist.tools.registry import _combine_output
+    assert _combine_output("just stdout", "", budget=200) == "just stdout"
+
+
 def test_read_file_rejects_absolute_path_outside_wiki_and_workspace_roots(tmp_path):
     # The actual regression: read_file hit "not a file" on a wiki-relative
     # path, the model retried with an absolute path "to avoid relative path
@@ -1908,6 +1951,40 @@ def test_normalize_tool_call_preserves_different_ip_targets():
     a = _normalize_tool_call("shell", json.dumps({"command": "nmap -sV -sC 10.129.30.204"}))
     b = _normalize_tool_call("shell", json.dumps({"command": "nmap -sV -sC 10.129.30.99"}))
     assert a != b
+
+
+def test_truncate_tool_output_keeps_tail_not_just_head():
+    # Regression case from a real run: a live `nuclei` scan's actual
+    # findings and "N matches found" summary line only appear after a long
+    # banner/template-loading preamble. A plain head cut (the old
+    # behavior) kept only that banner and silently dropped every real
+    # finding — the model was reasoning off "10430 templates loaded", never
+    # the scan results.
+    from mist.core.agent import _truncate_tool_output
+    banner = "banner noise " * 50
+    findings = "tech-detect:next.js found\nScan completed in 3m. 14 matches found."
+    text = banner + findings
+    out = _truncate_tool_output(text, budget=200)
+    assert "Scan completed" in out
+    assert len(out) <= 200 + len("\n...[N chars omitted]...\n")  # marker overhead only
+
+
+def test_truncate_tool_output_passes_through_under_budget():
+    from mist.core.agent import _truncate_tool_output
+    assert _truncate_tool_output("short", budget=200) == "short"
+
+
+def test_truncate_raw_output_keeps_tail_not_just_head():
+    # Same fix, one layer earlier: registry._run_subprocess's own coarser
+    # cap ran before agent.py's smarter truncation ever saw the output, so
+    # a plain head cut here would discard the real findings before agent.py
+    # got a chance to keep them.
+    from mist.tools.registry import _truncate_raw_output
+    banner = "banner noise " * 50
+    findings = "tech-detect:next.js found\nScan completed in 3m. 14 matches found."
+    text = banner + findings
+    out = _truncate_raw_output(text, budget=200)
+    assert "Scan completed" in out
 
 
 async def test_mission_pauses_on_near_duplicate_tool_calls(tmp_path):

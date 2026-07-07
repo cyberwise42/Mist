@@ -237,30 +237,77 @@ def _make_write_file(default_root: Path | str | None,
     return _write_file
 
 
+def _truncate_raw_output(text: str, budget: int = 4000, head_ratio: float = 0.3) -> str:
+    """Keeps a head slice AND a tail slice, not just the head — mirrors
+    mist.core.agent._truncate_tool_output (duplicated rather than imported
+    to avoid a cross-import from tools back into core). This is an earlier,
+    coarser safety cap than the model-context budget applied later in
+    agent.py, but it runs first: a plain head cut here would silently
+    discard a verbose scanner's real findings/summary (printed near the
+    end, after its startup banner) before agent.py's own smarter truncation
+    ever got a chance to keep them."""
+    if len(text) <= budget:
+        return text
+    head_chars = int(budget * head_ratio)
+    marker = f"\n...[{len(text) - budget} chars omitted]...\n"
+    tail_chars = budget - head_chars - len(marker)
+    return text[:head_chars] + marker + text[-tail_chars:]
+
+
+def _combine_output(stdout: str, stderr: str, budget: int = 4000) -> str:
+    """stdout is a tool's actual signal (results, findings); stderr is
+    commonly progress/banner noise for recon tools — confirmed live for
+    `nuclei`, whose real findings and "N matches found" summary go to
+    stdout while its ASCII banner and template-loading chatter go to
+    stderr. Merging the two streams (the old behavior) let that noise
+    crowd out and even truncate away the actual finding before it ever
+    reached the model. Giving stdout the bulk of the budget and stderr a
+    small reserved tail keeps error/diagnostic context on failure without
+    letting it push out the primary output on success."""
+    if not stderr:
+        return _truncate_raw_output(stdout, budget)
+    # stderr's floor (200 chars) is itself capped at budget // 2 so stdout
+    # always keeps at least half the budget, even when `budget` itself is
+    # small — a plain `max(200, budget // 5)` floor doesn't check that and
+    # can exceed the whole budget, leaving nothing (or negative room) for
+    # stdout, the exact thing this function exists to prevent.
+    stderr_budget = min(len(stderr), max(budget // 5, min(200, budget // 2)))
+    stdout_budget = budget - stderr_budget - len("\n[stderr]\n")
+    out = _truncate_raw_output(stdout, stdout_budget) if stdout else "(no stdout)"
+    err = _truncate_raw_output(stderr, stderr_budget)
+    return f"{out}\n[stderr]\n{err}"
+
+
 def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
                      registry: ProcessRegistry | None,
                      cwd: Path | None = None) -> str:
     """Runs a command via Popen (not subprocess.run) so the live process can
     be registered for an operator kill — cancelling the asyncio task awaiting
     this (via asyncio.to_thread) does not stop a subprocess already running
-    in a worker thread, since Python threads can't be preempted."""
+    in a worker thread, since Python threads can't be preempted.
+
+    stdout/stderr are captured as separate streams (not merged) — see
+    `_combine_output` for why that matters."""
     proc = subprocess.Popen(args, shell=shell, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, cwd=cwd)
+                            stderr=subprocess.PIPE, text=True, cwd=cwd)
     if registry is not None:
         registry.set(proc)
     try:
         try:
-            out, _ = proc.communicate(timeout=timeout)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, _ = proc.communicate()
-            return (out or "")[:4000] + f"\nERROR: command timed out after {timeout:.0f}s"
+            out, err = proc.communicate()
+            return (_combine_output(out or "", err or "")
+                   + f"\nERROR: command timed out after {timeout:.0f}s")
     finally:
         if registry is not None:
             registry.clear()
     if proc.returncode is not None and proc.returncode < 0:
-        return (out or "")[:4000] + "\nERROR: command was killed by the operator"
-    return out[:4000] if out else "(no output)"
+        return _combine_output(out or "", err or "") + "\nERROR: command was killed by the operator"
+    if not out and not err:
+        return "(no output)"
+    return _combine_output(out or "", err or "")
 
 
 def _shell(command: str, registry: ProcessRegistry | None = None,
