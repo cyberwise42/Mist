@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -126,6 +127,65 @@ def _fit_budget(messages: list[dict[str, str]], budget: int) -> list[dict[str, s
     while sum(_approx_tokens(m["content"]) for m in messages) > budget and len(messages) > 2:
         messages.pop(1)
     return messages
+
+
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+# Tries a full IPv4 dotted-quad first at each position; only falls back to a
+# bare digit run if that didn't match. Doing this as one alternation (rather
+# than stripping digits and separately protecting IPs) avoids the digit-strip
+# pass clobbering a placeholder that itself contains digits.
+_NUMERIC_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}|\d+")
+
+
+def _normalize_value(v: str) -> str:
+    v = _QUOTED_RE.sub("‹Q›", v)
+    # IPv4 addresses are left untouched — two calls against two different
+    # real target hosts must never collapse to the same signature just
+    # because both targets happen to be numeric.
+    v = _NUMERIC_RE.sub(lambda m: m.group(0) if "." in m.group(0) else "‹N›", v)
+    return v
+
+
+# Argument keys whose entire value IS the "attempt" being varied, the same
+# role a quoted grep pattern or context-line count plays inside a shell
+# command — so the value is wildcarded outright rather than partially
+# normalized. `search_files`'s `query` is the motivating case: a real mission
+# spammed it a dozen times with a different plain-text query each call
+# ("Next.js", "ReactorWatch", "Server Action", ...), treating the wiki's own
+# full-text search as a vulnerability database. None of those values contain
+# a quote or a digit, so _normalize_value alone leaves them all distinct.
+_WILDCARD_KEYS = {"query"}
+
+
+def _normalize_tool_call(tool: str, args_json: str) -> str:
+    """Coarse signature for near-duplicate detection: wildcards whole
+    "attempt" arguments (see `_WILDCARD_KEYS`) and strips quoted string
+    literals (grep patterns, ...) and standalone integers (context-line
+    counts, offsets, ...) out of the rest, so calls that only vary in the
+    part of the command actually being "tried again" collapse to the same
+    signature. The exact stuck-repeat check above requires byte-identical
+    calls and never catches this.
+
+    Deliberately coarser than the exact check and thus given a higher
+    threshold (`near_duplicate_threshold` > `stuck_repeat_threshold`) — it
+    will not catch every variation (e.g. swapping `-A` for `-C` changes the
+    kept flag token, not just its value), but catches the dominant real
+    pattern: re-probing the same target with only a literal/number changed."""
+    try:
+        args = json.loads(args_json) if args_json else {}
+    except (ValueError, TypeError):
+        args = None
+    if not isinstance(args, dict):
+        return f"{tool}:{args_json}"
+    parts = []
+    for k in sorted(args):
+        v = args[k]
+        if k in _WILDCARD_KEYS:
+            v = "‹*›"
+        elif isinstance(v, str):
+            v = _normalize_value(v)
+        parts.append(f"{k}={v}")
+    return f"{tool}:" + ",".join(parts)
 
 
 @dataclass
@@ -468,6 +528,7 @@ class MistAgent:
                                max_turns: int | None = None,
                                max_seconds: float | None = None,
                                stuck_repeat_threshold: int | None = None,
+                               near_duplicate_threshold: int | None = None,
                                ) -> AsyncIterator[MissionEvent]:
         """Repeatedly drives astream_turn, treating each "respond" as an
         interim status rather than a stopping point, and synthesizing the
@@ -480,6 +541,8 @@ class MistAgent:
         max_seconds = self.cfg.mission.max_seconds if max_seconds is None else max_seconds
         stuck_threshold = (self.cfg.mission.stuck_repeat_threshold
                            if stuck_repeat_threshold is None else stuck_repeat_threshold)
+        near_dup_threshold = (self.cfg.mission.near_duplicate_threshold
+                              if near_duplicate_threshold is None else near_duplicate_threshold)
 
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
@@ -496,6 +559,8 @@ class MistAgent:
             user_msg = objective
             last_signature: str | None = None
             occurrences = 0
+            near_dup_signature: str | None = None
+            near_dup_occurrences = 0
             next_turn_think = False
             recovered_once = False
 
@@ -521,6 +586,10 @@ class MistAgent:
                         sig = f"{event.tool}:{event.detail}"
                         occurrences = occurrences + 1 if sig == last_signature else 1
                         last_signature = sig
+                        nd_sig = _normalize_tool_call(event.tool, event.detail)
+                        near_dup_occurrences = (near_dup_occurrences + 1
+                                                if nd_sig == near_dup_signature else 1)
+                        near_dup_signature = nd_sig
                         if occurrences >= stuck_threshold:
                             # Break out of astream_turn's own tool loop
                             # immediately — a single turn can run up to
@@ -529,6 +598,19 @@ class MistAgent:
                             # runaway repeat hammer the target far more than
                             # stuck_threshold times before ever catching it.
                             stuck = True
+                            stuck_repeat_count = occurrences
+                            stuck_display = last_signature
+                            break
+                        if near_dup_occurrences >= near_dup_threshold:
+                            # Same idea, but for calls that are never
+                            # byte-identical — e.g. `search_files` spammed
+                            # with a different query each time, or the same
+                            # grep re-run with only its search term changed.
+                            # See _normalize_tool_call for what this does and
+                            # doesn't catch.
+                            stuck = True
+                            stuck_repeat_count = near_dup_occurrences
+                            stuck_display = f"{event.tool} (varying only a literal/number each call)"
                             break
                     elif event.kind == "tool_result":
                         self._mission_log_append(log_path, f"```\n{event.text}\n```\n")
@@ -564,22 +646,23 @@ class MistAgent:
                         self._mission_log_append(
                             log_path,
                             f"\n**Recovering** at {_now()}: repeated the same tool call "
-                            f"{occurrences}x in a row ({last_signature}) — attempting a "
+                            f"{stuck_repeat_count}x in a row ({stuck_display}) — attempting a "
                             "reasoning-assisted recovery before pausing.\n",
                         )
                         yield MissionEvent(
                             kind="recovering",
-                            text=(f"Repeated the same tool call {occurrences}x in a row "
-                                  f"({last_signature}) — reasoning through a different "
+                            text=(f"Repeated the same tool call {stuck_repeat_count}x in a row "
+                                  f"({stuck_display}) — reasoning through a different "
                                   "approach before giving up."),
                         )
-                        nudge = (f"You've repeated the same tool call ({last_signature}) "
-                                f"{occurrences} times in a row with no new result. Stop and "
+                        nudge = (f"You've repeated the same tool call ({stuck_display}) "
+                                f"{stuck_repeat_count} times in a row with no new result. Stop and "
                                 "actually think through why this specific approach isn't "
                                 "working, then commit to a genuinely different next step — "
                                 "not a minor variation of the same command.")
                         user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
                         occurrences = 0
+                        near_dup_occurrences = 0
                         recovered_once = True
                         next_turn_think = True
                         continue
@@ -591,21 +674,22 @@ class MistAgent:
                     self._mission_log_append(
                         log_path,
                         f"\n**Paused** at {_now()}: still stuck after a reasoning-assisted "
-                        f"recovery attempt — repeated the same tool call {occurrences}x in "
-                        f"a row again ({last_signature}).\n",
+                        f"recovery attempt — repeated the same tool call {stuck_repeat_count}x in "
+                        f"a row again ({stuck_display}).\n",
                     )
                     yield MissionEvent(
                         kind="stuck",
                         text=(f"Still stuck after trying to reason through it — repeated "
-                              f"the same tool call {occurrences}x in a row again "
-                              f"({last_signature}) — paused for operator review."),
+                              f"the same tool call {stuck_repeat_count}x in a row again "
+                              f"({stuck_display}) — paused for operator review."),
                     )
-                    nudge = (f"You've repeated the same tool call ({last_signature}) "
-                            f"{occurrences} times in a row with no new result — that approach "
+                    nudge = (f"You've repeated the same tool call ({stuck_display}) "
+                            f"{stuck_repeat_count} times in a row with no new result — that approach "
                             "isn't working. Try something different, or explain what you're "
                             "blocked on if you need the operator's judgment.")
                     user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
                     occurrences = 0
+                    near_dup_occurrences = 0
                     recovered_once = False
                     continue
 

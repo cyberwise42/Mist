@@ -1867,6 +1867,64 @@ async def test_mission_stuck_detection_fires_mid_turn_not_after_full_tool_budget
         await task
 
 
+def test_normalize_tool_call_collapses_varying_literal():
+    # Regression case from a real run: `search_files` spammed with a
+    # different query string each call, all against the same root — the
+    # exact-repeat check never sees two byte-identical calls, but this is
+    # exactly the pattern near-duplicate detection exists to catch.
+    from mist.core.agent import _normalize_tool_call
+    a = _normalize_tool_call("search_files", json.dumps({"query": "Next.js", "root": "."}))
+    b = _normalize_tool_call("search_files", json.dumps({"query": "ReactorWatch", "root": "."}))
+    assert a == b
+
+
+def test_normalize_tool_call_preserves_different_ip_targets():
+    # A false positive here would be worse than missing the real pattern:
+    # two calls against two different real hosts must never collapse just
+    # because both targets happen to be numeric.
+    from mist.core.agent import _normalize_tool_call
+    a = _normalize_tool_call("shell", json.dumps({"command": "nmap -sV -sC 10.129.30.204"}))
+    b = _normalize_tool_call("shell", json.dumps({"command": "nmap -sV -sC 10.129.30.99"}))
+    assert a != b
+
+
+async def test_mission_pauses_on_near_duplicate_tool_calls(tmp_path):
+    # Same shape as test_mission_auto_pauses_on_repeated_identical_tool_call,
+    # but every call is byte-different (a different search_files query each
+    # time) — only the coarser near-duplicate signature repeats. The exact
+    # stuck check must never fire here; the near-duplicate one must.
+    queries = ["Next.js", "ReactorWatch", "Next.js vulnerability", "Server Action",
+              "Next.js RCE", "nuclei", "pentest-methodology", "v3.2.1"]
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "search_files",
+                    "arguments": {"query": q, "root": "."}}) for q in queries
+    ] + [
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.near_duplicate_threshold = 3
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("find the known vulnerability", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert any(e.kind == "recovering" for e in events)
+    assert control.paused
+    stuck = [e for e in events if e.kind == "stuck"]
+    assert stuck and "varying only a literal/number" in stuck[0].text
+    control.resume()
+    await task
+    assert "finished" in [e.kind for e in events]
+
+
 async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
     # The reasoning-assisted recovery attempt must actually request thinking
     # for that one turn (force_think=True), and only that turn — not every

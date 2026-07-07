@@ -85,6 +85,11 @@ class MissionConfig(BaseModel):
     max_turns: int = 40          # autonomous turns before a mission force-stops
     max_seconds: float = 3600.0  # wall-clock budget before a mission force-stops
     stuck_repeat_threshold: int = 3  # identical tool+args calls in a row -> auto-pause
+    near_duplicate_threshold: int = 5  # coarsely-similar tool+args calls in a row (same
+                                        # tool/target, only a quoted literal or number
+                                        # differs, e.g. varying a search query or a grep
+                                        # flag) -> auto-pause. Looser signal than the exact
+                                        # match above, so it needs more repeats to fire.
 
 
 class MistConfig(BaseModel):
