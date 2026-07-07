@@ -584,6 +584,28 @@ def test_read_file_allows_absolute_path_inside_workspace_root(tmp_path):
     assert "hello from the sandbox" in out
 
 
+def test_write_file_allows_absolute_path_inside_configured_extra_root(tmp_path):
+    # Regression case from a real run: the htb-engagement skill documents
+    # `~/Desktop/HTB/<machine>/` as the operator's engagement workspace, and
+    # `shell` writes there unsandboxed — but write_file/read_file/
+    # search_files only ever knew about wiki_root and workspace_root, so a
+    # write_file there was refused, splitting one engagement's artifacts
+    # across two unrelated directory trees. workspace.extra_roots (plumbed
+    # through as `extra_roots` here) is the fix: name that directory too.
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    htb_dir = tmp_path / "Desktop" / "HTB" / "Reactor"
+    htb_dir.mkdir(parents=True)
+    notes = htb_dir / "notes.md"
+
+    tools = default_registry(remember_fn=lambda c: None, wiki_root=wiki_root,
+                             extra_roots=(tmp_path / "Desktop" / "HTB",))
+    out = tools.get("write_file").run(path=str(notes), content="# Reactor recon")
+
+    assert "Wrote" in out
+    assert notes.read_text() == "# Reactor recon"
+
+
 def test_write_file_rejects_absolute_path_outside_roots(tmp_path):
     wiki_root = tmp_path / "wiki"
     wiki_root.mkdir()

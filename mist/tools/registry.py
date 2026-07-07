@@ -376,17 +376,24 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       subagent_tools_enabled: bool = True,
                       wiki_root: str | Path | None = None,
                       workspace_root: str | Path | None = None,
+                      extra_roots: tuple[str | Path, ...] = (),
                       enabled: list[str] | None = None,
                       shell_config: ShellConfig | None = None,
                       process_registry: ProcessRegistry | None = None) -> ToolRegistry:
     # read_file/write_file/search_files anchor relative paths to wiki_root,
     # but an absolute path used to be let through unconditionally — a real
     # run escaped the wiki root that way and read an unrelated project's
-    # source elsewhere on disk. workspace_root is the one other place
-    # absolute paths are still allowed to reach (also shell's cwd for the
-    # local backend), so both stay inside Mist's own sandbox.
+    # source elsewhere on disk. workspace_root is the next place absolute
+    # paths are allowed to reach (also shell's cwd for the local backend);
+    # extra_roots (config: workspace.extra_roots) lets an operator name
+    # further directories outside both — e.g. a `~/Desktop/HTB/<machine>/`
+    # convention `shell` already writes into unsandboxed, so read_file/
+    # write_file/search_files can reach the same files instead of being
+    # silently refused and scattering an engagement's notes elsewhere.
     workspace_base = Path(workspace_root).expanduser() if workspace_root else None
-    allowed_roots = tuple(r for r in (workspace_base,) if r is not None)
+    allowed_roots = tuple(
+        r for r in (workspace_base, *(Path(p).expanduser() for p in extra_roots)) if r is not None
+    )
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
@@ -472,6 +479,7 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
             if subagent_tools_enabled:
                 subagent_tools = default_registry(remember_fn=remember_fn, llm=None, skills=None,
                                                   wiki_root=wiki_root, workspace_root=workspace_root,
+                                                  extra_roots=extra_roots,
                                                   enabled=enabled,
                                                   shell_config=shell_config,
                                                   process_registry=process_registry)

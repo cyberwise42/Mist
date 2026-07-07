@@ -33,9 +33,18 @@ class WikiConfig(BaseModel):
 
 
 class WorkspaceConfig(BaseModel):
-    root_path: str = "~/.mist/workspace"  # shell's cwd, and the only absolute-path
-                                          # escape hatch read_file/write_file/search_files
-                                          # allow outside the wiki root
+    root_path: str = "~/.mist/workspace"  # shell's cwd, and (with extra_roots below) an
+                                          # absolute-path escape hatch read_file/write_file/
+                                          # search_files allow outside the wiki root
+    extra_roots: list[str] = Field(default_factory=list)
+    # Additional absolute directories read_file/write_file/search_files may reach, beyond
+    # wiki_root and workspace.root_path. `shell` itself is never sandboxed by path — it can
+    # already write anywhere, e.g. an operator-documented convention like
+    # `~/Desktop/HTB/<machine>/` (see the htb-engagement skill). Without an entry here for
+    # that same directory, write_file/read_file/search_files can't reach it: a real mission
+    # tried `write_file` there (per that skill's own documented convention) and was refused,
+    # landing its notes under wiki_root instead while shell's raw scan output stayed under
+    # the HTB directory — the same engagement split across two unrelated trees.
 
 
 class EmbeddingConfig(BaseModel):
@@ -124,6 +133,10 @@ class MistConfig(BaseModel):
     @property
     def workspace_root(self) -> Path:
         return Path(os.path.expanduser(self.workspace.root_path))
+
+    @property
+    def extra_workspace_roots(self) -> tuple[Path, ...]:
+        return tuple(Path(os.path.expanduser(p)) for p in self.workspace.extra_roots)
 
 
 def load_config(path: str | None = None) -> MistConfig:
