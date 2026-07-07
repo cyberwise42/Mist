@@ -70,6 +70,12 @@ Available tools:
   local search seems tempting, that's a sign to re-check whether you actually need a network
   request against the target instead. Absolute file paths outside the wiki/workspace roots are
   refused by read_file/write_file/search_files for this reason.
+- Follow standard methodology order instead of jumping straight to manual requests: after a port
+  scan (`nmap -sV -sC`) identifies an open service, fingerprint the exact technology/version, then
+  check it for known vulnerabilities (`nmap --script vuln`, `nuclei -u`, `searchsploit <service>
+  <version>`) before hand-crafting a `curl`/manual request against it. A raw `curl` against a
+  webserver's JS/assets is a fine follow-up once a scan or search has pointed at something
+  specific to confirm — it is not the first move against an unscanned target or port.
 - Do not write the answer itself here — a separate step does that.
 - One action per reply. No text outside the JSON object."""
 
