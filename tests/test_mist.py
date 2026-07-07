@@ -153,6 +153,43 @@ def test_skill_routing_prefers_lexical_over_embeddings(tmp_path):
     assert hits and hits[0].name == "git-workflow"
 
 
+def test_content_tokens_excludes_stopwords():
+    # Regression case from a real run: two skills' meaningful-word overlap
+    # (3 words each) tied with a third skill whose overlap was almost
+    # entirely stopwords ("a", "do", "or", "the", "what") plus one real
+    # word — raw token overlap scored the stopword-heavy skill highest.
+    from mist.skills.router import _content_tokens
+    assert _content_tokens("a the of or what do") == set()
+    assert _content_tokens("Complete the HTB Machine") == {"complete", "htb", "machine"}
+
+
+def test_skill_routing_not_decided_by_stopword_overlap(tmp_path):
+    # git-workflow's description ("Steps for common git operations like
+    # status, commit, branch, and push") shares only stopwords with a
+    # query about an unrelated topic phrased with the same connector words
+    # — it must not be rated relevant just because both share "for"/"and".
+    router = SkillRouter(_isolated_skills_library(tmp_path))
+    assert router.route("looking for a place to eat, and nothing else") == []
+
+
+def test_mission_routing_query_omits_boilerplate():
+    # _mission_routing_query carries the real, variable content (objective,
+    # nudge, operator notes) but never MISSION_CONTINUE_TEMPLATE's fixed
+    # instructional text — that boilerplate is identical every turn and
+    # gave the llm-wiki skill ("...wiki...knowledge...tool...") a
+    # keyword-overlap head start on every single mission turn regardless
+    # of what the mission was actually about.
+    from mist.core.agent import _mission_routing_query, MISSION_CONTINUE_TEMPLATE
+    q = _mission_routing_query("get root on 10.129.30.204", notes=["operator note"],
+                               nudge="stop repeating yourself")
+    assert "get root on 10.129.30.204" in q
+    assert "operator note" in q
+    assert "stop repeating yourself" in q
+    # None of the boilerplate's own distinctive phrasing should leak in.
+    assert "finish_objective" not in q
+    assert "search_files" not in q
+
+
 # -- batch summarizer -----------------------------------------------------
 
 def test_batch_summarizer_compacts_session_into_memory(tmp_path):

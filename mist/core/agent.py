@@ -117,6 +117,23 @@ def _mission_continue_message(objective: str, notes: list[str], nudge: str | Non
     return msg
 
 
+def _mission_routing_query(objective: str, notes: list[str], nudge: str | None = None) -> str:
+    """Same real content as `_mission_continue_message` (objective, nudge,
+    operator notes) but WITHOUT MISSION_CONTINUE_TEMPLATE's fixed
+    boilerplate — used only to drive tool/skill/memory selection, never
+    sent to the model. That boilerplate is identical every turn regardless
+    of what the mission is about, and its own wording ("...with a `tool`
+    right now"; "search_files the `wiki` for existing reference
+    `knowledge`...") gives the llm-wiki skill a keyword-overlap head start
+    on every single turn — confirmed live, it beat pentest-methodology for
+    objectives as plainly on-topic as "get root on 10.129.30.204"."""
+    parts = [nudge] if nudge else []
+    parts.append(objective)
+    if notes:
+        parts.extend(notes)
+    return "\n\n".join(parts)
+
+
 def _approx_tokens(text: str) -> int:
     return len(text) // 4  # cheap heuristic; good enough for budgeting
 
@@ -249,12 +266,26 @@ class MistAgent:
         self.last_context_tokens = 0
 
     # ------------------------------------------------------------------
-    def _assemble_context(self, user_msg: str) -> tuple[str, str, str, list]:
+    def _assemble_context(self, user_msg: str, routing_query: str | None = None
+                          ) -> tuple[str, str, str, list]:
         """Builds the three variable sections of every system prompt (tool
         listing, active skill, relevant memories) plus the tools exposed for
         this turn. Shared by every template so tool/skill/memory selection
-        logic lives in exactly one place."""
-        exposed = self.tools.select(user_msg, self.cfg.tools.max_exposed,
+        logic lives in exactly one place.
+
+        `routing_query` (defaults to `user_msg`) is what actually drives
+        tool/skill/memory selection — kept separate from `user_msg` because
+        a mission's `user_msg` is MISSION_CONTINUE_TEMPLATE's boilerplate
+        wrapped around the real objective, and that fixed boilerplate text
+        ("...with a `tool` right now"; "search_files the `wiki` for
+        existing reference `knowledge`...") shares keywords with the
+        llm-wiki skill on every single turn regardless of what the mission
+        is actually about — confirmed live: it won the routing race over
+        pentest-methodology for short objectives like "get root on
+        10.129.30.204" purely on that boilerplate overlap, never letting
+        the actually-relevant skill's full body load."""
+        routing_query = user_msg if routing_query is None else routing_query
+        exposed = self.tools.select(routing_query, self.cfg.tools.max_exposed,
                                     always=self.always_exposed)
         tool_lines = "\n".join(
             f"- {t.name}: {t.description} | args schema: {json.dumps(t.parameters['properties'])}"
@@ -262,7 +293,7 @@ class MistAgent:
         )
 
         skill_section = ""
-        candidates = self.skills.route(user_msg, self.cfg.skills.max_candidates)
+        candidates = self.skills.route(routing_query, self.cfg.skills.max_candidates)
         if candidates:
             # Load ONLY the top skill's full body; list the rest as one-liners.
             top = candidates[0]
@@ -274,21 +305,24 @@ class MistAgent:
                 skill_section += f"Other possibly relevant skills: {others}\n"
 
         memory_section = ""
-        memories = self.store.search(user_msg, self.cfg.memory.top_k)
+        memories = self.store.search(routing_query, self.cfg.memory.top_k)
         if memories:
             memory_section = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memories) + "\n"
 
         return tool_lines, skill_section, memory_section, exposed
 
-    def _build_decision_system(self, user_msg: str) -> tuple[str, list]:
-        tool_lines, skill_section, memory_section, exposed = self._assemble_context(user_msg)
+    def _build_decision_system(self, user_msg: str, routing_query: str | None = None
+                               ) -> tuple[str, list]:
+        tool_lines, skill_section, memory_section, exposed = self._assemble_context(
+            user_msg, routing_query
+        )
         system = DECISION_SYSTEM_TEMPLATE.format(
             tools=tool_lines, skill_section=skill_section, memory_section=memory_section
         )
         return system, exposed
 
-    def _build_answer_system(self, user_msg: str) -> str:
-        _, skill_section, memory_section, _ = self._assemble_context(user_msg)
+    def _build_answer_system(self, user_msg: str, routing_query: str | None = None) -> str:
+        _, skill_section, memory_section, _ = self._assemble_context(user_msg, routing_query)
         return ANSWER_SYSTEM_TEMPLATE.format(
             skill_section=skill_section, memory_section=memory_section
         )
@@ -395,19 +429,26 @@ class MistAgent:
     # ------------------------------------------------------------------
     # Streaming interface (mist tui)
     # ------------------------------------------------------------------
-    async def astream_turn(self, user_msg: str, force_think: bool = False) -> AsyncIterator[TurnEvent]:
+    async def astream_turn(self, user_msg: str, force_think: bool = False,
+                           routing_query: str | None = None) -> AsyncIterator[TurnEvent]:
         """Async generator form of a turn: yields TurnEvents as they happen so
         a caller (the TUI) can render tokens live and — since this is a plain
         asyncio coroutine — cancel it cleanly (Ctrl+C) at any await point.
 
         `force_think` opts the (normally non-reasoning) tool-decision calls
         back into full reasoning for this turn specifically — see
-        astream_mission's stuck-recovery escalation for why."""
+        astream_mission's stuck-recovery escalation for why.
+
+        `routing_query` (see `_assemble_context`) lets a mission drive
+        tool/skill/memory selection off the bare objective instead of the
+        full boilerplate-wrapped continue-message."""
         history = self._history()
         # Context assembly can make a network call (embedding fallback in
         # skill routing); push it to a thread so a slow/unreachable embedding
         # backend can't freeze the UI or block a pending interrupt.
-        system, exposed = await asyncio.to_thread(self._build_decision_system, user_msg)
+        system, exposed = await asyncio.to_thread(
+            self._build_decision_system, user_msg, routing_query
+        )
         schema = self.tools.decision_schema(exposed)
         messages = _fit_budget(
             [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
@@ -447,7 +488,8 @@ class MistAgent:
                 return
 
             if action.get("action") != "use_tool" or "tool" not in action:
-                async for event in self._stream_answer(user_msg, history, tool_context):
+                async for event in self._stream_answer(user_msg, history, tool_context,
+                                                       routing_query):
                     yield event
                 return
 
@@ -482,9 +524,10 @@ class MistAgent:
         yield TurnEvent(kind="done", text=summary)
 
     async def _stream_answer(self, user_msg: str, history: list[dict[str, str]],
-                              tool_context: list[dict[str, str]] | None = None
+                              tool_context: list[dict[str, str]] | None = None,
+                              routing_query: str | None = None
                               ) -> AsyncIterator[TurnEvent]:
-        system = await asyncio.to_thread(self._build_answer_system, user_msg)
+        system = await asyncio.to_thread(self._build_answer_system, user_msg, routing_query)
         messages = _fit_budget(
             [{"role": "system", "content": system}, *history,
              {"role": "user", "content": user_msg}, *(tool_context or [])],
@@ -576,6 +619,7 @@ class MistAgent:
             start = time.monotonic()
             turns = 0
             user_msg = objective
+            routing_query = objective
             last_signature: str | None = None
             occurrences = 0
             near_dup_signature: str | None = None
@@ -593,7 +637,8 @@ class MistAgent:
                 finished = False
                 stuck = False
                 error_text: str | None = None
-                async for event in self.astream_turn(user_msg, force_think=use_think):
+                async for event in self.astream_turn(user_msg, force_think=use_think,
+                                                     routing_query=routing_query):
                     yield MissionEvent(kind=event.kind, text=event.text,
                                        tool=event.tool, detail=event.detail)
                     if event.kind == "tool_start":
@@ -679,7 +724,9 @@ class MistAgent:
                                 "actually think through why this specific approach isn't "
                                 "working, then commit to a genuinely different next step — "
                                 "not a minor variation of the same command.")
-                        user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
+                        notes = control.pop_notes()
+                        user_msg = _mission_continue_message(objective, notes, nudge)
+                        routing_query = _mission_routing_query(objective, notes, nudge)
                         occurrences = 0
                         near_dup_occurrences = 0
                         recovered_once = True
@@ -706,7 +753,9 @@ class MistAgent:
                             f"{stuck_repeat_count} times in a row with no new result — that approach "
                             "isn't working. Try something different, or explain what you're "
                             "blocked on if you need the operator's judgment.")
-                    user_msg = _mission_continue_message(objective, control.pop_notes(), nudge)
+                    notes = control.pop_notes()
+                    user_msg = _mission_continue_message(objective, notes, nudge)
+                    routing_query = _mission_routing_query(objective, notes, nudge)
                     occurrences = 0
                     near_dup_occurrences = 0
                     recovered_once = False
@@ -721,10 +770,10 @@ class MistAgent:
                         kind="stuck",
                         text=f"Turn failed ({error_text}) — paused for operator review.",
                     )
-                    user_msg = _mission_continue_message(
-                        objective, control.pop_notes(),
-                        nudge=f"Your previous attempt failed: {error_text}. Try again.",
-                    )
+                    notes = control.pop_notes()
+                    nudge = f"Your previous attempt failed: {error_text}. Try again."
+                    user_msg = _mission_continue_message(objective, notes, nudge)
+                    routing_query = _mission_routing_query(objective, notes, nudge)
                     continue
 
                 if turns >= max_turns:
@@ -754,6 +803,8 @@ class MistAgent:
                 # Made it through a normal turn — any future stuck streak is
                 # a fresh problem and deserves its own recovery attempt.
                 recovered_once = False
-                user_msg = _mission_continue_message(objective, control.pop_notes())
+                notes = control.pop_notes()
+                user_msg = _mission_continue_message(objective, notes)
+                routing_query = _mission_routing_query(objective, notes)
         finally:
             self.always_exposed.discard("finish_objective")

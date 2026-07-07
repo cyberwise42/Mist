@@ -32,6 +32,30 @@ class Skill:
 
 _FRONT = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
 
+# Common English stopwords, excluded from keyword-overlap scoring. Without
+# this, two skills a handful of meaningful-word overlaps apart can lose a
+# routing race entirely on shared "a"/"the"/"of"/"or" noise — confirmed
+# live: for the objective "Complete the HTB Machine named Reactor at
+# 10.129.30.204", htb-engagement (meaningful overlap: complete, htb,
+# machine) and pentest-methodology (meaningful overlap: known, methodology)
+# both scored 7 raw, one point behind llm-wiki's 8 — but llm-wiki's overlap
+# was almost entirely stopwords ("a", "do", "or", "the", "what"), with only
+# "knowledge"/"tool"/"wiki" as real signal. The methodology skill never got
+# its full body loaded that turn because of stopword noise, not because it
+# was actually less relevant.
+_STOPWORDS = frozenset("""
+a an the and or of for with without to in on at is are was were be been
+being it its this that these those do does did doing what which who whom
+how why when where i you your we our they their he she his her not no so
+as if than then from by but into about over under again further once here
+there all any both each few more most other some such only own same too
+very can will just should now
+""".split())
+
+
+def _content_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower())) - _STOPWORDS
+
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
     m = _FRONT.match(text)
@@ -102,10 +126,10 @@ class SkillRouter:
         """Rank skills by keyword overlap with the query; return top candidates
         that score above zero. Falls back to semantic similarity (if an
         embedding client is configured) when no skill shares a keyword."""
-        q_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+        q_tokens = _content_tokens(query)
         scored = []
         for skill in self.skills:
-            hay = set(re.findall(r"[a-z0-9]+", (skill.name + " " + skill.description).lower()))
+            hay = _content_tokens(skill.name + " " + skill.description)
             score = len(q_tokens & hay)
             if score > 0:
                 scored.append((score, skill))
