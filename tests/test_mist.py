@@ -16,6 +16,7 @@ from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.registry import ProcessRegistry, default_registry
 from mist.llm.client import parse_json_relaxed
+from mist.tui.memory_commands import render_history_command, render_memories_command
 from mist.wiki import init_wiki
 
 
@@ -71,6 +72,209 @@ def test_memory_fts_roundtrip(tmp_path):
     store.remember("Project deadline is Friday")
     hits = store.search("what language does the user prefer python")
     assert any("Python" in h for h in hits)
+
+
+# -- memory/history admin (MemoryStore list/delete + /memories, /history) ---
+
+def test_list_memories_orders_newest_first_and_respects_limit(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    for i in range(5):
+        store.remember(f"note {i}")
+    rows = store.list_memories(limit=2)
+    assert [r["content"] for r in rows] == ["note 4", "note 3"]
+
+
+def test_list_memories_like_filter(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("Reactor target uses CVE-2025-55182")
+    store.remember("Cap target uses SMB")
+    rows = store.list_memories(like="Reactor")
+    assert len(rows) == 1
+    assert "Reactor" in rows[0]["content"]
+
+
+def test_forget_memory_deletes_row_and_drops_from_search(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    mid = store.remember("corrupted test residue")
+    assert store.forget_memory(mid) is True
+    assert store.list_memories() == []
+    assert not any("corrupted" in h for h in store.search("corrupted"))
+
+
+def test_forget_memory_nonexistent_id_returns_false(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert store.forget_memory(999) is False
+
+
+def test_delete_memories_matching_deletes_only_matches(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("Reactor note one")
+    store.remember("Reactor note two")
+    store.remember("Unrelated note")
+    deleted = store.delete_memories_matching("Reactor")
+    assert deleted == 2
+    remaining = store.list_memories()
+    assert len(remaining) == 1
+    assert remaining[0]["content"] == "Unrelated note"
+
+
+def test_delete_memories_matching_no_match_deletes_nothing(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("Unrelated note")
+    assert store.delete_memories_matching("Nonexistent") == 0
+    assert len(store.list_memories()) == 1
+
+
+def test_list_sessions_includes_turn_count_and_zero_turn_session(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    empty_sid = store.new_session("empty")
+    busy_sid = store.new_session("busy")
+    store.add_turn(busy_sid, "user", "hello")
+    store.add_turn(busy_sid, "assistant", "hi")
+    sessions = {s["id"]: s for s in store.list_sessions()}
+    assert sessions[empty_sid]["turn_count"] == 0
+    assert sessions[busy_sid]["turn_count"] == 2
+
+
+def test_list_turns_returns_ids_and_respects_like_filter(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "run nmap against Reactor")
+    store.add_turn(sid, "assistant", "sure, scanning now")
+    rows = store.list_turns(sid, like="nmap")
+    assert len(rows) == 1
+    assert rows[0]["role"] == "user"
+    assert "id" in rows[0]
+
+
+def test_delete_turn_removes_single_row(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "hello")
+    [row] = store.list_turns(sid)
+    assert store.delete_turn(row["id"]) is True
+    assert store.list_turns(sid) == []
+
+
+def test_delete_turn_nonexistent_returns_false(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert store.delete_turn(999) is False
+
+
+def test_delete_turns_matching_scopes_to_session_and_pattern(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid_a = store.new_session("a")
+    sid_b = store.new_session("b")
+    store.add_turn(sid_a, "user", "Reactor recon")
+    store.add_turn(sid_a, "user", "unrelated")
+    store.add_turn(sid_b, "user", "Reactor recon")
+    deleted = store.delete_turns_matching(sid_a, "Reactor")
+    assert deleted == 1
+    assert len(store.list_turns(sid_a)) == 1
+    # session b's matching turn is untouched
+    assert len(store.list_turns(sid_b)) == 1
+
+
+def test_delete_turns_matching_no_pattern_clears_whole_session(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "one")
+    store.add_turn(sid, "assistant", "two")
+    deleted = store.delete_turns_matching(sid, None)
+    assert deleted == 2
+    assert store.list_turns(sid) == []
+
+
+def test_render_memories_command_lists_recent(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("hello world", kind="note")
+    out = render_memories_command(store, "")
+    assert "hello world" in out
+    assert "[note]" in out
+
+
+def test_render_memories_clear_without_yes_is_dry_run(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("Reactor residue")
+    out = render_memories_command(store, "clear Reactor")
+    assert "1 memories match" in out
+    assert "--yes" in out
+    assert len(store.list_memories()) == 1  # nothing actually deleted
+
+
+def test_render_memories_clear_with_yes_deletes(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("Reactor residue")
+    store.remember("unrelated")
+    out = render_memories_command(store, "clear Reactor --yes")
+    assert "Deleted 1" in out
+    remaining = store.list_memories()
+    assert len(remaining) == 1
+    assert remaining[0]["content"] == "unrelated"
+
+
+def test_render_memories_forget_deletes_immediately_no_dry_run(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    mid = store.remember("to be forgotten")
+    out = render_memories_command(store, f"forget {mid}")
+    assert f"Deleted memory #{mid}" in out
+    assert store.list_memories() == []
+
+
+def test_render_memories_forget_bad_id_returns_usage(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    store.remember("keep me")
+    out = render_memories_command(store, "forget abc")
+    assert out.startswith("Usage:")
+    assert len(store.list_memories()) == 1
+
+
+def test_render_history_lists_sessions(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("my session")
+    store.add_turn(sid, "user", "hi")
+    out = render_history_command(store, "")
+    assert "my session" in out
+    assert "1 turns" in out
+
+
+def test_render_history_lists_session_turns_scoped(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid_a = store.new_session("a")
+    sid_b = store.new_session("b")
+    store.add_turn(sid_a, "user", "Reactor scan")
+    store.add_turn(sid_b, "user", "Reactor scan")
+    out = render_history_command(store, f"{sid_a} Reactor")
+    assert "Reactor scan" in out
+    # only one match reported for session a, not both sessions combined
+    assert out.count("Reactor scan") == 1
+
+
+def test_render_history_clear_without_yes_is_dry_run(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "Reactor scan")
+    out = render_history_command(store, f"clear {sid} Reactor")
+    assert "--yes" in out
+    assert len(store.list_turns(sid)) == 1
+
+
+def test_render_history_clear_with_yes_deletes(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "Reactor scan")
+    store.add_turn(sid, "user", "unrelated")
+    out = render_history_command(store, f"clear {sid} Reactor --yes")
+    assert "Deleted 1" in out
+    remaining = store.list_turns(sid)
+    assert len(remaining) == 1
+    assert remaining[0]["content"] == "unrelated"
+
+
+def test_render_history_clear_bad_session_id_returns_usage(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    out = render_history_command(store, "clear notanumber")
+    assert out.startswith("Usage:")
 
 
 def test_skill_routing(tmp_path):

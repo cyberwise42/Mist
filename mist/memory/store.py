@@ -102,6 +102,48 @@ class MemoryStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_sessions(self, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT s.id, s.title, s.created_at, s.compacted, "
+            "COUNT(t.id) AS turn_count "
+            "FROM sessions s LEFT JOIN turns t ON t.session_id = s.id "
+            "GROUP BY s.id ORDER BY s.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_turns(self, session_id: int, limit: int = 20,
+                    like: str | None = None) -> list[dict]:
+        params: list = [session_id]
+        query = "SELECT id, role, content, created_at FROM turns WHERE session_id = ?"
+        if like:
+            query += " AND content LIKE ?"
+            params.append(f"%{like}%")
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def delete_turn(self, turn_id: int) -> bool:
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM turns WHERE id = ?", (turn_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def delete_turns_matching(self, session_id: int, pattern: str | None = None) -> int:
+        with self._lock:
+            if pattern:
+                cur = self.conn.execute(
+                    "DELETE FROM turns WHERE session_id = ? AND content LIKE ?",
+                    (session_id, f"%{pattern}%"),
+                )
+            else:
+                cur = self.conn.execute(
+                    "DELETE FROM turns WHERE session_id = ?", (session_id,)
+                )
+            self.conn.commit()
+            return cur.rowcount
+
     # -- compaction ------------------------------------------------------
     def sessions_to_compact(self, exclude_session_id: int | None,
                              keep_recent: int = 1, min_turns: int = 4) -> list[int]:
@@ -133,6 +175,31 @@ class MemoryStore:
             )
             self.conn.commit()
             return cur.lastrowid
+
+    def list_memories(self, limit: int = 20, like: str | None = None) -> list[dict]:
+        params: list = []
+        query = "SELECT id, content, kind, created_at FROM memories"
+        if like:
+            query += " WHERE content LIKE ?"
+            params.append(f"%{like}%")
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def forget_memory(self, memory_id: int) -> bool:
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def delete_memories_matching(self, pattern: str) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM memories WHERE content LIKE ?", (f"%{pattern}%",)
+            )
+            self.conn.commit()
+            return cur.rowcount
 
     def search(self, query: str, top_k: int = 3) -> list[str]:
         """FTS5 search; falls back to recency if the query has no usable terms."""

@@ -23,6 +23,8 @@ COMMANDS: list[tuple[str, str]] = [
     ("/resume", "Resume a paused mission"),
     ("/kill", "Stop the running mission immediately (Ctrl+C also works)"),
     ("/compact", "Fold old sessions into long-term memory now"),
+    ("/memories [kw]", "List memories, optionally filtered; forget/clear to delete"),
+    ("/history [id]", "List sessions or a session's turns; forget/clear to delete"),
     ("/quit, /exit", "Quit Mist"),
 ]
 

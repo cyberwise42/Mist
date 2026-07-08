@@ -37,6 +37,7 @@ from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
 from mist.core.summarizer import BatchSummarizer
 from mist.history import HistoryStore
+from mist.tui.memory_commands import render_history_command, render_memories_command
 from mist.tui.onboarding import build_onboarding_panel
 from mist.tui.render import format_status, format_tool_call
 from mist.tui.theme import ACCENT, ERROR, MIST_THEME, SUCCESS, WARNING
@@ -281,6 +282,12 @@ class MistTUI(App):
                 self._kill_mission()
             else:
                 log.write("[dim]No mission is running.[/]")
+            return
+        if name == "memories":
+            log.write(render_memories_command(self.agent.store, rest))
+            return
+        if name == "history":
+            log.write(render_history_command(self.agent.store, rest))
             return
         log.write(f"[red]Unknown command /{name}. Type /help for a list.[/]")
 
