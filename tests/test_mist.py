@@ -2343,6 +2343,62 @@ async def test_mission_manual_probe_streak_resets_on_scanner_call(tmp_path):
     assert "finished" in [e.kind for e in events]
 
 
+async def test_mission_pauses_on_respond_streak_with_no_tool_call(tmp_path):
+    # Regression case from a real run: the model chose "respond" instead of
+    # calling a tool, turn after turn, describing a plan in prose instead of
+    # acting on it. Every other check is keyed off tool_start events, so a
+    # mission that never calls a tool was completely invisible to stuck
+    # detection before this fix — it could otherwise run to max_turns.
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.respond_streak_threshold = 2
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("get root", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert any(e.kind == "recovering" for e in events)
+    assert control.paused
+    stuck = [e for e in events if e.kind == "stuck"]
+    assert stuck and "no tool call" in stuck[0].text
+    control.resume()
+    await task
+    assert "finished" in [e.kind for e in events]
+
+
+async def test_mission_respond_streak_resets_on_tool_call(tmp_path):
+    # A tool call in the middle of a turn (even one that also ends in
+    # "respond" afterward) must reset the streak — the pathology is never
+    # calling a tool, not ending a turn with a status update per se.
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo hi"}}),
+        json.dumps({"action": "respond"}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.respond_streak_threshold = 2
+    control = MissionControl()
+
+    events = [e async for e in agent.astream_mission("test objective", control, max_turns=10)]
+    assert not any(e.kind == "stuck" for e in events)
+    assert "finished" in [e.kind for e in events]
+
+
 async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
     # The reasoning-assisted recovery attempt must actually request thinking
     # for that one turn (force_think=True), and only that turn — not every

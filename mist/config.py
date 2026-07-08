@@ -105,6 +105,14 @@ class MissionConfig(BaseModel):
                                         # hand-guessed at a dozen+ invented API paths one at
                                         # a time instead of running a content-discovery
                                         # scanner (gobuster/ffuf) once told to.
+    respond_streak_threshold: int = 2  # consecutive mission turns that end in "respond"
+                                        # with no tool call at all -> auto-pause. Invisible
+                                        # to every check above (they're all keyed off
+                                        # tool_start events) — a real mission "responded"
+                                        # with a prose plan instead of acting, burning its
+                                        # whole token budget still "thinking" and never
+                                        # calling a tool, which could otherwise run
+                                        # undetected all the way to max_turns/max_seconds.
 
 
 class MistConfig(BaseModel):

@@ -628,6 +628,7 @@ class MistAgent:
                                stuck_repeat_threshold: int | None = None,
                                near_duplicate_threshold: int | None = None,
                                manual_probe_threshold: int | None = None,
+                               respond_streak_threshold: int | None = None,
                                ) -> AsyncIterator[MissionEvent]:
         """Repeatedly drives astream_turn, treating each "respond" as an
         interim status rather than a stopping point, and synthesizing the
@@ -644,6 +645,8 @@ class MistAgent:
                               if near_duplicate_threshold is None else near_duplicate_threshold)
         manual_probe_threshold = (self.cfg.mission.manual_probe_threshold
                                   if manual_probe_threshold is None else manual_probe_threshold)
+        respond_streak_threshold = (self.cfg.mission.respond_streak_threshold
+                                    if respond_streak_threshold is None else respond_streak_threshold)
 
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
@@ -664,6 +667,7 @@ class MistAgent:
             near_dup_signature: str | None = None
             near_dup_occurrences = 0
             manual_probe_streak = 0
+            respond_streak = 0
             next_turn_think = False
             recovered_once = False
 
@@ -677,11 +681,13 @@ class MistAgent:
                 finished = False
                 stuck = False
                 error_text: str | None = None
+                tool_called_this_turn = False
                 async for event in self.astream_turn(user_msg, force_think=use_think,
                                                      routing_query=routing_query):
                     yield MissionEvent(kind=event.kind, text=event.text,
                                        tool=event.tool, detail=event.detail)
                     if event.kind == "tool_start":
+                        tool_called_this_turn = True
                         self._mission_log_append(
                             log_path, f"\n### {_now()} — {event.tool}\n**args:** `{event.detail}`\n"
                         )
@@ -743,6 +749,28 @@ class MistAgent:
                         # the operator see what happened.
                         error_text = event.text
 
+                if not finished and error_text is None:
+                    if tool_called_this_turn:
+                        respond_streak = 0
+                    elif not stuck:
+                        # A turn that ends in "respond" with no tool call at
+                        # all is invisible to every check above — they're all
+                        # keyed off tool_start events, so a mission that just
+                        # keeps "responding" with a plan in prose (instead of
+                        # calling a tool per MISSION_CONTINUE_TEMPLATE's own
+                        # instructions) would otherwise never trip stuck
+                        # detection and could run to max_turns/max_seconds
+                        # without ever acting. Confirmed live: a turn decided
+                        # "respond", the free-text answer step burned its
+                        # entire token budget still inside a <think> block,
+                        # and the next turn did the same thing again.
+                        respond_streak += 1
+                        if respond_streak >= respond_streak_threshold:
+                            stuck = True
+                            stuck_kind = "no_action"
+                            stuck_repeat_count = respond_streak
+                            stuck_display = f"{respond_streak}x mission turns in a row with no tool call"
+
                 if finished:
                     self._mission_log_append(
                         log_path, f"\n**Finished** at {_now()}: objective complete.\n"
@@ -784,6 +812,12 @@ class MistAgent:
                                     "whether the objective is already satisfied by what you've "
                                     "already found; if it is, call finish_objective now instead of "
                                     "continuing to explore.")
+                        elif stuck_kind == "no_action":
+                            nudge = (f"You've given a plain-text response for {stuck_repeat_count} "
+                                    "turns in a row without calling a tool. This objective requires "
+                                    "action, not a description of what you would do — pick one "
+                                    "concrete next step and call a tool for it right now instead of "
+                                    "writing out commands as text.")
                         else:
                             nudge = (f"You've repeated the same tool call ({stuck_display}) "
                                     f"{stuck_repeat_count} times in a row with no new result. Stop and "
@@ -796,6 +830,7 @@ class MistAgent:
                         occurrences = 0
                         near_dup_occurrences = 0
                         manual_probe_streak = 0
+                        respond_streak = 0
                         recovered_once = True
                         next_turn_think = True
                         continue
@@ -821,6 +856,10 @@ class MistAgent:
                                 "instead of switching to a scanner (gobuster/ffuf/nuclei/"
                                 "searchsploit) or recognizing the objective is already done. "
                                 "Explain what you're blocked on if you need the operator's judgment.")
+                    elif stuck_kind == "no_action":
+                        nudge = (f"You're still responding in plain text ({stuck_display}) instead of "
+                                "calling a tool. Call a tool for a concrete next step, or explain "
+                                "what you're blocked on if you need the operator's judgment.")
                     else:
                         nudge = (f"You've repeated the same tool call ({stuck_display}) "
                                 f"{stuck_repeat_count} times in a row with no new result — that approach "
@@ -832,6 +871,7 @@ class MistAgent:
                     occurrences = 0
                     near_dup_occurrences = 0
                     manual_probe_streak = 0
+                    respond_streak = 0
                     recovered_once = False
                     continue
 
@@ -874,9 +914,15 @@ class MistAgent:
                     yield MissionEvent(kind="debrief", text=debrief.summary())
                     return
 
-                # Made it through a normal turn — any future stuck streak is
-                # a fresh problem and deserves its own recovery attempt.
-                recovered_once = False
+                # Made it through a normal turn — but only a turn that
+                # actually called a tool is genuine progress; a "respond"
+                # turn that merely hasn't crossed the no-action threshold
+                # yet must not reset this, or a slowly-accumulating
+                # response streak would never make it past its first
+                # recovery attempt (each not-yet-stuck turn in between
+                # would silently discard the "already tried once" state).
+                if tool_called_this_turn:
+                    recovered_once = False
                 notes = control.pop_notes()
                 user_msg = _mission_continue_message(objective, notes)
                 routing_query = _mission_routing_query(objective, notes)
