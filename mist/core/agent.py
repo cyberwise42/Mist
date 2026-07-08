@@ -129,6 +129,26 @@ def _mission_continue_message(objective: str, notes: list[str], nudge: str | Non
     return msg
 
 
+def _findings_recap(findings: list[str], max_items: int = 5) -> str:
+    """A compact recap of the most recent tool results this mission, meant
+    to be appended to a stuck-recovery nudge specifically. Regression case
+    from a real run: after a reasoning-assisted recovery got the model to
+    call a real tool again, it re-ran the exact same `nmap` scan it had
+    already gotten full results from turns earlier — wasteful, but never
+    flagged by any detector, since a different `curl` call in between reset
+    every repeat/near-dup signature. The persisted chat history is supposed
+    to carry this forward, but relies on the model's own free-text summary
+    faithfully restating it every turn — this recap restates the raw
+    findings directly at exactly the moment (a nudge) the model is being
+    asked to pick a genuinely different next step, so it doesn't need to
+    rediscover what it already has."""
+    if not findings:
+        return ""
+    recent = findings[-max_items:]
+    lines = "\n".join(f"- {f}" for f in recent)
+    return f"\n\nAlready found this mission (don't redo these):\n{lines}"
+
+
 def _mission_routing_query(objective: str, notes: list[str], nudge: str | None = None) -> str:
     """Same real content as `_mission_continue_message` (objective, nudge,
     operator notes) but WITHOUT MISSION_CONTINUE_TEMPLATE's fixed
@@ -668,6 +688,7 @@ class MistAgent:
             near_dup_occurrences = 0
             manual_probe_streak = 0
             respond_streak = 0
+            mission_findings: list[str] = []
             next_turn_think = False
             recovered_once = False
 
@@ -740,6 +761,7 @@ class MistAgent:
                             break
                     elif event.kind == "tool_result":
                         self._mission_log_append(log_path, f"```\n{event.text}\n```\n")
+                        mission_findings.append(f"{event.tool}: {event.text[:200]}")
                     elif event.kind == "error":
                         # A crashed LLM/network call ends astream_turn's own
                         # generator, but the mission loop must not just spin
@@ -824,6 +846,7 @@ class MistAgent:
                                     "actually think through why this specific approach isn't "
                                     "working, then commit to a genuinely different next step — "
                                     "not a minor variation of the same command.")
+                        nudge += _findings_recap(mission_findings)
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge)
                         routing_query = _mission_routing_query(objective, notes, nudge)
@@ -865,6 +888,7 @@ class MistAgent:
                                 f"{stuck_repeat_count} times in a row with no new result — that approach "
                                 "isn't working. Try something different, or explain what you're "
                                 "blocked on if you need the operator's judgment.")
+                    nudge += _findings_recap(mission_findings)
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge)
                     routing_query = _mission_routing_query(objective, notes, nudge)

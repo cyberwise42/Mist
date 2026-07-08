@@ -2475,6 +2475,59 @@ async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
     assert llm.force_think_calls == [False, False, True, False, False]
 
 
+async def test_mission_nudge_recaps_prior_tool_findings(tmp_path):
+    # Regression case from a real run: after a reasoning-assisted recovery
+    # got the model to call a real tool again, it re-ran a scan it already
+    # had full results for — no existing mechanism reminds the model what
+    # it already found at exactly the moment a nudge asks it to try
+    # something different. Confirms the recap reaches the model at both the
+    # first-recovery stage and the second (pause) stage.
+    class RecordingLLM(ScriptedAsyncLLM):
+        def __init__(self, decisions):
+            super().__init__(decisions)
+            self.seen_user_messages: list[str] = []
+
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            self.seen_user_messages.append(messages[-1]["content"])
+            return self.decisions.pop(0)
+
+    llm = RecordingLLM([
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo findme"}}),
+        json.dumps({"action": "respond"}),                                              # turn 1 ends
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),  # -> recovery
+        json.dumps({"action": "respond"}),                                              # recovery turn's decision
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "ping x"}}),  # -> pause
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent = make_mission_agent(tmp_path, [])
+    agent.llm = llm
+    agent.cfg.mission.stuck_repeat_threshold = 2
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("test objective", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert control.paused
+    control.resume()
+    await task
+
+    assert "finished" in [e.kind for e in events]
+    recap_messages = [m for m in llm.seen_user_messages if "Already found this mission" in m]
+    assert len(recap_messages) >= 2  # reached both the recovery-stage and pause-stage nudges
+    assert all("findme" in m for m in recap_messages)
+
+
 async def test_mission_finish_objective_reachable_even_off_topic(tmp_path):
     # finish_objective shares no keywords with this message, so it would be
     # ranked out of the default top-5 tools if not force-included.
