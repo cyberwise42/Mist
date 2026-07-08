@@ -116,7 +116,7 @@ class LLMClient:
             options["num_ctx"] = self.num_ctx
         return options
 
-    def discover_context_length(self) -> int | None:
+    def discover_context_length(self, timeout: float = 5.0) -> int | None:
         """Queries Ollama's /api/show for this model's maximum context
         length (model_info's `<family>.context_length` key — the family
         prefix varies by architecture, e.g. "qwen35moe.context_length", so
@@ -124,11 +124,19 @@ class LLMClient:
         one family name). Returns None on any failure (network error,
         unreachable server, a backend/model that doesn't expose this) —
         this is a best-effort enhancement, and every caller must have a
-        sane fallback (today's behavior: don't set num_ctx at all)."""
+        sane fallback (today's behavior: don't set num_ctx at all).
+
+        Uses a short, explicit `timeout` independent of `self._client`'s
+        general one (which defaults to 120s, sized for slow LLM
+        completions) — this is a lightweight metadata query called once at
+        startup, before anything is rendered. Confirmed live: with the
+        client's full timeout, an unreachable server made `mist tui` look
+        hung for a full 2 minutes before ever showing a prompt."""
         if self.backend != "ollama":
             return None
         try:
-            resp = self._client.post(f"{self.base_url}/api/show", json={"model": self.model})
+            resp = self._client.post(f"{self.base_url}/api/show", json={"model": self.model},
+                                     timeout=timeout)
             resp.raise_for_status()
             model_info = resp.json().get("model_info") or {}
         except Exception:

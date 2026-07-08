@@ -2266,6 +2266,26 @@ def test_discover_context_length_returns_none_on_network_failure():
     assert client.discover_context_length() is None
 
 
+def test_discover_context_length_uses_short_timeout_not_full_client_timeout():
+    # Regression case from a real run: with no explicit timeout here, this
+    # shared the LLMClient's general timeout (120s, sized for slow
+    # completions) — an unreachable server made `mist tui` look hung for
+    # two full minutes before ever showing a prompt, since this call
+    # happens at startup before anything renders.
+    captured = {}
+
+    class FakeSyncClient:
+        def post(self, url, json=None, timeout=None):
+            captured["timeout"] = timeout
+            raise ConnectionError("simulated unreachable")
+
+    client = LLMClient("ollama", "http://fake", "m", timeout=120.0)
+    client._client = FakeSyncClient()
+    assert client.discover_context_length() is None
+    assert captured["timeout"] is not None
+    assert captured["timeout"] < 120.0
+
+
 def test_discover_context_length_returns_none_when_key_missing():
     def handler(request):
         return httpx.Response(200, json={"model_info": {"general.architecture": "llama"}})

@@ -50,8 +50,16 @@ def _build_agent(config_path: str | None, backend: str | None,
     # actually assembles), which silently truncates the prompt from the
     # front with no error. A failed discovery (server unreachable, an older
     # Ollama, the vLLM backend) leaves num_ctx/max_tokens unchanged —
-    # today's behavior.
+    # today's behavior. Bounded by a short timeout (see
+    # discover_context_length) and announced here — confirmed live: with no
+    # status line and the client's full 120s timeout, an unreachable server
+    # made `mist tui` look hung for two minutes before ever showing a prompt.
+    console.print("[dim]Checking model context window...[/]", end="\r")
     discovered_ctx = llm.discover_context_length()
+    console.print(" " * 40, end="\r")  # clear the status line
+    if discovered_ctx is None:
+        console.print("[dim]Could not reach the model backend to check its context "
+                      "window — continuing without num_ctx/max_tokens adjustment.[/]")
     llm.num_ctx = compute_num_ctx(cfg.context.token_budget, cfg.generation.max_tokens, discovered_ctx)
     effective_max_tokens = compute_max_tokens(cfg.generation.max_tokens, cfg.context.token_budget,
                                               discovered_ctx)
