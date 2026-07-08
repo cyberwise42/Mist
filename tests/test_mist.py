@@ -2061,7 +2061,103 @@ async def test_tui_kill_triggers_debrief(tmp_path):
 
 import httpx  # noqa: E402
 
-from mist.llm.client import LLMClient  # noqa: E402
+from mist.llm.client import LLMClient, compute_num_ctx  # noqa: E402
+
+
+# -- context-window discovery (mist.llm.client) ---------------------------
+
+def test_compute_num_ctx_clamps_to_discovered_max():
+    # Ollama's num_ctx is one shared window for the prompt AND the
+    # generation — the desired size is their sum, but it must never exceed
+    # what the model actually supports.
+    assert compute_num_ctx(token_budget=6000, max_tokens=256000, discovered_max=262144) == 262000
+    assert compute_num_ctx(token_budget=6000, max_tokens=256000, discovered_max=8192) == 8192
+
+
+def test_compute_num_ctx_returns_none_when_discovery_failed():
+    # Picking an arbitrary fallback number here could just as easily be
+    # wrong as not setting num_ctx at all — None means "leave the backend's
+    # own default alone," today's behavior, unchanged.
+    assert compute_num_ctx(token_budget=6000, max_tokens=1024, discovered_max=None) is None
+
+
+def test_discover_context_length_extracts_family_prefixed_key():
+    # The `model_info` key name varies by architecture family
+    # ("qwen35moe.context_length", "llama.context_length", ...) — this
+    # must work without hardcoding one family.
+    def handler(request):
+        return httpx.Response(200, json={
+            "model_info": {"general.architecture": "qwen35moe",
+                           "qwen35moe.context_length": 262144,
+                           "qwen35moe.embedding_length": 5120},
+        })
+    client = LLMClient("ollama", "http://fake", "qwen3.6:35b-a3b-q4_K_M")
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert client.discover_context_length() == 262144
+
+
+def test_discover_context_length_returns_none_on_network_failure():
+    def handler(request):
+        raise httpx.ConnectError("connection refused")
+    client = LLMClient("ollama", "http://fake", "m")
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert client.discover_context_length() is None
+
+
+def test_discover_context_length_returns_none_when_key_missing():
+    def handler(request):
+        return httpx.Response(200, json={"model_info": {"general.architecture": "llama"}})
+    client = LLMClient("ollama", "http://fake", "m")
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert client.discover_context_length() is None
+
+
+def test_discover_context_length_returns_none_for_vllm_backend():
+    client = LLMClient("vllm", "http://fake/v1", "m")
+    assert client.discover_context_length() is None
+
+
+def test_ollama_options_omits_num_ctx_when_unset():
+    def handler(request):
+        body = json.loads(request.content)
+        assert "num_ctx" not in body["options"]
+        return httpx.Response(200, json={"message": {"content": "ok"}})
+    client = LLMClient("ollama", "http://fake", "m")
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    client.complete([{"role": "user", "content": "hi"}])
+
+
+def test_ollama_options_includes_num_ctx_when_set():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["options"]["num_ctx"] == 32768
+        return httpx.Response(200, json={"message": {"content": "ok"}})
+    client = LLMClient("ollama", "http://fake", "m")
+    client.num_ctx = 32768
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    client.complete([{"role": "user", "content": "hi"}])
+
+
+async def test_aollama_options_includes_num_ctx_when_set():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["options"]["num_ctx"] == 32768
+        return httpx.Response(200, json={"message": {"content": "ok"}})
+    client = LLMClient("ollama", "http://fake", "m")
+    client.num_ctx = 32768
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await client.acomplete([{"role": "user", "content": "hi"}])
+
+
+async def test_astream_ollama_options_includes_num_ctx_when_set():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["options"]["num_ctx"] == 32768
+        return httpx.Response(200, content='{"message": {"content": "hi"}, "done": true}\n')
+    client = LLMClient("ollama", "http://fake", "m", think=False)
+    client.num_ctx = 32768
+    client._aclient = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    _ = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
 
 
 async def test_ollama_astream_parses_ndjson_deltas():

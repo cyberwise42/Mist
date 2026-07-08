@@ -35,6 +35,20 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+def compute_num_ctx(token_budget: int, max_tokens: int, discovered_max: int | None) -> int | None:
+    """Ollama's num_ctx is one shared window for both the assembled prompt
+    (bounded by `token_budget`) and the model's own generation (bounded by
+    `max_tokens`) — so the window this requests has to hold both. Returns
+    None (meaning: don't set num_ctx at all, let the backend use its own
+    default) when `discovered_max` is unknown — picking an arbitrary
+    fallback number here could just as easily be wrong as not setting it,
+    and this must never *raise* the effective context beyond what a real
+    model supports."""
+    if discovered_max is None:
+        return None
+    return min(token_budget + max_tokens, discovered_max)
+
+
 class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,
@@ -66,9 +80,47 @@ class LLMClient:
         self._think_unsupported: set[str] = set()
         self._client = httpx.Client(timeout=timeout)
         self._aclient = httpx.AsyncClient(timeout=timeout)
+        # Ollama's context window (num_ctx) is never sent unless set here —
+        # left None (the historical default), the server loads the model
+        # with whatever num_ctx its Modelfile/tags default to (commonly
+        # 2048-4096), which can be smaller than what Mist actually assembles
+        # (context.token_budget can run into the tens of thousands) and
+        # silently truncates from the front with no error. See
+        # `discover_context_length`/`compute_num_ctx` — the caller (cli.py)
+        # sets this explicitly once at startup after discovering the
+        # model's real max context length.
+        self.num_ctx: int | None = None
 
     def _effective_think(self) -> bool:
         return self.think and self.model not in self._think_unsupported
+
+    def _ollama_options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": self.temperature, "num_predict": self.max_tokens}
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
+        return options
+
+    def discover_context_length(self) -> int | None:
+        """Queries Ollama's /api/show for this model's maximum context
+        length (model_info's `<family>.context_length` key — the family
+        prefix varies by architecture, e.g. "qwen35moe.context_length", so
+        this looks for any key ending in that suffix rather than hardcoding
+        one family name). Returns None on any failure (network error,
+        unreachable server, a backend/model that doesn't expose this) —
+        this is a best-effort enhancement, and every caller must have a
+        sane fallback (today's behavior: don't set num_ctx at all)."""
+        if self.backend != "ollama":
+            return None
+        try:
+            resp = self._client.post(f"{self.base_url}/api/show", json={"model": self.model})
+            resp.raise_for_status()
+            model_info = resp.json().get("model_info") or {}
+        except Exception:
+            return None
+        for key, value in model_info.items():
+            if key.endswith(".context_length") and isinstance(value, int):
+                return value
+        return None
 
     # ------------------------------------------------------------------
     def complete(self, messages: list[dict[str, str]],
@@ -97,10 +149,7 @@ class LLMClient:
             # call back in for exactly the moments non-reasoning
             # decision-making has demonstrably failed (stuck-loop recovery).
             "think": self._effective_think() if (force_think or json_schema is None) else False,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.max_tokens,
-            },
+            "options": self._ollama_options(),
         }
         if json_schema is not None:
             payload["format"] = json_schema  # constrained decoding
@@ -167,7 +216,7 @@ class LLMClient:
             "messages": messages,
             "stream": False,
             "think": self._effective_think() if (force_think or json_schema is None) else False,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": self._ollama_options(),
         }
         if json_schema is not None:
             payload["format"] = json_schema
@@ -219,7 +268,7 @@ class LLMClient:
             "messages": messages,
             "stream": True,
             "think": think,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": self._ollama_options(),
         }
         async with self._aclient.stream(
             "POST", f"{self.base_url}/api/chat", json=payload
