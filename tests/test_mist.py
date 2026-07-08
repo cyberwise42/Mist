@@ -2061,7 +2061,7 @@ async def test_tui_kill_triggers_debrief(tmp_path):
 
 import httpx  # noqa: E402
 
-from mist.llm.client import LLMClient, compute_num_ctx  # noqa: E402
+from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx  # noqa: E402
 
 
 # -- context-window discovery (mist.llm.client) ---------------------------
@@ -2072,6 +2072,46 @@ def test_compute_num_ctx_clamps_to_discovered_max():
     # what the model actually supports.
     assert compute_num_ctx(token_budget=6000, max_tokens=256000, discovered_max=262144) == 262000
     assert compute_num_ctx(token_budget=6000, max_tokens=256000, discovered_max=8192) == 8192
+
+
+def test_answer_system_asserts_real_tool_access(tmp_path):
+    # Regression case from a real run: after a long think-heavy turn with
+    # no tool call, the free-text answer step claimed "I don't have
+    # network access or an active SSH shell" — a flat-out hallucinated
+    # limitation, since ANSWER_SYSTEM_TEMPLATE never actually told the
+    # model it has real tool access, only how to talk about tool output
+    # *if* there was any.
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    agent = MistAgent(cfg, FakeLLM([]), store, skills, tools)
+    system = agent._build_answer_system("what's my status")
+    assert "not a text-only assistant" in system
+    assert "claim you lack network access" in system
+
+
+def test_compute_max_tokens_clamps_unrealistic_configured_value():
+    # Regression case from a real run: a fixed generation.max_tokens tuned
+    # for one model (256000) is meaningless (or worse, wasteful/incorrect)
+    # against a model with a much smaller real context window.
+    assert compute_max_tokens(configured_max_tokens=256000, token_budget=6000,
+                              discovered_max=32768) == 26768
+    # Already fits: left unchanged.
+    assert compute_max_tokens(configured_max_tokens=8192, token_budget=6000,
+                              discovered_max=262144) == 8192
+
+
+def test_compute_max_tokens_never_raises_above_configured_value():
+    # Only tightens an unrealistic value — never second-guesses upward.
+    assert compute_max_tokens(configured_max_tokens=1024, token_budget=100,
+                              discovered_max=262144) == 1024
+
+
+def test_compute_max_tokens_passthrough_when_discovery_failed():
+    assert compute_max_tokens(configured_max_tokens=256000, token_budget=6000,
+                              discovered_max=None) == 256000
 
 
 def test_compute_num_ctx_returns_none_when_discovery_failed():
@@ -2753,7 +2793,7 @@ async def test_mission_pauses_on_near_duplicate_tool_calls(tmp_path):
     assert "finished" in [e.kind for e in events]
 
 
-async def test_mission_pauses_on_manual_probe_streak(tmp_path):
+async def test_mission_pauses_on_manual_probe_streak(tmp_path, monkeypatch):
     # Regression case from a real run: after one nmap scan, the model made
     # a dozen+ `curl` calls to a *different* invented path every time
     # (/login, /dashboard, /api/v1/reports/generate.json, ...) instead of
@@ -2763,6 +2803,22 @@ async def test_mission_pauses_on_manual_probe_streak(tmp_path):
     # 6 distinct paths against a threshold of 3: the first 3 trigger recovery
     # (which resets the streak), the next 3 trigger the pause — same shape
     # as test_mission_pauses_on_near_duplicate_tool_calls's 8-query/3-threshold ratio.
+    #
+    # The IP is a real target elsewhere on the operator's network — from
+    # wherever tests actually run, it's unreachable, and a real `curl`
+    # doesn't fail fast: it hangs until Mist's own subprocess timeout,
+    # which blew straight through this test's polling window (a genuine
+    # regression this exact test hit once network conditions differed from
+    # when it was written). Mock the subprocess so this never depends on
+    # real network reachability/timing at all.
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("(mock response)", "")
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+
     paths = ["/login", "/dashboard", "/api/v1/users", "/api/v1/reports/generate.json",
              "/api/v1/reports/generate.xml", "/robots.txt"]
     agent = make_mission_agent(tmp_path, [
@@ -2796,9 +2852,20 @@ async def test_mission_pauses_on_manual_probe_streak(tmp_path):
     assert "finished" in [e.kind for e in events]
 
 
-async def test_mission_manual_probe_streak_resets_on_scanner_call(tmp_path):
+async def test_mission_manual_probe_streak_resets_on_scanner_call(tmp_path, monkeypatch):
     # A scanner call in between two curls must reset the streak — it's
     # exactly the corrective behavior the nudge asks for, not a violation.
+    # Mocked for the same reason as test_mission_pauses_on_manual_probe_streak
+    # above: a real curl/gobuster against this unreachable IP shouldn't
+    # determine how long this test takes.
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("(mock response)", "")
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+
     agent = make_mission_agent(tmp_path, [
         json.dumps({"action": "use_tool", "tool": "shell",
                     "arguments": {"command": "curl -s http://10.0.0.1:3000/login"}}),

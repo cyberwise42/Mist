@@ -49,6 +49,22 @@ def compute_num_ctx(token_budget: int, max_tokens: int, discovered_max: int | No
     return min(token_budget + max_tokens, discovered_max)
 
 
+def compute_max_tokens(configured_max_tokens: int, token_budget: int,
+                       discovered_max: int | None) -> int:
+    """Caps a manually-configured `generation.max_tokens` so prompt +
+    generation never exceeds the model's real context window — a fixed
+    max_tokens tuned for one model (e.g. 256000) can be wildly wrong for a
+    smaller-context model without this. Returns `configured_max_tokens`
+    unchanged when `discovered_max` is unknown (today's behavior) or when
+    it already fits; never *raises* it above what's configured — this
+    only tightens an unrealistic value, it doesn't second-guess a
+    reasonable one."""
+    if discovered_max is None:
+        return configured_max_tokens
+    available = max(discovered_max - token_budget, 1)
+    return min(configured_max_tokens, available)
+
+
 class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,

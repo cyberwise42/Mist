@@ -11,7 +11,7 @@ from mist.config import load_config
 from mist.core.agent import MistAgent
 from mist.core.summarizer import BatchSummarizer
 from mist.core.tool_compressor import ToolOutputCompressor
-from mist.llm.client import LLMClient, compute_num_ctx
+from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx
 from mist.llm.embeddings import EmbeddingClient
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
@@ -49,19 +49,19 @@ def _build_agent(config_path: str | None, backend: str | None,
     # its Modelfile/tag defaults to (often much smaller than what Mist
     # actually assembles), which silently truncates the prompt from the
     # front with no error. A failed discovery (server unreachable, an older
-    # Ollama, the vLLM backend) leaves num_ctx unset — today's behavior,
-    # unchanged.
+    # Ollama, the vLLM backend) leaves num_ctx/max_tokens unchanged —
+    # today's behavior.
     discovered_ctx = llm.discover_context_length()
     llm.num_ctx = compute_num_ctx(cfg.context.token_budget, cfg.generation.max_tokens, discovered_ctx)
-    if discovered_ctx is not None:
-        desired = cfg.context.token_budget + cfg.generation.max_tokens
-        if desired > discovered_ctx:
-            console.print(
-                f"[yellow]Warning: context.token_budget + generation.max_tokens "
-                f"({desired}) exceeds {cfg.model}'s real context window "
-                f"({discovered_ctx}) — num_ctx clamped to {discovered_ctx}. A long "
-                f"response may hit the context limit before max_tokens.[/]"
-            )
+    effective_max_tokens = compute_max_tokens(cfg.generation.max_tokens, cfg.context.token_budget,
+                                              discovered_ctx)
+    if effective_max_tokens != cfg.generation.max_tokens:
+        llm.max_tokens = effective_max_tokens
+        console.print(
+            f"[yellow]generation.max_tokens ({cfg.generation.max_tokens}) reduced to "
+            f"{effective_max_tokens} to fit inside {cfg.model}'s real context window "
+            f"({discovered_ctx}) alongside context.token_budget ({cfg.context.token_budget}).[/]"
+        )
     store = MemoryStore(cfg.db_path)
 
     embeddings = None
