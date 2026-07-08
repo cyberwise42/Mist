@@ -85,7 +85,19 @@ def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
     context assembly a subagent must not touch."""
 
     def _run_one(task: str) -> SubagentResult:
-        all_tools = tools.all()
+        # `mission_only` tools (currently just `finish_objective`) are meant
+        # to be reachable only through a mission's own decision loop, via
+        # `always_exposed` — never through `ToolRegistry.select()`'s normal
+        # ranking. `tools.all()` bypasses that filtering entirely, and a real
+        # run confirmed the model will still try to call `finish_objective`
+        # here if it's offered: it emitted a schema-deviant
+        # {"action": "finish_objective", "summary": "..."} instead of this
+        # loop's documented {"action": "use_tool", "tool": ..., "arguments":
+        # {...}} shape (this schema has no top-level "finish_objective"
+        # action, and no "summary" property), which fell through to the
+        # empty-response fallback below — twice, in a real mission, wasting
+        # ~200s before the parent's own stuck-repeat detector caught it.
+        all_tools = [t for t in tools.all() if not t.mission_only]
         tool_lines = "\n".join(
             f"- {t.name}: {t.description} | args schema: {json.dumps(t.parameters['properties'])}"
             for t in all_tools
@@ -108,7 +120,20 @@ def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
                     continue
 
                 if action.get("action") == "respond" or "tool" not in action:
-                    response = action.get("response", "").strip() or "(empty response)"
+                    response = action.get("response", "").strip()
+                    if not response:
+                        # A bare "(empty response)" here previously discarded
+                        # a real, debuggable signal: a model can emit a
+                        # schema-deviant action (missing "tool", an
+                        # unexpected "action" value) that satisfies neither
+                        # branch cleanly. Surfacing the raw action back to
+                        # the caller at least gives the parent turn/mission
+                        # something to react to instead of nothing — which
+                        # is exactly why a real run just blindly retried the
+                        # identical call three times: an empty result gave
+                        # it no information about what to change.
+                        response = ("(subagent produced no usable response; "
+                                   f"raw action: {json.dumps(action)[:300]})")
                     return SubagentResult(task=task, response=response)
 
                 tool = tools.get(action.get("tool", ""))

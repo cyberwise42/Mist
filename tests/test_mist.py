@@ -501,6 +501,47 @@ def test_run_tool_subagents_empty_tasks():
     assert run_tool_subagents(ToolEchoLLM(), tools, [], max_workers=4) == []
 
 
+def test_run_tool_subagents_excludes_mission_only_tools():
+    # Regression case from a real run: `finish_objective` is mission_only
+    # (meant to be reachable only through a mission's own decision loop via
+    # always_exposed) but `tools.all()` doesn't filter that, so a subagent
+    # used to see it listed as an available tool — and a live model tried to
+    # call it, emitting {"action": "finish_objective", "summary": "..."},
+    # a shape this loop's schema has no room for.
+    tools = default_registry(remember_fn=lambda c: None)
+    assert any(t.name == "finish_objective" for t in tools.all())  # exists in the full registry
+
+    captured: dict = {}
+
+    class CapturingLLM:
+        def complete(self, messages, json_schema=None, force_think=False):
+            captured["system"] = messages[0]["content"]
+            captured["schema"] = json_schema
+            return json.dumps({"action": "respond", "response": "done"})
+
+    run_tool_subagents(CapturingLLM(), tools, ["a task"], max_workers=1, max_steps=3)
+    assert "finish_objective" not in captured["system"]
+    assert "finish_objective" not in captured["schema"]["properties"]["tool"]["enum"]
+
+
+def test_run_tool_subagents_surfaces_malformed_action_instead_of_empty_response():
+    # Same regression case: when a model emits a schema-deviant action
+    # anyway (missing "tool", an unexpected "action" value), the fallback
+    # must surface something a caller can act on, not a bare "(empty
+    # response)" that discards the only clue as to what went wrong — this
+    # is exactly why a real mission just blindly retried the identical
+    # spawn_subagents call three times before getting flagged as stuck.
+    class MalformedLLM:
+        def complete(self, messages, json_schema=None, force_think=False):
+            return json.dumps({"action": "finish_objective", "summary": "done scanning"})
+
+    tools = default_registry(remember_fn=lambda c: None)
+    results = run_tool_subagents(MalformedLLM(), tools, ["a task"], max_workers=1, max_steps=3)
+    assert len(results) == 1
+    assert results[0].response != "(empty response)"
+    assert "finish_objective" in results[0].response
+
+
 def test_default_registry_omits_write_skill_without_skills():
     tools = default_registry(remember_fn=lambda c: None)
     assert tools.get("write_skill") is None
