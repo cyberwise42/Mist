@@ -28,13 +28,21 @@ class Artifact:
     def pointer(self) -> str:
         """Appended as a suffix *after* the (possibly truncated) tool
         result. Both truncation layers keep a tail slice of the string
-        (`text[-tail_chars:]`), and this pointer is ~110-130 chars against a
-        tail budget of ~1360 chars at default settings — so it survives
-        every downstream truncation pass automatically, without any change
-        needed to the truncation functions themselves."""
+        (`text[-tail_chars:]`), and this pointer is well under the ~1360
+        char tail budget at default settings — so it survives every
+        downstream truncation pass automatically, without any change
+        needed to the truncation functions themselves.
+
+        Explicitly says `read_file`, not `shell`/`grep`/`cat` — confirmed
+        live: a model tried to `grep` this path directly and got "No such
+        file or directory", since `rel_path` is relative to the wiki root
+        (what `read_file` resolves against), not `shell`'s cwd (the
+        workspace root, or a genuinely different machine entirely on the
+        SSH backend) — the artifact lives wherever Mist itself runs, which
+        a shell command has no guaranteed access to at all."""
         return (f"\n[full output: {self.rel_path.as_posix()} "
                 f"({self.stdout_chars} stdout / {self.stderr_chars} stderr chars) — "
-                f"read_file to see more]")
+                f"use read_file, not shell/grep, to see more]")
 
 
 class ArtifactStore:

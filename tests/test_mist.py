@@ -1049,6 +1049,33 @@ def test_summarize_content_discovery_returns_none_without_status_lines():
     assert summarize_tool_output("ffuf", "no hits here, just banner text", "") is None
 
 
+def test_summarize_content_discovery_detects_narrow_size_band_wildcard():
+    # Regression case from a real run (HTB "Connected"): a wildcard vhost
+    # 301-redirected virtually every fuzzed word, but Content-Length varied
+    # 231-240 bytes because the response echoed the requested word back —
+    # never an exact size match, so the identical-size check above never
+    # fires. Status-code clustering + a narrow size band still catches it.
+    lines = [f"word{i}   [Status: 301, Size: {231 + (i % 10)}, Words: 14, Lines: 8]"
+             for i in range(30)]
+    lines.append("real-hit  [Status: 200, Size: 942, Words: 20, Lines: 5]")
+    stdout = "\n".join(lines)
+    out = summarize_tool_output("ffuf", stdout, "")
+    assert "30/31 paths returned Status 301" in out
+    assert "231-240" in out or "240-231" in out
+    assert "-fc 301" in out
+    assert "real-hit  [Status: 200, Size: 942" in out
+
+
+def test_summarize_content_discovery_exact_size_match_takes_priority():
+    # When an exact-size match exists, it's more precise than the
+    # status-clustering fallback and should be used instead.
+    lines = [f"/path{i}    (Status: 200) [Size: 500]" for i in range(15)]
+    stdout = "\n".join(lines)
+    out = summarize_tool_output("gobuster", stdout, "")
+    assert "-fs 500" in out
+    assert "-fc" not in out
+
+
 # -- Tier 1+2 wiring into _run_subprocess/_shell ----------------------------
 
 def test_shell_persists_artifact_and_appends_pointer(tmp_path, monkeypatch):
@@ -1065,7 +1092,7 @@ def test_shell_persists_artifact_and_appends_pointer(tmp_path, monkeypatch):
                              artifact_config=ArtifactConfig(min_chars_to_persist=10))
     out = tools.get("shell").run(command="echo test")
     assert "[full output:" in out
-    assert "read_file to see more" in out
+    assert "use read_file, not shell/grep" in out
     artifact_files = list((tmp_path / "raw" / "tool-output").rglob("*.txt"))
     assert len(artifact_files) == 1
     assert "y" * 1000 in artifact_files[0].read_text(encoding="utf-8")

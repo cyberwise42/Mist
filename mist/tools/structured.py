@@ -131,37 +131,89 @@ _HIT_STATUS_RE = re.compile(r"Status:\s*(\d+)")
 _HIT_SIZE_RE = re.compile(r"Size:\s*(\d+)")
 
 
+_WILDCARD_SIZE_SPREAD = 50  # bytes: how tight a size cluster has to be to
+                            # still count as "the same response" when sizes
+                            # aren't bit-for-bit identical. Confirmed live
+                            # (HTB "Connected"): a real wildcard vhost's
+                            # Content-Length varied 229-257 (spread 28) —
+                            # an initial 20-byte threshold was tuned from a
+                            # synthetic test and turned out too tight for
+                            # the real distribution once checked against it.
+
+
+def _finish_discovery(parts: list[str], stderr: str) -> str:
+    result = "\n".join(parts)
+    if stderr.strip():
+        result += "\n[stderr omitted: progress/banner chatter]"
+    return result
+
+
 def _summarize_content_discovery(stdout: str, stderr: str) -> str | None:
     """gobuster/ffuf: keep `Status:` hit lines, drop `Progress:`/`Duration:`
-    lines unconditionally. Additionally: if most hits share an identical
-    response size, that's very likely a catch-all/SPA route responding 200
-    to everything, not real content discovery — surface that explicitly
-    instead of a wall of near-identical false positives (confirmed live: an
-    ffuf run against a Next.js catch-all page returned Status 200, an
-    identical Size, for virtually every path tried)."""
+    lines unconditionally. Additionally, two wildcard/catch-all detections,
+    tried in order:
+
+    1. Most hits share an *identical* response size — very likely a
+       catch-all/SPA route responding 200 to everything (confirmed live:
+       an ffuf run against a Next.js catch-all page returned Status 200,
+       an identical Size, for virtually every path tried).
+    2. Most hits share the same *status code*, with sizes clustered in a
+       narrow band rather than bit-for-bit identical — a wildcard vhost
+       commonly echoes the requested path into the response body, shifting
+       Content-Length by a few bytes per word without changing what's
+       actually happening (confirmed live: a target 301-redirected
+       virtually every fuzzed word, sizes varying 231-240 bytes — the
+       exact-size check above never fires, but it's unmistakably a
+       wildcard once status+narrow-size-band are considered together;
+       gobuster's own wildcard-detection warning on the same target
+       confirmed it independently)."""
     hits = [l for l in stdout.splitlines() if _HIT_STATUS_RE.search(l)]
     if not hits:
         return None
 
-    sizes = [m.group(1) for l in hits if (m := _HIT_SIZE_RE.search(l))]
-    parts = hits
+    parsed = []  # (line, status, size-or-None) — kept aligned per hit line,
+                 # since not every hit line necessarily has a Size field
+    for line in hits:
+        status_m = _HIT_STATUS_RE.search(line)
+        size_m = _HIT_SIZE_RE.search(line)
+        parsed.append((line, status_m.group(1), size_m.group(1) if size_m else None))
+
+    sizes = [sz for _, _, sz in parsed if sz is not None]
+    statuses = [st for _, st, _ in parsed]
+
     if sizes and len(sizes) >= 5:
-        common_size, count = Counter(sizes).most_common(1)[0]
-        if count / len(sizes) > 0.8:
-            statuses = [m.group(1) for l in hits if (m := _HIT_STATUS_RE.search(l))]
-            common_status = Counter(statuses).most_common(1)[0][0] if statuses else "?"
-            distinct = [l for l in hits
-                       if not (m := _HIT_SIZE_RE.search(l)) or m.group(1) != common_size]
+        common_size, size_count = Counter(sizes).most_common(1)[0]
+        if size_count / len(sizes) > 0.8:
+            common_status = Counter(statuses).most_common(1)[0][0]
+            distinct = [line for line, _, sz in parsed if sz != common_size]
             parts = [
-                f"{count}/{len(sizes)} paths returned Status {common_status}, Size "
+                f"{size_count}/{len(sizes)} paths returned Status {common_status}, Size "
                 f"{common_size} (likely a catch-all/SPA route — re-scan with "
                 f"-fs {common_size} to exclude it).",
             ]
             if distinct:
                 parts.append(f"Remaining {len(distinct)} hit(s) not matching that size:")
                 parts.extend(distinct[:30])
+            return _finish_discovery(parts, stderr)
 
-    result = "\n".join(parts)
-    if stderr.strip():
-        result += "\n[stderr omitted: progress/banner chatter]"
-    return result
+    if len(statuses) >= 10:
+        common_status, status_count = Counter(statuses).most_common(1)[0]
+        if status_count / len(statuses) > 0.8:
+            same_status_sizes = [int(sz) for _, st, sz in parsed
+                                 if st == common_status and sz is not None]
+            if same_status_sizes and (max(same_status_sizes) - min(same_status_sizes)
+                                      ) <= _WILDCARD_SIZE_SPREAD:
+                remaining = [line for line, st, _ in parsed if st != common_status]
+                parts = [
+                    f"{status_count}/{len(statuses)} paths returned Status {common_status} "
+                    f"with sizes clustered narrowly ({min(same_status_sizes)}-"
+                    f"{max(same_status_sizes)} bytes) — almost certainly a wildcard/catch-all "
+                    f"response, not real content discovery (re-scan excluding it, e.g. "
+                    f"ffuf -fc {common_status}).",
+                ]
+                if remaining:
+                    parts.append(f"Remaining {len(remaining)} hit(s) with a different status:")
+                    parts.extend(remaining[:30])
+                return _finish_discovery(parts, stderr)
+
+    return _finish_discovery(hits, stderr)
