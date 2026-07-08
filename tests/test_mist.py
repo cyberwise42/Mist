@@ -1597,7 +1597,38 @@ async def test_astream_turn_survives_llm_call_exception(tmp_path):
     agent = make_async_agent(tmp_path, RaisingLLM())
     events = [e async for e in agent.astream_turn("scan the target")]
     assert events[-1].kind == "error"
-    assert "backend unreachable" in events[-1].text
+
+
+class EmptyMessageRaisingLLM:
+    """Simulates a real incident: some low-level connection exceptions have
+    an empty str() (a dropped socket, a reset connection with no message),
+    so f"...{exc}" renders as a bare, undiagnosable "LLM call failed: " —
+    confirmed live, three separate times in one real mission with zero clue
+    which exception actually fired."""
+    def complete(self, messages, json_schema=None, force_think=False):
+        raise ConnectionResetError()
+
+    async def acomplete(self, messages, json_schema=None, force_think=False):
+        raise ConnectionResetError()
+
+    async def astream(self, messages):
+        raise ConnectionResetError()
+        yield  # pragma: no cover - unreachable, makes this an async generator
+
+
+def test_turn_error_message_names_exception_type_even_when_str_is_empty(tmp_path):
+    assert str(ConnectionResetError()) == ""  # sanity-check the premise
+    agent = make_agent(tmp_path, [])
+    agent.llm = EmptyMessageRaisingLLM()
+    result = agent.turn("scan the target")
+    assert "ConnectionResetError" in result.response
+
+
+async def test_astream_turn_error_message_names_exception_type_even_when_str_is_empty(tmp_path):
+    agent = make_async_agent(tmp_path, EmptyMessageRaisingLLM())
+    events = [e async for e in agent.astream_turn("scan the target")]
+    assert events[-1].kind == "error"
+    assert "ConnectionResetError" in events[-1].text
 
 
 async def test_stream_answer_survives_mid_stream_exception(tmp_path):
@@ -1608,6 +1639,26 @@ async def test_stream_answer_survives_mid_stream_exception(tmp_path):
     # The partial text generated before the crash isn't silently discarded.
     turns = agent.store.recent_turns(agent.session_id, 10)
     assert turns and "partial" in turns[-1]["content"]
+
+
+class EmptyMessageRaisingMidStreamLLM:
+    """Same premise as EmptyMessageRaisingLLM, but the empty-message
+    exception fires mid-stream (in _stream_answer) rather than at the
+    decision step — the third of the three "LLM call failed" sites this
+    incident affected."""
+    async def acomplete(self, messages, json_schema=None, force_think=False):
+        return json.dumps({"action": "respond"})
+
+    async def astream(self, messages):
+        yield "partial "
+        raise ConnectionResetError()
+
+
+async def test_stream_answer_error_message_names_exception_type_even_when_str_is_empty(tmp_path):
+    agent = make_async_agent(tmp_path, EmptyMessageRaisingMidStreamLLM())
+    events = [e async for e in agent.astream_turn("hi")]
+    assert events[-1].kind == "error"
+    assert "ConnectionResetError" in events[-1].text
 
 
 async def test_mission_pauses_on_turn_error_instead_of_spinning(tmp_path):

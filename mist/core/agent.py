@@ -433,7 +433,13 @@ class MistAgent:
             try:
                 raw = self.llm.complete(messages, json_schema=schema)
             except Exception as exc:  # network/backend errors must not crash the caller
-                response = f"ERROR: LLM call failed: {exc}"
+                # repr(), not str() — some low-level connection exceptions
+                # (a dropped socket, a reset connection) have an empty
+                # message, and str() alone renders as a bare "LLM call
+                # failed: " with zero diagnostic value. Confirmed live:
+                # this happened three separate times in one real mission
+                # with no clue as to which exception actually fired.
+                response = f"ERROR: LLM call failed: {exc!r}"
                 self.store.add_turn(self.session_id, "user", user_msg)
                 self.store.add_turn(self.session_id, "assistant", response)
                 return TurnResult(response=response, tool_trace=trace)
@@ -501,7 +507,7 @@ class MistAgent:
         try:
             response = self.llm.complete(messages).strip() or "(empty response)"
         except Exception as exc:
-            response = f"ERROR: LLM call failed: {exc}"
+            response = f"ERROR: LLM call failed: {exc!r}"
         self.store.add_turn(self.session_id, "user", user_msg)
         self.store.add_turn(self.session_id, "assistant", response)
         return TurnResult(response=response, tool_trace=trace)
@@ -562,7 +568,7 @@ class MistAgent:
                                      "content": "Invalid JSON. Reply with ONLY the JSON object."})
             if raw_action is None:
                 if last_error is not None:
-                    yield TurnEvent(kind="error", text=f"LLM call failed: {last_error}")
+                    yield TurnEvent(kind="error", text=f"LLM call failed: {last_error!r}")
                 else:
                     yield TurnEvent(kind="error", text="Model failed to produce valid JSON.")
                 return
@@ -641,11 +647,11 @@ class MistAgent:
                 yield TurnEvent(kind="delta", text=delta)
         except Exception as exc:  # network/backend errors must not crash the caller
             partial = "".join(chunks).strip()
-            note = f"[interrupted: LLM call failed mid-stream: {exc}]"
-            response = f"{partial}\n{note}" if partial else f"ERROR: LLM call failed mid-stream: {exc}"
+            note = f"[interrupted: LLM call failed mid-stream: {exc!r}]"
+            response = f"{partial}\n{note}" if partial else f"ERROR: LLM call failed mid-stream: {exc!r}"
             self.store.add_turn(self.session_id, "user", user_msg)
             self.store.add_turn(self.session_id, "assistant", response)
-            yield TurnEvent(kind="error", text=f"LLM call failed mid-stream: {exc}")
+            yield TurnEvent(kind="error", text=f"LLM call failed mid-stream: {exc!r}")
             return
         response = "".join(chunks).strip() or "(empty response)"
         self.store.add_turn(self.session_id, "user", user_msg)
