@@ -2194,6 +2194,20 @@ def test_normalize_tool_call_preserves_different_ip_targets():
     assert a != b
 
 
+def test_is_manual_probe_detects_curl_and_wget_shell_calls():
+    from mist.core.agent import _is_manual_probe
+    assert _is_manual_probe("shell", json.dumps({"command": "curl -s http://10.0.0.1/login"}))
+    assert _is_manual_probe("shell", json.dumps({"command": "wget -q http://10.0.0.1/x"}))
+    assert _is_manual_probe("shell", json.dumps({"command": "sudo curl http://10.0.0.1/"}))
+
+
+def test_is_manual_probe_false_for_scanners_and_other_tools():
+    from mist.core.agent import _is_manual_probe
+    assert not _is_manual_probe("shell", json.dumps({"command": "nmap -sV -sC 10.0.0.1"}))
+    assert not _is_manual_probe("shell", json.dumps({"command": "gobuster dir -u http://10.0.0.1"}))
+    assert not _is_manual_probe("search_files", json.dumps({"query": "curl"}))
+
+
 def test_truncate_tool_output_keeps_tail_not_just_head():
     # Regression case from a real run: a live `nuclei` scan's actual
     # findings and "N matches found" summary line only appear after a long
@@ -2262,6 +2276,70 @@ async def test_mission_pauses_on_near_duplicate_tool_calls(tmp_path):
     assert stuck and "varying only a literal/number" in stuck[0].text
     control.resume()
     await task
+    assert "finished" in [e.kind for e in events]
+
+
+async def test_mission_pauses_on_manual_probe_streak(tmp_path):
+    # Regression case from a real run: after one nmap scan, the model made
+    # a dozen+ `curl` calls to a *different* invented path every time
+    # (/login, /dashboard, /api/v1/reports/generate.json, ...) instead of
+    # running a content-discovery scanner. Every call is genuinely
+    # different, so neither the exact-repeat nor near-duplicate check ever
+    # fires — only the manual-probe-streak check should.
+    # 6 distinct paths against a threshold of 3: the first 3 trigger recovery
+    # (which resets the streak), the next 3 trigger the pause — same shape
+    # as test_mission_pauses_on_near_duplicate_tool_calls's 8-query/3-threshold ratio.
+    paths = ["/login", "/dashboard", "/api/v1/users", "/api/v1/reports/generate.json",
+             "/api/v1/reports/generate.xml", "/robots.txt"]
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": f"curl -s http://10.129.245.214:3000{p}"}})
+        for p in paths
+    ] + [
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.manual_probe_threshold = 3
+    control = MissionControl()
+
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("enumerate the web app", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(200):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert any(e.kind == "recovering" for e in events)
+    assert control.paused
+    stuck = [e for e in events if e.kind == "stuck"]
+    assert stuck and "curl/wget probes" in stuck[0].text
+    control.resume()
+    await task
+    assert "finished" in [e.kind for e in events]
+
+
+async def test_mission_manual_probe_streak_resets_on_scanner_call(tmp_path):
+    # A scanner call in between two curls must reset the streak — it's
+    # exactly the corrective behavior the nudge asks for, not a violation.
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": "curl -s http://10.0.0.1:3000/login"}}),
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": "gobuster dir -u http://10.0.0.1:3000 -w list.txt"}}),
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": "curl -s http://10.0.0.1:3000/dashboard"}}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.manual_probe_threshold = 2
+    control = MissionControl()
+
+    events = [e async for e in agent.astream_mission("enumerate the web app", control, max_turns=10)]
+    assert not any(e.kind == "stuck" for e in events)
     assert "finished" in [e.kind for e in events]
 
 

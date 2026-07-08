@@ -59,6 +59,12 @@ Available tools:
 - A broad or multi-phase request ("pentest this machine", "get the flags") is still a request that
   requires action: decide `use_tool` for the next concrete step now. Deciding `respond` here means
   the operator gets a description instead of progress — only do that when no action is needed.
+- Match your actions to the objective's actual scope, in both directions. A narrow objective
+  ("enumerate ports and services", "identify what's running on port X") is fully satisfied once a
+  scan's own output already answers it — persist that result and call `finish_objective` right
+  then, don't keep going into content discovery, vulnerability scanning, or exploitation the
+  objective never asked for. Only continue into those further phases when the objective itself
+  calls for full compromise, access, or a flag.
 - Only decide to respond directly when no action is needed: answering a question, explaining a
   concept, or reporting results you already produced.
 - After a tool call produces a meaningful finding (open ports, a credential, a vulnerability, a
@@ -77,6 +83,12 @@ Available tools:
   <version>`) before hand-crafting a `curl`/manual request against it. A raw `curl` against a
   webserver's JS/assets is a fine follow-up once a scan or search has pointed at something
   specific to confirm — it is not the first move against an unscanned target or port.
+- Content/route discovery is a scanner's job (`gobuster`, `ffuf`, `dirsearch`), not a series of
+  hand-picked `curl` guesses at paths you invented (`/api/v1/...`, `/dashboard`, `/login`, ...). A
+  wordlist scan finds real endpoints in seconds; guessing one path at a time rarely finds anything
+  a scan wouldn't have and burns turns doing it. More than one or two manual probes to different
+  paths on the same host without a scanner call in between is the signal to switch tools, not to
+  keep guessing.
 - Do not write the answer itself here — a separate step does that.
 - One action per reply. No text outside the JSON object."""
 
@@ -222,6 +234,30 @@ def _normalize_tool_call(tool: str, args_json: str) -> str:
             v = _normalize_value(v)
         parts.append(f"{k}={v}")
     return f"{tool}:" + ",".join(parts)
+
+
+_MANUAL_PROBE_RE = re.compile(r"^\s*(?:sudo\s+)?(?:curl|wget)\b", re.IGNORECASE)
+
+
+def _is_manual_probe(tool: str, args_json: str) -> bool:
+    """True for a `shell` call that's a single ad hoc HTTP request (`curl`/
+    `wget`) — the tool class a real mission used, correctly-shaped and
+    genuinely different every time (a different path each call: `/login`,
+    `/dashboard`, `/api/v1/reports/generate.json`, ...), to hand-guess at
+    content discovery instead of running a scanner. Neither the exact-repeat
+    nor near-duplicate check above can catch this: every call really is a
+    distinct, individually reasonable-looking command, so no signature ever
+    repeats. This is a separate, coarser signal — a streak of this *tool
+    class* in a row, regardless of what varies inside it — tracked by
+    `astream_mission` alongside (not instead of) the other two."""
+    if tool != "shell":
+        return False
+    try:
+        args = json.loads(args_json) if args_json else {}
+    except (ValueError, TypeError):
+        return False
+    command = args.get("command", "") if isinstance(args, dict) else ""
+    return bool(_MANUAL_PROBE_RE.match(command))
 
 
 @dataclass
@@ -591,6 +627,7 @@ class MistAgent:
                                max_seconds: float | None = None,
                                stuck_repeat_threshold: int | None = None,
                                near_duplicate_threshold: int | None = None,
+                               manual_probe_threshold: int | None = None,
                                ) -> AsyncIterator[MissionEvent]:
         """Repeatedly drives astream_turn, treating each "respond" as an
         interim status rather than a stopping point, and synthesizing the
@@ -605,6 +642,8 @@ class MistAgent:
                            if stuck_repeat_threshold is None else stuck_repeat_threshold)
         near_dup_threshold = (self.cfg.mission.near_duplicate_threshold
                               if near_duplicate_threshold is None else near_duplicate_threshold)
+        manual_probe_threshold = (self.cfg.mission.manual_probe_threshold
+                                  if manual_probe_threshold is None else manual_probe_threshold)
 
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
@@ -624,6 +663,7 @@ class MistAgent:
             occurrences = 0
             near_dup_signature: str | None = None
             near_dup_occurrences = 0
+            manual_probe_streak = 0
             next_turn_think = False
             recovered_once = False
 
@@ -654,6 +694,8 @@ class MistAgent:
                         near_dup_occurrences = (near_dup_occurrences + 1
                                                 if nd_sig == near_dup_signature else 1)
                         near_dup_signature = nd_sig
+                        manual_probe_streak = (manual_probe_streak + 1
+                                               if _is_manual_probe(event.tool, event.detail) else 0)
                         if occurrences >= stuck_threshold:
                             # Break out of astream_turn's own tool loop
                             # immediately — a single turn can run up to
@@ -662,6 +704,7 @@ class MistAgent:
                             # runaway repeat hammer the target far more than
                             # stuck_threshold times before ever catching it.
                             stuck = True
+                            stuck_kind = "repeat"
                             stuck_repeat_count = occurrences
                             stuck_display = last_signature
                             break
@@ -673,8 +716,21 @@ class MistAgent:
                             # See _normalize_tool_call for what this does and
                             # doesn't catch.
                             stuck = True
+                            stuck_kind = "repeat"
                             stuck_repeat_count = near_dup_occurrences
                             stuck_display = f"{event.tool} (varying only a literal/number each call)"
+                            break
+                        if manual_probe_streak >= manual_probe_threshold:
+                            # A third, distinct failure shape: every call is
+                            # genuinely different (a different path each
+                            # time), so neither check above ever fires — but
+                            # it's the same *tool class* used over and over
+                            # as a substitute for a content-discovery scanner.
+                            # See _is_manual_probe.
+                            stuck = True
+                            stuck_kind = "manual_probe"
+                            stuck_repeat_count = manual_probe_streak
+                            stuck_display = f"{manual_probe_streak}x curl/wget probes with no scanner call in between"
                             break
                     elif event.kind == "tool_result":
                         self._mission_log_append(log_path, f"```\n{event.text}\n```\n")
@@ -719,16 +775,27 @@ class MistAgent:
                                   f"({stuck_display}) — reasoning through a different "
                                   "approach before giving up."),
                         )
-                        nudge = (f"You've repeated the same tool call ({stuck_display}) "
-                                f"{stuck_repeat_count} times in a row with no new result. Stop and "
-                                "actually think through why this specific approach isn't "
-                                "working, then commit to a genuinely different next step — "
-                                "not a minor variation of the same command.")
+                        if stuck_kind == "manual_probe":
+                            nudge = (f"You've made {stuck_repeat_count} manual curl/wget requests in "
+                                    "a row, each to a different path, without running a scanner. "
+                                    "Content/route discovery is a scanner's job (gobuster/ffuf/"
+                                    "dirsearch) and vulnerability checks come from nmap --script "
+                                    "vuln / nuclei / searchsploit — not hand-picked URLs. Also check "
+                                    "whether the objective is already satisfied by what you've "
+                                    "already found; if it is, call finish_objective now instead of "
+                                    "continuing to explore.")
+                        else:
+                            nudge = (f"You've repeated the same tool call ({stuck_display}) "
+                                    f"{stuck_repeat_count} times in a row with no new result. Stop and "
+                                    "actually think through why this specific approach isn't "
+                                    "working, then commit to a genuinely different next step — "
+                                    "not a minor variation of the same command.")
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge)
                         routing_query = _mission_routing_query(objective, notes, nudge)
                         occurrences = 0
                         near_dup_occurrences = 0
+                        manual_probe_streak = 0
                         recovered_once = True
                         next_turn_think = True
                         continue
@@ -749,15 +816,22 @@ class MistAgent:
                               f"the same tool call {stuck_repeat_count}x in a row again "
                               f"({stuck_display}) — paused for operator review."),
                     )
-                    nudge = (f"You've repeated the same tool call ({stuck_display}) "
-                            f"{stuck_repeat_count} times in a row with no new result — that approach "
-                            "isn't working. Try something different, or explain what you're "
-                            "blocked on if you need the operator's judgment.")
+                    if stuck_kind == "manual_probe":
+                        nudge = (f"You're still making manual curl/wget requests ({stuck_display}) "
+                                "instead of switching to a scanner (gobuster/ffuf/nuclei/"
+                                "searchsploit) or recognizing the objective is already done. "
+                                "Explain what you're blocked on if you need the operator's judgment.")
+                    else:
+                        nudge = (f"You've repeated the same tool call ({stuck_display}) "
+                                f"{stuck_repeat_count} times in a row with no new result — that approach "
+                                "isn't working. Try something different, or explain what you're "
+                                "blocked on if you need the operator's judgment.")
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge)
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     occurrences = 0
                     near_dup_occurrences = 0
+                    manual_probe_streak = 0
                     recovered_once = False
                     continue
 
