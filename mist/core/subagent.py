@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from mist.llm.client import LLMClient, parse_json_relaxed
 
 if TYPE_CHECKING:
+    from mist.core.tool_compressor import ToolOutputCompressor
     from mist.tools.registry import ToolRegistry
 
 SUBAGENT_SYSTEM = """You are a focused subagent handling one isolated subtask.
@@ -76,13 +77,20 @@ def run_subagents(llm: LLMClient, tasks: list[str], max_workers: int = 4) -> lis
 
 
 def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
-                        max_workers: int = 4, max_steps: int = 6) -> list[SubagentResult]:
+                        max_workers: int = 4, max_steps: int = 6,
+                        tool_compressor: "ToolOutputCompressor | None" = None
+                        ) -> list[SubagentResult]:
     """Run each task as an isolated subagent with its own bounded tool loop
     (read_file/write_file/shell/remember — never spawn_subagents or
     write_skill, since ``tools`` is built without ``llm``/``skills``). Kept as
     a standalone loop rather than sharing MistAgent.turn()'s implementation:
     that method is entangled with session persistence and skill/memory
-    context assembly a subagent must not touch."""
+    context assembly a subagent must not touch.
+
+    ``tool_compressor`` mirrors the same tier-3 tool-output insertion point
+    as ``MistAgent.turn``/``astream_turn`` — this loop already runs on plain
+    threads (via ``ThreadPoolExecutor``), so the compressor's own blocking
+    LLM call needs no ``asyncio.to_thread`` wrapper here."""
 
     def _run_one(task: str) -> SubagentResult:
         # `mission_only` tools (currently just `finish_objective`) are meant
@@ -149,6 +157,9 @@ def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
                     result = f"ERROR: bad arguments: {exc}"
                 except Exception as exc:  # tool errors go back to the model, not up
                     result = f"ERROR: {exc}"
+
+                if tool_compressor is not None:
+                    result = tool_compressor.maybe_compress(result)
 
                 trace.append(f"{tool.name} -> {result[:120]}")
                 messages.append({"role": "assistant", "content": json.dumps(action)})

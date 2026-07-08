@@ -14,10 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from mist.config import ShellConfig
+from mist.config import ArtifactConfig, ShellConfig, StructuredToolsConfig
 from mist.core.subagent import format_results, run_subagents, run_tool_subagents
+from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient
 from mist.skills.router import SkillRouter
+from mist.tools.artifacts import ArtifactStore
+from mist.tools.structured import detect_tool, summarize_tool_output
 
 
 class ProcessRegistry:
@@ -278,16 +281,45 @@ def _combine_output(stdout: str, stderr: str, budget: int = 4000) -> str:
     return f"{out}\n[stderr]\n{err}"
 
 
+def _finalize_output(command_text: str, out: str, err: str,
+                     artifacts: ArtifactStore | None,
+                     structured_cfg: StructuredToolsConfig | None) -> str:
+    """Shared tail for every _run_subprocess return path once real output
+    exists: persists the full untruncated stdout/stderr (tier 1, before any
+    cut), tries a deterministic structured summary for recognized recon
+    tools (tier 2), and falls back to today's head+tail truncation
+    otherwise — all before agent.py's own model-context-budget truncation
+    gets a chance to run as a final safety net. Must be called from every
+    return path (normal/timeout/killed) so the artifact/summary apply no
+    matter how the command finished."""
+    artifact = artifacts.write(command_text, out, err) if artifacts is not None else None
+    summary = None
+    if structured_cfg is not None and structured_cfg.enabled:
+        tool = detect_tool(command_text)
+        if tool is not None and (not structured_cfg.tools or tool in structured_cfg.tools):
+            summary = summarize_tool_output(tool, out, err)
+    result = summary if summary is not None else _combine_output(out, err)
+    if artifact is not None:
+        result += artifact.pointer()
+    return result
+
+
 def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
                      registry: ProcessRegistry | None,
-                     cwd: Path | None = None) -> str:
+                     cwd: Path | None = None,
+                     command_text: str = "",
+                     artifacts: ArtifactStore | None = None,
+                     structured_cfg: StructuredToolsConfig | None = None) -> str:
     """Runs a command via Popen (not subprocess.run) so the live process can
     be registered for an operator kill — cancelling the asyncio task awaiting
     this (via asyncio.to_thread) does not stop a subprocess already running
     in a worker thread, since Python threads can't be preempted.
 
     stdout/stderr are captured as separate streams (not merged) — see
-    `_combine_output` for why that matters."""
+    `_combine_output` for why that matters. `command_text` is the original,
+    pre-wrap command (for the SSH backend, before `_shell_ssh` splices in
+    its own `cd ... &&` prefix) — used only for the tier-1 artifact header
+    and tier-2 tool detection, never passed to the shell itself."""
     proc = subprocess.Popen(args, shell=shell, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, cwd=cwd)
     if registry is not None:
@@ -298,26 +330,32 @@ def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
         except subprocess.TimeoutExpired:
             proc.kill()
             out, err = proc.communicate()
-            return (_combine_output(out or "", err or "")
+            return (_finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
                    + f"\nERROR: command timed out after {timeout:.0f}s")
     finally:
         if registry is not None:
             registry.clear()
     if proc.returncode is not None and proc.returncode < 0:
-        return _combine_output(out or "", err or "") + "\nERROR: command was killed by the operator"
+        return (_finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
+               + "\nERROR: command was killed by the operator")
     if not out and not err:
         return "(no output)"
-    return _combine_output(out or "", err or "")
+    return _finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
 
 
 def _shell(command: str, registry: ProcessRegistry | None = None,
-          cwd: Path | None = None) -> str:
-    return _run_subprocess(command, shell=True, timeout=60, registry=registry, cwd=cwd)
+          cwd: Path | None = None,
+          artifacts: ArtifactStore | None = None,
+          structured_cfg: StructuredToolsConfig | None = None) -> str:
+    return _run_subprocess(command, shell=True, timeout=60, registry=registry, cwd=cwd,
+                           command_text=command, artifacts=artifacts, structured_cfg=structured_cfg)
 
 
 def _make_shell(shell_cfg: ShellConfig | None,
                 registry: ProcessRegistry | None = None,
-                workspace_path: str | None = None) -> Callable[..., str]:
+                workspace_path: str | None = None,
+                artifacts: ArtifactStore | None = None,
+                structured_cfg: StructuredToolsConfig | None = None) -> Callable[..., str]:
     if shell_cfg is None or shell_cfg.backend == "local":
         # Runs from a dedicated workspace dir rather than wherever the mist
         # process happened to be launched from — a real run found the model
@@ -327,7 +365,8 @@ def _make_shell(shell_cfg: ShellConfig | None,
         if workspace_path:
             cwd = Path(workspace_path).expanduser()
             cwd.mkdir(parents=True, exist_ok=True)
-        return lambda command: _shell(command, registry, cwd=cwd)
+        return lambda command: _shell(command, registry, cwd=cwd,
+                                      artifacts=artifacts, structured_cfg=structured_cfg)
 
     ssh = shell_cfg.ssh
 
@@ -349,7 +388,8 @@ def _make_shell(shell_cfg: ShellConfig | None,
                               f"cd '{workspace_path}' && {command}")
         args += ["-p", str(ssh.port), f"{ssh.user}@{ssh.host}" if ssh.user else ssh.host,
                 remote_command]
-        return _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry)
+        return _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry,
+                               command_text=command, artifacts=artifacts, structured_cfg=structured_cfg)
     return _shell_ssh
 
 
@@ -426,7 +466,10 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       extra_roots: tuple[str | Path, ...] = (),
                       enabled: list[str] | None = None,
                       shell_config: ShellConfig | None = None,
-                      process_registry: ProcessRegistry | None = None) -> ToolRegistry:
+                      process_registry: ProcessRegistry | None = None,
+                      artifact_config: ArtifactConfig | None = None,
+                      structured_tools_config: StructuredToolsConfig | None = None,
+                      tool_compressor: ToolOutputCompressor | None = None) -> ToolRegistry:
     # read_file/write_file/search_files anchor relative paths to wiki_root,
     # but an absolute path used to be let through unconditionally — a real
     # run escaped the wiki root that way and read an unrelated project's
@@ -441,6 +484,16 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
     allowed_roots = tuple(
         r for r in (workspace_base, *(Path(p).expanduser() for p in extra_roots)) if r is not None
     )
+    # Tier 1 (persist full output before truncation): only constructed when
+    # there's a wiki root to persist under and it isn't disabled — a
+    # subagent's own recursive default_registry() call (below) passes no
+    # wiki_root today, so its shell calls simply skip persisting rather
+    # than erroring.
+    artifact_store = None
+    if wiki_root is not None and (artifact_config is None or artifact_config.enabled):
+        cfg = artifact_config or ArtifactConfig()
+        artifact_store = ArtifactStore(wiki_root, dir_name=cfg.dir,
+                                       min_chars_to_persist=cfg.min_chars_to_persist)
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
@@ -478,7 +531,9 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                     "properties": {"command": {"type": "string"}},
                     "required": ["command"]},
         fn=_make_shell(shell_config, process_registry,
-                      str(workspace_root) if workspace_root else None),
+                      str(workspace_root) if workspace_root else None,
+                      artifacts=artifact_store,
+                      structured_cfg=structured_tools_config),
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
     ))
     reg.register(Tool(
@@ -529,10 +584,13 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                                                   extra_roots=extra_roots,
                                                   enabled=enabled,
                                                   shell_config=shell_config,
-                                                  process_registry=process_registry)
+                                                  process_registry=process_registry,
+                                                  artifact_config=artifact_config,
+                                                  structured_tools_config=structured_tools_config)
                 results = run_tool_subagents(llm, subagent_tools, tasks,
                                              max_workers=max_subagent_workers,
-                                             max_steps=max_subagent_steps)
+                                             max_steps=max_subagent_steps,
+                                             tool_compressor=tool_compressor)
             else:
                 results = run_subagents(llm, tasks, max_workers=max_subagent_workers)
             return format_results(results, time.monotonic() - start)

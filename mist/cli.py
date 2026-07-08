@@ -10,6 +10,7 @@ from mist.banner import BANNER, TAGLINE, help_lines
 from mist.config import load_config
 from mist.core.agent import MistAgent
 from mist.core.summarizer import BatchSummarizer
+from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient
 from mist.llm.embeddings import EmbeddingClient
 from mist.memory.store import MemoryStore
@@ -52,6 +53,18 @@ def _build_agent(config_path: str | None, backend: str | None,
     skills = SkillRouter(cfg.skills.library_path, embeddings=embeddings,
                          embedding_threshold=cfg.embeddings.similarity_threshold)
 
+    tool_compressor = None
+    if cfg.summarizer.enabled:
+        # Tier 3 of tool-output handling: an independently-configured
+        # second model (same pattern as `embeddings` above), off by
+        # default since tiers 1-2 already cover the tools that actually
+        # blow the budget.
+        summarizer_llm = LLMClient(cfg.summarizer.backend, cfg.summarizer.base_url,
+                                   cfg.summarizer.model, cfg.summarizer.api_key)
+        tool_compressor = ToolOutputCompressor(summarizer_llm,
+                                               trigger_chars=cfg.summarizer.trigger_chars,
+                                               max_input_chars=cfg.summarizer.max_input_chars)
+
     process_registry = ProcessRegistry()
     tools = default_registry(
         remember_fn=store.remember,
@@ -66,8 +79,12 @@ def _build_agent(config_path: str | None, backend: str | None,
         enabled=cfg.tools.enabled,
         shell_config=cfg.tools.shell,
         process_registry=process_registry,
+        artifact_config=cfg.artifacts,
+        structured_tools_config=cfg.tools.structured,
+        tool_compressor=tool_compressor,
     )
-    return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry)
+    return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,
+                     tool_compressor=tool_compressor)
 
 
 def _print_welcome(agent: MistAgent) -> None:

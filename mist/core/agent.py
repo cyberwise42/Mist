@@ -37,6 +37,7 @@ from typing import AsyncIterator
 from mist.config import MistConfig
 from mist.core.debrief import DebriefResult, MissionDebriefer
 from mist.core.mission import MissionControl, MissionEvent
+from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient, parse_json_relaxed
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
@@ -302,13 +303,19 @@ class TurnEvent:
 class MistAgent:
     def __init__(self, config: MistConfig, llm: LLMClient, store: MemoryStore,
                  skills: SkillRouter, tools: ToolRegistry, session_id: int | None = None,
-                 process_registry: ProcessRegistry | None = None):
+                 process_registry: ProcessRegistry | None = None,
+                 tool_compressor: ToolOutputCompressor | None = None):
         self.cfg = config
         self.llm = llm
         self.store = store
         self.skills = skills
         self.tools = tools
         self.session_id = session_id or store.new_session()
+        # Tier 3 of tool-output handling (mist/core/tool_compressor.py): an
+        # optional, independently-configured aux model that compresses
+        # long tool output tiers 1-2 don't already fit. None by default —
+        # most tool output already fits after tiers 1-2, so this is opt-in.
+        self.tool_compressor = tool_compressor
         # Force-included regardless of keyword ranking — set by astream_mission
         # for the duration of a mission so `finish_objective` is always
         # reachable even when a turn's message shares no keywords with it.
@@ -450,6 +457,8 @@ class MistAgent:
             except Exception as exc:  # tool errors go back to the model, not up
                 result = f"ERROR: {exc}"
 
+            if self.tool_compressor is not None:
+                result = self.tool_compressor.maybe_compress(result)
             result = _truncate_tool_output(result, self.cfg.context.max_tool_output_chars)
             trace.append(f"{tool.name} -> {result[:120]}")
             # This turn's tool trace lives in messages only; it is NOT persisted
@@ -565,6 +574,12 @@ class MistAgent:
             except Exception as exc:  # tool errors go back to the model, not up
                 result = f"ERROR: {exc}"
 
+            if self.tool_compressor is not None:
+                # Keeps registry.py's tool functions synchronous and
+                # network-free (their existing "plain functions" design) —
+                # the compressor's own LLM call goes through the same
+                # asyncio.to_thread pattern already used for tool.run itself.
+                result = await asyncio.to_thread(self.tool_compressor.maybe_compress, result)
             result = _truncate_tool_output(result, self.cfg.context.max_tool_output_chars)
             trace.append(f"{tool.name} -> {result[:120]}")
             yield TurnEvent(kind="tool_result", tool=tool.name, text=result)

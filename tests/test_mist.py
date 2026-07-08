@@ -7,14 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from mist.config import MistConfig, ShellConfig, ShellSSHConfig
+from mist.config import (ArtifactConfig, MistConfig, ShellConfig, ShellSSHConfig,
+                         StructuredToolsConfig)
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
+from mist.core.tool_compressor import ToolOutputCompressor
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
+from mist.tools.artifacts import ArtifactStore
 from mist.tools.registry import ProcessRegistry, default_registry
+from mist.tools.structured import detect_tool, summarize_tool_output
 from mist.llm.client import parse_json_relaxed
 from mist.tui.memory_commands import render_history_command, render_memories_command
 from mist.wiki import init_wiki
@@ -874,6 +878,339 @@ def test_combine_output_prioritizes_stdout_over_noisy_stderr():
 def test_combine_output_passes_through_stdout_only_when_stderr_empty():
     from mist.tools.registry import _combine_output
     assert _combine_output("just stdout", "", budget=200) == "just stdout"
+
+
+# -- Tier 1: full-output artifacts (mist.tools.artifacts.ArtifactStore) ----
+
+def test_artifact_store_writes_full_untruncated_output(tmp_path):
+    store = ArtifactStore(tmp_path, min_chars_to_persist=10)
+    big_stdout = "x" * 5000
+    artifact = store.write("nmap -p- 10.0.0.1", big_stdout, "some stderr")
+    assert artifact is not None
+    full_path = tmp_path / artifact.rel_path
+    assert full_path.is_file()
+    content = full_path.read_text(encoding="utf-8")
+    assert big_stdout in content  # nothing truncated
+    assert "some stderr" in content
+    assert "nmap -p- 10.0.0.1" in content  # command recorded in the header
+    assert artifact.stdout_chars == 5000
+    assert artifact.stderr_chars == len("some stderr")
+
+
+def test_artifact_store_skips_persisting_trivially_small_output(tmp_path):
+    store = ArtifactStore(tmp_path, min_chars_to_persist=500)
+    assert store.write("echo hi", "hi\n", "") is None
+    # nothing written under the wiki root at all
+    assert not (tmp_path / "raw").exists()
+
+
+def test_artifact_store_write_failure_returns_none_not_raise(tmp_path, monkeypatch):
+    store = ArtifactStore(tmp_path, min_chars_to_persist=1)
+
+    def _boom(*a, **kw):
+        raise OSError("disk full")
+    monkeypatch.setattr(Path, "write_text", _boom)
+    assert store.write("echo hi", "hi" * 100, "") is None
+
+
+def test_artifact_pointer_survives_tail_truncation(tmp_path):
+    # The whole point of appending the pointer as a suffix: it must still be
+    # present after the existing head+tail truncation runs on the combined
+    # result. Sanity-checks the real numbers cited in the design doc.
+    from mist.tools.registry import _truncate_raw_output
+    store = ArtifactStore(tmp_path, min_chars_to_persist=1)
+    artifact = store.write("nmap -p- 10.0.0.1", "x" * 10000, "")
+    pointer = artifact.pointer()
+    combined = ("y" * 20000) + pointer
+    truncated = _truncate_raw_output(combined, budget=2000)
+    assert pointer in truncated
+
+
+# -- Tier 2: structured extraction (mist.tools.structured) -----------------
+
+def test_detect_tool_recognizes_known_tools_and_sudo_prefix():
+    assert detect_tool("nmap -sV -sC 10.0.0.1") == "nmap"
+    assert detect_tool("sudo nmap -p- 10.0.0.1") == "nmap"
+    assert detect_tool("/usr/lib/nmap/nmap -sV 10.0.0.1") == "nmap"
+    assert detect_tool("nuclei -u http://x") == "nuclei"
+    assert detect_tool("gobuster dir -u http://x -w list.txt") == "gobuster"
+    assert detect_tool("ffuf -u http://x/FUZZ") == "ffuf"
+    assert detect_tool("searchsploit apache 2.4") == "searchsploit"
+
+
+def test_detect_tool_returns_none_for_unrecognized_command():
+    assert detect_tool("curl -s http://x") is None
+    assert detect_tool("cat /etc/passwd") is None
+    assert detect_tool("") is None
+
+
+NMAP_SAMPLE = """Starting Nmap 7.99 ( https://nmap.org ) at 2026-07-07 20:07 -0500
+Nmap scan report for 10.129.245.214
+Host is up (0.062s latency).
+Not shown: 998 closed tcp ports (reset)
+PORT     STATE SERVICE VERSION
+22/tcp   open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.16 (Ubuntu Linux; protocol 2.0)
+| ssh-hostkey:
+|   256 ce:fd:0d:82:c0:23:ed:6e:4b:ea:13:fa:4f:ea:ef:b7 (ECDSA)
+|_  256 f8:44:c6:46:58:7a:39:21:ef:16:44:e9:58:c2:f3:62 (ED25519)
+3000/tcp open  ppp?
+| fingerprint-strings:
+|   GetRequest:
+|     HTTP/1.1 200 OK
+SF:x2008\\x20Jul\\x202026\\x2001:08:01\\x20GMT\\x20some\\x20garbage\\x20data
+SF:Connection:\\x20close\\r\\n\\r\\n")%r(RPCCheck,2F,"HTTP/1\\.1\\x20400
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+Nmap done: 1 IP address (1 host up) scanned in 18.22 seconds
+"""
+
+
+def test_summarize_nmap_drops_sf_blob_keeps_port_table():
+    out = summarize_tool_output("nmap", NMAP_SAMPLE, "")
+    assert "22/tcp   open  ssh" in out
+    assert "3000/tcp open  ppp?" in out
+    assert "Nmap done:" in out
+    assert "SF:x2008" not in out  # the actual raw fingerprint data line is gone
+    assert "lines of raw fingerprint-strings" in out  # replaced by a one-line note
+
+
+def test_summarize_nmap_passthrough_when_no_sf_lines():
+    simple = "PORT   STATE SERVICE\n22/tcp open  ssh\nNmap done: 1 IP address scanned\n"
+    out = summarize_tool_output("nmap", simple, "")
+    assert out == simple.rstrip("\n")  # split+rejoin drops a trailing newline; no data lost
+
+
+NUCLEI_SAMPLE = """
+                     __     _
+   ____  __  _______/ /__  (_)
+  / __ \\/ / / / ___/ / _ \\/ /
+ / / / / /_/ / /__/ /  __/ /
+/_/ /_/\\__,_/\\___/_/\\___/_/   v3.2.1
+
+[INF] Using Nuclei Engine 3.2.1
+[INF] Templates loaded for scan: 5000
+[CVE-2025-55182] [http] [critical] http://10.129.30.204:3000/
+Scan completed. 1 matches found.
+"""
+
+
+def test_summarize_nuclei_extracts_finding_and_summary_drops_banner():
+    out = summarize_tool_output("nuclei", NUCLEI_SAMPLE, "loading templates...\n" * 20)
+    assert "[CVE-2025-55182] [http] [critical]" in out
+    assert "1 matches found" in out
+    assert "Using Nuclei Engine" not in out
+    assert "loading templates" not in out
+
+
+def test_summarize_nuclei_parses_jsonl_output_completely():
+    lines = [json.dumps({"template-id": f"cve-{i}",
+                         "info": {"severity": "high"},
+                         "matched-at": f"http://x/{i}"}) for i in range(50)]
+    out = summarize_tool_output("nuclei", "\n".join(lines), "")
+    assert out.count("[cve-") == 50  # every finding survives, not truncated
+
+
+def test_summarize_nuclei_returns_none_when_nothing_recognizable():
+    assert summarize_tool_output("nuclei", "some unrelated plain text\nwith no brackets", "") is None
+
+
+def test_summarize_content_discovery_extracts_status_lines():
+    stdout = (
+        "===============================================================\n"
+        "Gobuster v3.6\n"
+        "===============================================================\n"
+        "Progress: 500 / 4614 (10.84%)\n"
+        "/login               (Status: 200) [Size: 1234]\n"
+        "/admin               (Status: 403) [Size: 278]\n"
+        "Progress: 4614 / 4614 (100.00%)\n"
+        "===============================================================\n"
+    )
+    out = summarize_tool_output("gobuster", stdout, "")
+    assert "/login               (Status: 200) [Size: 1234]" in out
+    assert "/admin               (Status: 403) [Size: 278]" in out
+    assert "Progress:" not in out
+    assert "====" not in out
+
+
+def test_summarize_content_discovery_detects_same_size_false_positive():
+    # Regression case from a real ffuf run: a Next.js catch-all page
+    # returned Status 200 with an identical Size for virtually every path
+    # tried — the useful signal is "exclude this size and re-scan," not a
+    # wall of near-identical hits.
+    lines = [f"/path{i}    (Status: 200) [Size: 17175]" for i in range(20)]
+    lines.append("/real-hit   (Status: 200) [Size: 942]")
+    stdout = "\n".join(lines)
+    out = summarize_tool_output("ffuf", stdout, "")
+    assert "20/21 paths returned Status 200, Size 17175" in out
+    assert "-fs 17175" in out
+    assert "/real-hit   (Status: 200) [Size: 942]" in out
+
+
+def test_summarize_content_discovery_returns_none_without_status_lines():
+    assert summarize_tool_output("ffuf", "no hits here, just banner text", "") is None
+
+
+# -- Tier 1+2 wiring into _run_subprocess/_shell ----------------------------
+
+def test_shell_persists_artifact_and_appends_pointer(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("y" * 1000, "")
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None,
+                             wiki_root=tmp_path,
+                             artifact_config=ArtifactConfig(min_chars_to_persist=10))
+    out = tools.get("shell").run(command="echo test")
+    assert "[full output:" in out
+    assert "read_file to see more" in out
+    artifact_files = list((tmp_path / "raw" / "tool-output").rglob("*.txt"))
+    assert len(artifact_files) == 1
+    assert "y" * 1000 in artifact_files[0].read_text(encoding="utf-8")
+
+
+def test_shell_applies_structured_summary_for_recognized_tool(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (NMAP_SAMPLE, "")
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None,
+                             structured_tools_config=StructuredToolsConfig())
+    out = tools.get("shell").run(command="nmap -sV -sC 10.129.245.214")
+    assert "SF:x2008" not in out
+    assert "22/tcp   open  ssh" in out
+
+
+def test_shell_reproduces_prior_behavior_when_tier1_and_tier2_disabled(monkeypatch):
+    # Config-off: with no artifact_config/structured_tools_config passed at
+    # all (both default to None in default_registry), behavior must be
+    # byte-for-byte identical to before tiers 1-2 existed.
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return (NMAP_SAMPLE, "")
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    from mist.tools.registry import _combine_output
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    out = tools.get("shell").run(command="nmap -sV -sC 10.129.245.214")
+    assert out == _combine_output(NMAP_SAMPLE, "")
+    assert "[full output:" not in out
+
+
+# -- Tier 3: auxiliary-model compression (mist.core.tool_compressor) --------
+
+class FakeCompressorLLM:
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = 0
+
+    def complete(self, messages, json_schema=None, force_think=False):
+        self.calls += 1
+        return self.reply
+
+
+def test_tool_compressor_passes_through_under_trigger_chars():
+    llm = FakeCompressorLLM(json.dumps({"summary": "should not be used"}))
+    compressor = ToolOutputCompressor(llm, trigger_chars=100)
+    text = "short text"
+    assert compressor.maybe_compress(text) == text
+    assert llm.calls == 0
+
+
+def test_tool_compressor_compresses_above_trigger_chars():
+    llm = FakeCompressorLLM(json.dumps({"summary": "compressed version"}))
+    compressor = ToolOutputCompressor(llm, trigger_chars=10)
+    out = compressor.maybe_compress("x" * 1000)
+    assert out == "compressed version"
+    assert llm.calls == 1
+
+
+def test_tool_compressor_falls_back_to_original_on_malformed_response():
+    # Critical difference from MissionDebriefer's failure handling: on ANY
+    # failure this must return the ORIGINAL text, never empty/short —
+    # silently dropping data here would recreate the exact bug this design
+    # exists to fix.
+    llm = FakeCompressorLLM("not valid json at all")
+    compressor = ToolOutputCompressor(llm, trigger_chars=10)
+    original = "x" * 1000
+    assert compressor.maybe_compress(original) == original
+
+
+def test_tool_compressor_falls_back_to_original_on_empty_summary():
+    llm = FakeCompressorLLM(json.dumps({"summary": "  "}))
+    compressor = ToolOutputCompressor(llm, trigger_chars=10)
+    original = "x" * 1000
+    assert compressor.maybe_compress(original) == original
+
+
+def test_tool_compressor_falls_back_to_original_on_llm_exception():
+    class RaisingLLM:
+        def complete(self, messages, json_schema=None, force_think=False):
+            raise RuntimeError("network error")
+    compressor = ToolOutputCompressor(RaisingLLM(), trigger_chars=10)
+    original = "x" * 1000
+    assert compressor.maybe_compress(original) == original
+
+
+def test_turn_applies_tool_compressor_before_truncation(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.context.max_tool_output_chars = 50
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    llm = FakeLLM([
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": f"echo {'x' * 500}"}}),
+        json.dumps({"action": "respond", "response": "done"}),
+    ])
+    agent = MistAgent(cfg, llm, store, skills, tools)
+    agent.tool_compressor = ToolOutputCompressor(
+        FakeCompressorLLM(json.dumps({"summary": "COMPRESSED"})), trigger_chars=10)
+    result = agent.turn("run it")
+    assert "COMPRESSED" in result.tool_trace[0]
+
+
+async def test_astream_turn_applies_tool_compressor_before_truncation(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.context.max_tool_output_chars = 50
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+
+    llm = ScriptedAsyncLLM([
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": f"echo {'x' * 500}"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent = MistAgent(cfg, llm, store, skills, tools)
+    agent.tool_compressor = ToolOutputCompressor(
+        FakeCompressorLLM(json.dumps({"summary": "COMPRESSED"})), trigger_chars=10)
+
+    events = [e async for e in agent.astream_turn("run it")]
+    tool_results = [e.text for e in events if e.kind == "tool_result"]
+    assert tool_results and "COMPRESSED" in tool_results[0]
+
+
+def test_run_tool_subagents_applies_tool_compressor():
+    llm = ToolEchoLLM()
+    tools = default_registry(remember_fn=lambda c: None)
+    compressor = ToolOutputCompressor(
+        FakeCompressorLLM(json.dumps({"summary": "COMPRESSED"})), trigger_chars=1)
+    results = run_tool_subagents(llm, tools, ["alpha"], max_workers=1, max_steps=3,
+                                 tool_compressor=compressor)
+    assert len(results) == 1
+    assert "COMPRESSED" in results[0].response
 
 
 def test_read_file_rejects_absolute_path_outside_wiki_and_workspace_roots(tmp_path):

@@ -56,6 +56,33 @@ class EmbeddingConfig(BaseModel):
     similarity_threshold: float = 0.35  # min cosine similarity to accept a semantic match
 
 
+class ArtifactConfig(BaseModel):
+    """Tier 1 of tool-output handling: persists the complete, untruncated
+    stdout/stderr of every tool call under `<wiki_root>/<dir>/` before any
+    truncation runs (see mist/tools/artifacts.py) — turns "truncated" into
+    a lossy *view* with the full data still available, not permanent data
+    loss."""
+    enabled: bool = True
+    dir: str = "raw/tool-output"      # relative to the wiki root
+    min_chars_to_persist: int = 500   # skip persisting trivially small output
+
+
+class SummarizerLLMConfig(BaseModel):
+    """Tier 3 of tool-output handling: an optional, independently-
+    configured second model (same pattern as EmbeddingConfig) that
+    compresses tool output tiers 1-2 don't already fit — the long tail of
+    ad hoc commands (see mist/core/tool_compressor.py). Off by default:
+    tiers 1-2 already cover the tools that actually blow the budget, so
+    this rarely needs to fire."""
+    enabled: bool = False
+    backend: str = "ollama"          # ollama | vllm
+    model: str = ""
+    base_url: str = "http://localhost:11434"
+    api_key: str = ""
+    trigger_chars: int = 6000     # only invoked above this size
+    max_input_chars: int = 20000  # hard cap on what's sent to the aux model at all
+
+
 class ShellSSHConfig(BaseModel):
     host: str = ""
     user: str = ""
@@ -70,10 +97,21 @@ class ShellConfig(BaseModel):
     ssh: ShellSSHConfig = Field(default_factory=ShellSSHConfig)
 
 
+class StructuredToolsConfig(BaseModel):
+    """Tier 2 of tool-output handling: deterministic structured extraction
+    for nmap/nuclei/gobuster/ffuf (see mist/tools/structured.py) — keeps
+    the real signal (port tables, findings, hit lines) and drops
+    high-volume boilerplate before the char-budget truncation ever has to
+    choose what to cut."""
+    enabled: bool = True
+    tools: list[str] = Field(default_factory=list)  # empty = every tool structured.py knows
+
+
 class ToolsConfig(BaseModel):
     max_exposed: int = 5
     enabled: list[str] | None = None  # opt-in allow-list; None = every tool Mist supports
     shell: ShellConfig = Field(default_factory=ShellConfig)
+    structured: StructuredToolsConfig = Field(default_factory=StructuredToolsConfig)
 
 
 class SubagentConfig(BaseModel):
@@ -131,6 +169,8 @@ class MistConfig(BaseModel):
     subagents: SubagentConfig = Field(default_factory=SubagentConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     mission: MissionConfig = Field(default_factory=MissionConfig)
+    artifacts: ArtifactConfig = Field(default_factory=ArtifactConfig)
+    summarizer: SummarizerLLMConfig = Field(default_factory=SummarizerLLMConfig)
 
     @property
     def history_file(self) -> Path:
