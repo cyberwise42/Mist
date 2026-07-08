@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from mist.config import MistConfig
+from mist.core.action import ActionValidationError, DecisionUseTool, parse_decision_action
 from mist.core.debrief import DebriefResult, MissionDebriefer
 from mist.core.mission import MissionControl, MissionEvent
 from mist.core.tool_compressor import ToolOutputCompressor
@@ -437,24 +438,33 @@ class MistAgent:
                 self.store.add_turn(self.session_id, "assistant", response)
                 return TurnResult(response=response, tool_trace=trace)
             try:
-                action = parse_json_relaxed(raw)
+                raw_action = parse_json_relaxed(raw)
             except (ValueError, json.JSONDecodeError):
                 # One retry with an explicit correction — cheap and usually enough.
                 messages.append({"role": "user",
                                  "content": "Invalid JSON. Reply with ONLY the JSON object."})
                 continue
 
-            if action.get("action") != "use_tool" or "tool" not in action:
+            try:
+                action = parse_decision_action(raw_action)
+            except ActionValidationError:
+                # Schema-deviant (parseable JSON, but neither "respond" nor a
+                # well-formed "use_tool") — nothing tool-shaped to dispatch,
+                # same fallback as an explicit "respond" (unchanged from
+                # before this was a named, validated case).
                 return self._answer(user_msg, history, tool_context, trace)
 
-            tool = self.tools.get(action.get("tool", ""))
+            if not isinstance(action, DecisionUseTool):
+                return self._answer(user_msg, history, tool_context, trace)
+
+            tool = self.tools.get(action.tool)
             if tool is None:
                 messages.append({"role": "user",
-                                 "content": f"Unknown tool {action.get('tool')!r}. "
+                                 "content": f"Unknown tool {action.tool!r}. "
                                             f"Choose from the listed tools or respond."})
                 continue
 
-            args = action.get("arguments") or {}
+            args = action.arguments
             try:
                 result = tool.run(**args)
             except TypeError as exc:
@@ -468,7 +478,7 @@ class MistAgent:
             trace.append(f"{tool.name} -> {result[:120]}")
             # This turn's tool trace lives in messages only; it is NOT persisted
             # to history, so it never bloats future turns.
-            messages.append({"role": "assistant", "content": json.dumps(action)})
+            messages.append({"role": "assistant", "content": action.model_dump_json()})
             messages.append({"role": "user", "content": f"Tool result:\n{result}"})
             tool_context.append({"role": "assistant", "content": f"Ran {tool.name}({args})."})
             tool_context.append({"role": "user", "content": f"Tool result:\n{result}"})
@@ -534,7 +544,7 @@ class MistAgent:
         # instead of being generated blind to its own actions this turn.
         tool_context: list[dict[str, str]] = []
         for _ in range(self.cfg.context.max_tool_steps):
-            action = None
+            raw_action = None
             last_error: Exception | None = None
             for _attempt in range(MAX_DECISION_RETRIES):
                 try:
@@ -544,33 +554,45 @@ class MistAgent:
                     last_error = exc
                     continue
                 try:
-                    action = parse_json_relaxed(raw)
+                    raw_action = parse_json_relaxed(raw)
                     break
                 except (ValueError, json.JSONDecodeError):
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user",
                                      "content": "Invalid JSON. Reply with ONLY the JSON object."})
-            if action is None:
+            if raw_action is None:
                 if last_error is not None:
                     yield TurnEvent(kind="error", text=f"LLM call failed: {last_error}")
                 else:
                     yield TurnEvent(kind="error", text="Model failed to produce valid JSON.")
                 return
 
-            if action.get("action") != "use_tool" or "tool" not in action:
+            try:
+                action = parse_decision_action(raw_action)
+            except ActionValidationError:
+                # Schema-deviant (parseable JSON, but neither "respond" nor a
+                # well-formed "use_tool") — same fallback as an explicit
+                # "respond" (unchanged from before this was a named,
+                # validated case).
                 async for event in self._stream_answer(user_msg, history, tool_context,
                                                        routing_query):
                     yield event
                 return
 
-            tool = self.tools.get(action.get("tool", ""))
+            if not isinstance(action, DecisionUseTool):
+                async for event in self._stream_answer(user_msg, history, tool_context,
+                                                       routing_query):
+                    yield event
+                return
+
+            tool = self.tools.get(action.tool)
             if tool is None:
                 messages.append({"role": "user",
-                                 "content": f"Unknown tool {action.get('tool')!r}. "
+                                 "content": f"Unknown tool {action.tool!r}. "
                                             f"Choose from the listed tools or respond."})
                 continue
 
-            args = action.get("arguments") or {}
+            args = action.arguments
             yield TurnEvent(kind="tool_start", tool=tool.name, detail=json.dumps(args))
             try:
                 result = await asyncio.to_thread(tool.run, **args)
@@ -589,7 +611,7 @@ class MistAgent:
             trace.append(f"{tool.name} -> {result[:120]}")
             yield TurnEvent(kind="tool_result", tool=tool.name, text=result)
 
-            messages.append({"role": "assistant", "content": json.dumps(action)})
+            messages.append({"role": "assistant", "content": action.model_dump_json()})
             messages.append({"role": "user", "content": f"Tool result:\n{result}"})
             tool_context.append({"role": "assistant", "content": f"Ran {tool.name}({args})."})
             tool_context.append({"role": "user", "content": f"Tool result:\n{result}"})

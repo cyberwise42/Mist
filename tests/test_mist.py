@@ -9,6 +9,9 @@ import pytest
 
 from mist.config import (ArtifactConfig, MistConfig, ShellConfig, ShellSSHConfig,
                          StructuredToolsConfig)
+from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
+                              SubagentRespond, SubagentUseTool, parse_decision_action,
+                              parse_subagent_action)
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
@@ -1503,6 +1506,25 @@ async def test_astream_turn_runs_tool_then_streams_answer(tmp_path):
     assert events[-1].kind == "done" and events[-1].text == "done"
 
 
+async def test_astream_turn_falls_back_to_respond_on_schema_deviant_action(tmp_path):
+    # Regression case from a real run: a model can emit valid JSON that
+    # matches neither "respond" nor a well-formed "use_tool"
+    # (e.g. {"action": "finish_objective", "summary": "..."} — this schema
+    # has no such top-level action, and no "summary" property). This must
+    # fall through to the same free-text answer path as an explicit
+    # "respond", not error out — unchanged behavior from before Pydantic
+    # validation replaced the old duck-typed dict check.
+    llm = GatedAsyncLLM(
+        decisions=[json.dumps({"action": "finish_objective", "summary": "done scanning"})],
+        streams=[["here's my summary"]],
+    )
+    agent = make_async_agent(tmp_path, llm)
+    events = [e async for e in agent.astream_turn("what did you find")]
+    assert not any(e.kind == "error" for e in events)
+    assert not any(e.kind == "tool_start" for e in events)
+    assert events[-1].kind == "done" and events[-1].text == "here's my summary"
+
+
 async def test_astream_turn_recovers_from_bad_json(tmp_path):
     llm = GatedAsyncLLM(decisions=["not json", json.dumps({"action": "respond"})],
                          streams=[["ok"]])
@@ -1541,6 +1563,18 @@ class RaisingMidStreamLLM:
     async def astream(self, messages):
         yield "partial "
         raise ConnectionError("connection reset mid-stream")
+
+
+def test_turn_falls_back_to_respond_on_schema_deviant_action(tmp_path):
+    # Same regression case as the astream_turn version, for the sync turn()
+    # path used by `mist chat`/`ask`.
+    agent = make_agent(tmp_path, [
+        json.dumps({"action": "finish_objective", "summary": "done scanning"}),
+        "here's my summary",
+    ])
+    result = agent.turn("what did you find")
+    assert result.response == "here's my summary"
+    assert result.tool_trace == []
 
 
 def test_turn_survives_llm_call_exception(tmp_path):
@@ -2117,6 +2151,67 @@ def test_answer_system_asserts_real_tool_access(tmp_path):
     system = agent._build_answer_system("what's my status")
     assert "not a text-only assistant" in system
     assert "claim you lack network access" in system
+
+
+# -- action validation (mist.core.action) ----------------------------------
+
+def test_parse_decision_action_valid_respond_and_use_tool():
+    respond = parse_decision_action({"action": "respond"})
+    assert isinstance(respond, DecisionRespond)
+
+    use_tool = parse_decision_action(
+        {"action": "use_tool", "tool": "shell", "arguments": {"command": "ls"}})
+    assert isinstance(use_tool, DecisionUseTool)
+    assert use_tool.tool == "shell"
+    assert use_tool.arguments == {"command": "ls"}
+
+
+def test_parse_decision_action_defaults_missing_arguments_to_empty_dict():
+    use_tool = parse_decision_action({"action": "use_tool", "tool": "shell"})
+    assert use_tool.arguments == {}
+
+
+def test_parse_decision_action_rejects_unexpected_action_value():
+    # Regression case from a real run: {"action": "finish_objective", ...}
+    # matches neither "respond" nor "use_tool" — must raise, not silently
+    # coerce into one of them.
+    with pytest.raises(ActionValidationError) as exc_info:
+        parse_decision_action({"action": "finish_objective", "summary": "done"})
+    assert exc_info.value.raw == {"action": "finish_objective", "summary": "done"}
+
+
+def test_parse_decision_action_rejects_use_tool_missing_tool_field():
+    with pytest.raises(ActionValidationError):
+        parse_decision_action({"action": "use_tool"})
+
+
+def test_parse_decision_action_rejects_missing_action_key():
+    with pytest.raises(ActionValidationError):
+        parse_decision_action({"tool": "shell", "arguments": {}})
+
+
+def test_parse_subagent_action_valid_respond_and_use_tool():
+    respond = parse_subagent_action({"action": "respond", "response": "done"})
+    assert isinstance(respond, SubagentRespond)
+    assert respond.response == "done"
+
+    use_tool = parse_subagent_action(
+        {"action": "use_tool", "tool": "shell", "arguments": {"command": "ls"}})
+    assert isinstance(use_tool, SubagentUseTool)
+    assert use_tool.tool == "shell"
+
+
+def test_parse_subagent_action_respond_defaults_missing_response_to_empty_string():
+    respond = parse_subagent_action({"action": "respond"})
+    assert respond.response == ""
+
+
+def test_parse_subagent_action_rejects_finish_objective_incident():
+    # The exact real-world shape that slipped through the old duck-typed
+    # check: {"action": "finish_objective", "summary": "..."}.
+    with pytest.raises(ActionValidationError) as exc_info:
+        parse_subagent_action({"action": "finish_objective", "summary": "done scanning"})
+    assert "finish_objective" in str(exc_info.value)
 
 
 def test_compute_max_tokens_clamps_unrealistic_configured_value():

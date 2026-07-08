@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from mist.core.action import ActionValidationError, SubagentRespond, parse_subagent_action
 from mist.llm.client import LLMClient, parse_json_relaxed
 
 if TYPE_CHECKING:
@@ -121,38 +122,38 @@ def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
             for _ in range(max_steps):
                 raw = llm.complete(messages, json_schema=schema)
                 try:
-                    action = parse_json_relaxed(raw)
+                    raw_action = parse_json_relaxed(raw)
                 except (ValueError, json.JSONDecodeError):
                     messages.append({"role": "user",
                                      "content": "Invalid JSON. Reply with ONLY the JSON object."})
                     continue
 
-                if action.get("action") == "respond" or "tool" not in action:
-                    response = action.get("response", "").strip()
-                    if not response:
-                        # A bare "(empty response)" here previously discarded
-                        # a real, debuggable signal: a model can emit a
-                        # schema-deviant action (missing "tool", an
-                        # unexpected "action" value) that satisfies neither
-                        # branch cleanly. Surfacing the raw action back to
-                        # the caller at least gives the parent turn/mission
-                        # something to react to instead of nothing — which
-                        # is exactly why a real run just blindly retried the
-                        # identical call three times: an empty result gave
-                        # it no information about what to change.
-                        response = ("(subagent produced no usable response; "
-                                   f"raw action: {json.dumps(action)[:300]})")
+                try:
+                    action = parse_subagent_action(raw_action)
+                except ActionValidationError:
+                    # A schema-deviant action (e.g. the finish_objective
+                    # incident this whole validation layer was built to
+                    # catch) — surfaced explicitly rather than silently
+                    # discarded, distinct from a genuine empty "respond" so
+                    # the two failure modes aren't conflated.
+                    return SubagentResult(task=task, response=(
+                        "(subagent produced an invalid action; "
+                        f"raw: {json.dumps(raw_action)[:300]})"
+                    ))
+
+                if isinstance(action, SubagentRespond):
+                    response = action.response.strip() or "(empty response)"
                     return SubagentResult(task=task, response=response)
 
-                tool = tools.get(action.get("tool", ""))
+                tool = tools.get(action.tool)
                 if tool is None:
                     messages.append({"role": "user",
-                                     "content": f"Unknown tool {action.get('tool')!r}. "
+                                     "content": f"Unknown tool {action.tool!r}. "
                                                 f"Choose from the listed tools or respond."})
                     continue
 
                 try:
-                    result = tool.run(**(action.get("arguments") or {}))
+                    result = tool.run(**action.arguments)
                 except TypeError as exc:
                     result = f"ERROR: bad arguments: {exc}"
                 except Exception as exc:  # tool errors go back to the model, not up
@@ -162,7 +163,7 @@ def run_tool_subagents(llm: LLMClient, tools: "ToolRegistry", tasks: list[str],
                     result = tool_compressor.maybe_compress(result)
 
                 trace.append(f"{tool.name} -> {result[:120]}")
-                messages.append({"role": "assistant", "content": json.dumps(action)})
+                messages.append({"role": "assistant", "content": action.model_dump_json()})
                 messages.append({"role": "user", "content": f"Tool result:\n{result}"})
 
             summary = "Hit the tool-step limit. Trace: " + "; ".join(trace[-3:])
