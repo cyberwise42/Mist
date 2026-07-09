@@ -351,9 +351,22 @@ def _shell(command: str, registry: ProcessRegistry | None = None,
                            command_text=command, artifacts=artifacts, structured_cfg=structured_cfg)
 
 
+@dataclass
+class MutableWorkspace:
+    """A shell's working directory, read at *call* time rather than baked
+    into the tool's closure at construction time — `default_registry()` is
+    only ever called once per Mist process, before any mission's target is
+    known, but each mission against a different HTB machine should get its
+    own directory (not one flat folder every mission/target ever shares).
+    `MistAgent.astream_mission` mutates `.path` at mission start once it
+    knows the target; every `shell` call after that point picks it up
+    automatically, with no need to reconstruct the tool itself."""
+    path: Path | None = None
+
+
 def _make_shell(shell_cfg: ShellConfig | None,
                 registry: ProcessRegistry | None = None,
-                workspace_path: str | None = None,
+                workspace: MutableWorkspace | None = None,
                 artifacts: ArtifactStore | None = None,
                 structured_cfg: StructuredToolsConfig | None = None) -> Callable[..., str]:
     if shell_cfg is None or shell_cfg.backend == "local":
@@ -361,12 +374,13 @@ def _make_shell(shell_cfg: ShellConfig | None,
         # process happened to be launched from — a real run found the model
         # wandering into an unrelated sibling project directory (agent-zero)
         # via relative paths that only "worked" because of the launch cwd.
-        cwd = None
-        if workspace_path:
-            cwd = Path(workspace_path).expanduser()
-            cwd.mkdir(parents=True, exist_ok=True)
-        return lambda command: _shell(command, registry, cwd=cwd,
-                                      artifacts=artifacts, structured_cfg=structured_cfg)
+        def _local_shell(command: str) -> str:
+            cwd = workspace.path if workspace is not None else None
+            if cwd is not None:
+                cwd.mkdir(parents=True, exist_ok=True)
+            return _shell(command, registry, cwd=cwd,
+                         artifacts=artifacts, structured_cfg=structured_cfg)
+        return _local_shell
 
     ssh = shell_cfg.ssh
 
@@ -375,6 +389,7 @@ def _make_shell(shell_cfg: ShellConfig | None,
         if ssh.key_path:
             args += ["-i", str(Path(ssh.key_path).expanduser())]
         remote_command = command
+        workspace_path = workspace.path if workspace is not None else None
         if workspace_path:
             # Best-effort: this is mist's own (locally expanded) workspace
             # path, reused as a literal path on the remote host. Only lines
@@ -484,6 +499,10 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
     allowed_roots = tuple(
         r for r in (workspace_base, *(Path(p).expanduser() for p in extra_roots)) if r is not None
     )
+    # Mutable, not baked into the shell tool's closure — lets a mission
+    # redirect the shell's cwd to a per-target directory once it knows the
+    # target, without rebuilding the tool. See MutableWorkspace.
+    workspace_box = MutableWorkspace(path=workspace_base)
     # Tier 1 (persist full output before truncation): only constructed when
     # there's a wiki root to persist under and it isn't disabled — a
     # subagent's own recursive default_registry() call (below) passes no
@@ -530,12 +549,15 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
         parameters={"type": "object",
                     "properties": {"command": {"type": "string"}},
                     "required": ["command"]},
-        fn=_make_shell(shell_config, process_registry,
-                      str(workspace_root) if workspace_root else None,
+        fn=_make_shell(shell_config, process_registry, workspace_box,
                       artifacts=artifact_store,
                       structured_cfg=structured_tools_config),
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
     ))
+    # Exposed so a caller (MistAgent.astream_mission) can redirect the
+    # shell's cwd to a per-mission target directory once the objective's
+    # target is known — see MutableWorkspace.
+    reg.workspace = workspace_box
     reg.register(Tool(
         name="finish_objective",
         description=(

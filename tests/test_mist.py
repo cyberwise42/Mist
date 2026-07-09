@@ -12,7 +12,7 @@ from mist.config import (ArtifactConfig, MistConfig, ShellConfig, ShellSSHConfig
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
-from mist.core.agent import MistAgent
+from mist.core.agent import MistAgent, _extract_target
 from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
@@ -838,6 +838,56 @@ def test_shell_ssh_backend_cds_into_workspace_first(monkeypatch):
     remote_command = captured["args"][-1]
     assert "cd '/home/kali/.mist/workspace'" in remote_command
     assert remote_command.endswith("&& ls")
+
+
+def test_shell_local_backend_follows_mutable_workspace_redirect(tmp_path, monkeypatch):
+    # The shell tool's cwd is read at *call* time (mist.tools.registry.
+    # MutableWorkspace), not baked into the tool's closure at
+    # default_registry() time — a mission redirects it once the target is
+    # known, without needing to rebuild the tool.
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["cwd"] = cwd
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    original = tmp_path / "workspace"
+    tools = default_registry(remember_fn=lambda c: None, workspace_root=original)
+    tools.get("shell").run(command="pwd")
+    assert captured["cwd"] == original
+
+    redirected = tmp_path / "HTB" / "10.129.33.21"
+    tools.workspace.path = redirected
+    tools.get("shell").run(command="pwd")
+    assert captured["cwd"] == redirected
+    assert redirected.is_dir()  # created on first use, same as the original
+
+
+def test_shell_ssh_backend_follows_mutable_workspace_redirect(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["args"] = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(host="10.0.0.5"))
+    tools = default_registry(remember_fn=lambda c: None, shell_config=shell_cfg,
+                             workspace_root="/home/kali/.mist/workspace")
+    tools.workspace.path = Path("/home/kali/Desktop/HTB/10.129.33.21")
+    tools.get("shell").run(command="ls")
+
+    remote_command = captured["args"][-1]
+    assert "cd '/home/kali/Desktop/HTB/10.129.33.21'" in remote_command
 
 
 def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):
@@ -2591,6 +2641,72 @@ def make_mission_agent(tmp_path, decisions):
     return MistAgent(cfg, ScriptedAsyncLLM(decisions), store, skills, tools)
 
 
+async def test_mission_redirects_shell_workspace_to_target_directory(tmp_path, monkeypatch):
+    # Confirms the structural fix end-to-end: the shell's cwd actually gets
+    # redirected to a per-target folder at mission start (not left in one
+    # flat workspace every mission/target shares), and a real shell call
+    # afterward picks it up.
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["cwd"] = cwd
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "pwd"}}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.workspace.mission_root = str(tmp_path / "HTB")
+    control = MissionControl()
+
+    events = [e async for e in agent.astream_mission(
+        'perform a phased pentest on target ip 10.129.33.21', control, max_turns=10)]
+
+    expected_dir = tmp_path / "HTB" / "10.129.33.21"
+    assert captured["cwd"] == expected_dir
+    assert expected_dir.is_dir()
+    assert "finished" in [e.kind for e in events]
+
+    log_path = [e.text for e in events if e.kind == "started"][0]
+    log_text = Path(log_path).read_text(encoding="utf-8")
+    assert str(expected_dir) in log_text
+
+
+async def test_mission_leaves_workspace_alone_when_mission_root_unset(tmp_path, monkeypatch):
+    # Default/backward-compat: with workspace.mission_root left empty (the
+    # default), a mission must not touch the shell's configured cwd at all.
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["cwd"] = cwd
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+
+    agent = make_mission_agent(tmp_path, [
+        json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "pwd"}}),
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "ok"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    control = MissionControl()
+
+    [e async for e in agent.astream_mission(
+        'perform a phased pentest on target ip 10.129.33.21', control, max_turns=10)]
+
+    assert captured["cwd"] is None  # unchanged from default_registry()'s own default
+
+
 async def test_mission_auto_continues_without_operator_input(tmp_path):
     agent = make_mission_agent(tmp_path, [
         json.dumps({"action": "use_tool", "tool": "shell", "arguments": {"command": "echo recon"}}),
@@ -2878,6 +2994,23 @@ async def test_mission_stuck_detection_fires_mid_turn_not_after_full_tool_budget
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+def test_extract_target_prefers_ip_address():
+    obj = 'perform a phased pentest on the host "Connected" at target ip 10.129.33.21'
+    assert _extract_target(obj) == "10.129.33.21"
+
+
+def test_extract_target_falls_back_to_quoted_hostname_without_ip():
+    assert _extract_target('perform a phased pentest on the host "Connected"') == "connected"
+
+
+def test_extract_target_falls_back_to_host_keyword_without_ip():
+    assert _extract_target("pentest host: connected") == "connected"
+
+
+def test_extract_target_returns_none_without_ip_or_hostname():
+    assert _extract_target("perform a phased pentest on the target") is None
 
 
 def test_normalize_tool_call_collapses_varying_literal():

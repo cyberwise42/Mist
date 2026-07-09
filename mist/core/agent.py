@@ -127,6 +127,31 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_HOSTNAME_RE = re.compile(r'"([A-Za-z][\w-]*)"|\bhost(?:name)?[:\s]+([A-Za-z][\w-]*)',
+                          re.IGNORECASE)
+
+
+def _extract_target(objective: str) -> str | None:
+    """Best-effort target identifier for per-mission workspace separation.
+    Prefers an IPv4 address — unambiguous, and how HTB objectives in
+    practice always name the target ("...at target ip 10.129.33.21") — and
+    falls back to a quoted or "host <name>" token, slugified, if no IP is
+    present. Returns None if neither is found (the caller then leaves the
+    shell's cwd at its configured default rather than guessing)."""
+    m = _IPV4_RE.search(objective)
+    if m:
+        return m.group(0)
+    m = _HOSTNAME_RE.search(objective)
+    if m:
+        return _slugify(m.group(1) or m.group(2))
+    return None
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
 def _mission_continue_message(objective: str, notes: list[str], nudge: str | None = None) -> str:
     msg = MISSION_CONTINUE_TEMPLATE.format(objective=objective)
     if nudge:
@@ -723,6 +748,20 @@ class MistAgent:
         # generator, since a kill runs debrief_mission separately rather
         # than from inside the cancelled generator (see mist.tui.app).
         yield MissionEvent(kind="started", text=str(log_path))
+
+        # Redirect the shell's cwd to a per-mission target directory (see
+        # WorkspaceConfig.mission_root and MutableWorkspace) so this
+        # mission's scan output/downloaded exploits/payloads land in their
+        # own folder instead of the one flat workspace every mission ever
+        # run shares regardless of target.
+        if self.cfg.workspace.mission_root:
+            target = _extract_target(objective)
+            if target and getattr(self.tools, "workspace", None) is not None:
+                mission_dir = Path(self.cfg.workspace.mission_root).expanduser() / target
+                self.tools.workspace.path = mission_dir
+                self._mission_log_append(
+                    log_path, f"\n**Working directory:** `{mission_dir}`\n"
+                )
 
         self.always_exposed.add("finish_objective")
         try:

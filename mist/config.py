@@ -45,6 +45,16 @@ class WorkspaceConfig(BaseModel):
     # tried `write_file` there (per that skill's own documented convention) and was refused,
     # landing its notes under wiki_root instead while shell's raw scan output stayed under
     # the HTB directory — the same engagement split across two unrelated trees.
+    mission_root: str = ""
+    # When set, each mission automatically gets its own subdirectory here
+    # (named after the target IP extracted from the objective, or a
+    # slugified hostname if no IP is present) as the shell's cwd for that
+    # mission — instead of every mission ever run sharing one flat
+    # workspace.root_path folder regardless of target. Confirmed live: a
+    # single shared workspace ended up with scan output, downloaded
+    # exploits, and payloads from multiple unrelated HTB machines all mixed
+    # together in one directory. Empty (default) disables this — missions
+    # keep using workspace.root_path unconditionally, today's behavior.
 
 
 class EmbeddingConfig(BaseModel):
@@ -155,8 +165,8 @@ class MissionConfig(BaseModel):
 
 class MistConfig(BaseModel):
     backend: str = "ollama"
-    model: str = "qwen2.5:14b"
-    base_url: str = "http://localhost:11434"
+    model: str = "qwen2.5:7b-instruct-q4_K_M"
+    base_url: str = "http://10.48.48.10:11434"
     api_key: str = ""
     history_path: str = "~/.mist/history"  # shared recall/autofill, mist chat + mist tui
     context: ContextConfig = Field(default_factory=ContextConfig)
