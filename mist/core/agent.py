@@ -36,6 +36,7 @@ from typing import AsyncIterator
 
 from mist.config import MistConfig
 from mist.core.action import ActionValidationError, DecisionUseTool, parse_decision_action
+from mist.core.checkpoints import CheckpointStore
 from mist.core.debrief import DebriefResult, MissionDebriefer
 from mist.core.mission import MissionControl, MissionEvent
 from mist.core.tool_compressor import ToolOutputCompressor
@@ -336,12 +337,17 @@ class MistAgent:
                  skills: SkillRouter, tools: ToolRegistry, session_id: int | None = None,
                  process_registry: ProcessRegistry | None = None,
                  tool_compressor: ToolOutputCompressor | None = None,
-                 preload_skills: list[str] | None = None):
+                 preload_skills: list[str] | None = None,
+                 checkpoint_store: CheckpointStore | None = None):
         self.cfg = config
         self.llm = llm
         self.store = store
         self.skills = skills
         self.tools = tools
+        # Off by default (see CheckpointConfig) — when set, snapshots the
+        # current workspace directory into a shadow git repo before every
+        # shell/write_file call, so a bad mission action can be rolled back.
+        self.checkpoint_store = checkpoint_store
         # `mist tui --skills a,b` / `-s a -s b`: force these skills' full
         # bodies into every turn's context for the whole session, bypassing
         # the router entirely for them — skill routing is otherwise fully
@@ -420,6 +426,28 @@ class MistAgent:
             memory_section = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memories) + "\n"
 
         return tool_lines, skill_section, memory_section, exposed
+
+    def _checkpoint_before_tool(self, tool_name: str, args: dict) -> None:
+        """Snapshots the current workspace directory before a mutating
+        tool call (shell/write_file), so a bad mission action can be
+        rolled back. No-op unless checkpoint_store is configured — a
+        failure here (e.g. git not installed) must never break the actual
+        tool call, so any exception is swallowed."""
+        if self.checkpoint_store is None or tool_name not in ("shell", "write_file"):
+            return
+        workspace_box = getattr(self.tools, "workspace", None)
+        workspace = (workspace_box.path if workspace_box is not None and workspace_box.path
+                    else self.cfg.workspace_root)
+        try:
+            # The tool call itself (registry.py's _local_shell/_shell_ssh)
+            # creates the workspace dir on first use if it doesn't exist
+            # yet — done here too so a mission's very first tool call in a
+            # brand-new per-target directory (see mission_root) still gets
+            # a checkpoint repo, not a silent no-op on a missing directory.
+            Path(workspace).mkdir(parents=True, exist_ok=True)
+            self.checkpoint_store.snapshot(workspace, f"pre-{tool_name}: {json.dumps(args)[:100]}")
+        except Exception:
+            pass
 
     def _build_decision_system(self, user_msg: str, routing_query: str | None = None
                                ) -> tuple[str, list]:
@@ -512,6 +540,7 @@ class MistAgent:
                 continue
 
             args = action.arguments
+            self._checkpoint_before_tool(tool.name, args)
             try:
                 result = tool.run(**args)
             except TypeError as exc:
@@ -641,6 +670,7 @@ class MistAgent:
 
             args = action.arguments
             yield TurnEvent(kind="tool_start", tool=tool.name, detail=json.dumps(args))
+            await asyncio.to_thread(self._checkpoint_before_tool, tool.name, args)
             try:
                 result = await asyncio.to_thread(tool.run, **args)
             except TypeError as exc:

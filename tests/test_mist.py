@@ -14,6 +14,7 @@ from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUs
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
 from mist.core.agent import MistAgent, _extract_target
+from mist.core.checkpoints import CheckpointStore
 from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
@@ -1047,6 +1048,176 @@ def test_shell_respects_custom_deny_patterns_from_config(tmp_path, monkeypatch):
     # deny_patterns list replaces (not extends) the defaults.
     assert "[blocked]" not in tools.get("shell").run(command="rm -rf /")
     assert "[blocked]" in tools.get("shell").run(command="hydra -l root -P wordlist ssh://10.0.0.5")
+
+
+# -- checkpoints (mist.core.checkpoints.CheckpointStore) --------------------
+
+def test_checkpoint_ensure_creates_shadow_repo_not_a_dot_git_in_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    store.ensure(workspace)
+
+    assert workspace.is_dir()
+    assert not (workspace / ".git").exists()  # shadow repo, workspace stays untouched
+    repo_dir = store._repo_dir(workspace)
+    assert (repo_dir / ".git").is_dir()
+    assert (repo_dir / "workspace_path.txt").read_text(encoding="utf-8") == str(workspace.resolve())
+
+
+def test_checkpoint_snapshot_commits_changes_and_reports_true(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+
+    (workspace / "file1.txt").write_text("hello", encoding="utf-8")
+    assert store.snapshot(workspace, "first snapshot") is True
+
+    info = store.status(workspace)
+    assert info is not None
+    assert info.commit_count == 1
+
+
+def test_checkpoint_snapshot_returns_false_when_nothing_changed(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    (workspace / "file1.txt").write_text("hello", encoding="utf-8")
+
+    assert store.snapshot(workspace, "first") is True
+    assert store.snapshot(workspace, "nothing changed") is False  # no diff since last commit
+
+
+def test_checkpoint_snapshot_returns_false_for_nonexistent_workspace(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    assert store.snapshot(tmp_path / "does_not_exist", "msg") is False
+
+
+def test_checkpoint_status_is_none_without_a_checkpoint_repo(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    assert store.status(tmp_path / "never_snapshotted") is None
+
+
+def test_checkpoint_rollback_restores_prior_content(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+
+    (workspace / "file1.txt").write_text("version 1", encoding="utf-8")
+    store.snapshot(workspace, "v1")
+    (workspace / "file1.txt").write_text("version 2 (bad)", encoding="utf-8")
+    store.snapshot(workspace, "v2")
+
+    assert store.rollback(workspace, "HEAD~1") is True
+    assert (workspace / "file1.txt").read_text(encoding="utf-8") == "version 1"
+
+
+def test_checkpoint_rollback_false_without_a_repo(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    assert store.rollback(tmp_path / "never_snapshotted") is False
+
+
+def test_checkpoint_list_all_reports_every_project(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    ws_a = tmp_path / "a"
+    ws_b = tmp_path / "b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    (ws_a / "f.txt").write_text("a", encoding="utf-8")
+    (ws_b / "f.txt").write_text("b", encoding="utf-8")
+    store.snapshot(ws_a, "snap a")
+    store.snapshot(ws_b, "snap b")
+
+    paths = {info.workspace_path for info in store.list_all()}
+    assert paths == {str(ws_a.resolve()), str(ws_b.resolve())}
+
+
+def test_checkpoint_prune_removes_orphans_and_keeps_live_ones(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    ws_live = tmp_path / "live"
+    ws_gone = tmp_path / "gone"
+    ws_live.mkdir()
+    ws_gone.mkdir()
+    (ws_live / "f.txt").write_text("x", encoding="utf-8")
+    (ws_gone / "f.txt").write_text("x", encoding="utf-8")
+    store.snapshot(ws_live, "snap")
+    store.snapshot(ws_gone, "snap")
+    shutil.rmtree(ws_gone)  # simulate the engagement folder being cleaned up
+
+    removed = store.prune()
+
+    assert removed == 1
+    remaining_paths = {info.workspace_path for info in store.list_all()}
+    assert remaining_paths == {str(ws_live.resolve())}
+
+
+def test_checkpoint_clear_removes_everything(tmp_path):
+    store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "f.txt").write_text("x", encoding="utf-8")
+    store.snapshot(workspace, "snap")
+
+    store.clear()
+
+    assert store.list_all() == []
+    assert not store.base_dir.exists()
+
+
+def _make_agent_with_checkpoints(tmp_path, checkpoint_store):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.workspace.root_path = str(tmp_path / "workspace")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember, workspace_root=cfg.workspace_root)
+    return MistAgent(cfg, FakeLLM([]), store, skills, tools, checkpoint_store=checkpoint_store)
+
+
+def test_checkpoint_before_tool_snapshots_shell_and_write_file(tmp_path):
+    # Something must already exist to snapshot — an untouched empty
+    # directory correctly produces no commit (nothing to capture yet).
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "workspace" / "existing.txt").write_text("v1", encoding="utf-8")
+    checkpoint_store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    agent = _make_agent_with_checkpoints(tmp_path, checkpoint_store)
+
+    agent._checkpoint_before_tool("shell", {"command": "echo hi"})
+    info = checkpoint_store.status(tmp_path / "workspace")
+    assert info is not None
+    assert info.commit_count == 1
+
+    (tmp_path / "workspace" / "new.txt").write_text("v2", encoding="utf-8")
+    agent._checkpoint_before_tool("write_file", {"path": "other.txt", "content": "x"})
+    info = checkpoint_store.status(tmp_path / "workspace")
+    assert info.commit_count == 2
+
+
+def test_checkpoint_before_tool_ignores_non_mutating_tools(tmp_path):
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    checkpoint_store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    agent = _make_agent_with_checkpoints(tmp_path, checkpoint_store)
+
+    agent._checkpoint_before_tool("read_file", {"path": "foo.txt"})
+    agent._checkpoint_before_tool("remember", {"content": "a fact"})
+
+    assert checkpoint_store.status(tmp_path / "workspace") is None  # no repo ever created
+
+
+def test_checkpoint_before_tool_noop_when_store_not_configured(tmp_path):
+    agent = _make_agent_with_checkpoints(tmp_path, checkpoint_store=None)
+    agent._checkpoint_before_tool("shell", {"command": "echo hi"})  # must not raise
+
+
+def test_checkpoint_before_tool_follows_mission_workspace_redirect(tmp_path):
+    checkpoint_store = CheckpointStore(base_dir=tmp_path / "checkpoints")
+    agent = _make_agent_with_checkpoints(tmp_path, checkpoint_store)
+
+    redirected = tmp_path / "HTB" / "10.129.33.21"
+    agent.tools.workspace.path = redirected
+    agent._checkpoint_before_tool("shell", {"command": "nmap -p- 10.129.33.21"})
+
+    assert checkpoint_store.status(redirected) is not None
+    assert checkpoint_store.status(tmp_path / "workspace") is None  # the static default untouched
 
 
 def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):

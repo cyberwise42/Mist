@@ -10,6 +10,7 @@ from mist import doctor as doctor_module
 from mist.banner import BANNER, TAGLINE, help_lines
 from mist.config import load_config
 from mist.core.agent import MistAgent
+from mist.core.checkpoints import CheckpointStore
 from mist.core.summarizer import BatchSummarizer
 from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx
@@ -127,8 +128,10 @@ def _build_agent(config_path: str | None, backend: str | None,
         tool_compressor=tool_compressor,
         security_config=cfg.security,
     )
+    checkpoint_store = CheckpointStore(cfg.checkpoints.base_dir) if cfg.checkpoints.enabled else None
     return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,
-                     tool_compressor=tool_compressor, preload_skills=preload_skills)
+                     tool_compressor=tool_compressor, preload_skills=preload_skills,
+                     checkpoint_store=checkpoint_store)
 
 
 def _print_welcome(agent: MistAgent) -> None:
@@ -375,6 +378,67 @@ def doctor(config: str = typer.Option(None, help="Path to config.yaml"),
         console.print("\n[red]One or more checks failed.[/]")
         raise typer.Exit(1)
     console.print("\n[green]All checks passed (warnings, if any, are non-fatal).[/]")
+
+
+checkpoints_app = typer.Typer(add_completion=False,
+                              help="Inspect / prune / clear the filesystem checkpoint store")
+app.add_typer(checkpoints_app, name="checkpoints")
+
+
+def _checkpoint_store(config: str | None) -> CheckpointStore:
+    return CheckpointStore(load_config(config).checkpoints.base_dir)
+
+
+def _format_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
+@checkpoints_app.command("status")
+def checkpoints_status(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Show total size, project count, and per-project breakdown."""
+    store = _checkpoint_store(config)
+    infos = store.list_all()
+    if not infos:
+        console.print("[dim]No checkpoints recorded.[/]")
+        return
+    total_size = sum(i.size_bytes for i in infos)
+    total_commits = sum(i.commit_count for i in infos)
+    console.print(f"{len(infos)} project(s), {total_commits} snapshot(s) total, "
+                 f"{_format_size(total_size)} on disk\n")
+    for info in infos:
+        console.print(f"  {info.workspace_path}: {info.commit_count} snapshot(s), "
+                     f"{_format_size(info.size_bytes)}")
+
+
+@checkpoints_app.command("list")
+def checkpoints_list(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Alias for 'status'."""
+    checkpoints_status(config)
+
+
+@checkpoints_app.command("prune")
+def checkpoints_prune(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Delete orphan/stale checkpoints (workspace no longer exists) and GC the rest."""
+    store = _checkpoint_store(config)
+    removed = store.prune()
+    console.print(f"Removed {removed} orphaned checkpoint(s).")
+
+
+@checkpoints_app.command("clear")
+def checkpoints_clear(config: str = typer.Option(None, help="Path to config.yaml"),
+                      yes: bool = typer.Option(False, "--yes", help="Skip confirmation")):
+    """Delete the entire checkpoint base — all rollback history, every project."""
+    store = _checkpoint_store(config)
+    if not yes and not typer.confirm(f"Delete ALL checkpoints under {store.base_dir}?"):
+        console.print("Aborted.")
+        raise typer.Exit(0)
+    store.clear()
+    console.print("Cleared.")
 
 
 if __name__ == "__main__":

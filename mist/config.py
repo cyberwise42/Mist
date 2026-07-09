@@ -124,6 +124,16 @@ class ToolsConfig(BaseModel):
     structured: StructuredToolsConfig = Field(default_factory=StructuredToolsConfig)
 
 
+class CheckpointConfig(BaseModel):
+    """Filesystem checkpoint/rollback (mist/core/checkpoints.py) — a shadow
+    git repo snapshotting a workspace directory before every shell/
+    write_file call, so a bad mission action can be rolled back. Off by
+    default: it shells out to git on every mutating tool call, real but
+    modest overhead not every casual chat session needs."""
+    enabled: bool = False
+    base_dir: str = "~/.mist/checkpoints"
+
+
 class SecurityConfig(BaseModel):
     """Pre-execution command-safety gate for the `shell` tool — see
     mist/tools/safety.py. Not a sandbox or an allowlist; a narrow backstop
@@ -192,6 +202,7 @@ class MistConfig(BaseModel):
     artifacts: ArtifactConfig = Field(default_factory=ArtifactConfig)
     summarizer: SummarizerLLMConfig = Field(default_factory=SummarizerLLMConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
 
     @property
     def history_file(self) -> Path:
