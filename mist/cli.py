@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from mist import backup as backup_module
 from mist import doctor as doctor_module
 from mist.banner import BANNER, TAGLINE, help_lines
 from mist.config import load_config
@@ -439,6 +440,38 @@ def checkpoints_clear(config: str = typer.Option(None, help="Path to config.yaml
         raise typer.Exit(0)
     store.clear()
     console.print("Cleared.")
+
+
+@app.command()
+def backup(config: str = typer.Option(None, help="Path to config.yaml"),
+          output: str = typer.Option(None, "--output", "-o",
+                                     help="Output zip path (default: "
+                                          "~/.mist/backups/mist-backup-<timestamp>.zip)")):
+    """Back up ~/.mist (config, memory DB, history, workspace) and the
+    wiki knowledge base to a single zip file."""
+    cfg = load_config(config)
+    path = backup_module.create_backup(cfg, output_path=output)
+    console.print(f"Backup written to {path}")
+
+
+@app.command()
+def restore(zip_path: str,
+           config: str = typer.Option(None, help="Path to config.yaml"),
+           yes: bool = typer.Option(False, "--yes", help="Skip confirmation")):
+    """Restore a backup created by `mist backup`, overwriting the current
+    ~/.mist and wiki contents at the paths recorded in the backup's own
+    manifest. Takes a safety backup of the current state first."""
+    cfg = load_config(config)
+    if not yes and not typer.confirm(
+        f"This overwrites the current ~/.mist and wiki contents with {zip_path}. Continue?"
+    ):
+        console.print("Aborted.")
+        raise typer.Exit(0)
+    safety_path = backup_module.create_backup(cfg)
+    console.print(f"[dim]Safety backup of the current state written to {safety_path} first.[/]")
+    restored = backup_module.restore_backup(zip_path)
+    console.print(f"Restored {restored['mist_home']} file(s) to ~/.mist, "
+                 f"{restored['wiki']} file(s) to the wiki root.")
 
 
 if __name__ == "__main__":

@@ -2,11 +2,13 @@ import asyncio
 import json
 import shutil
 import subprocess
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from mist import backup as backup_module
 from mist import doctor as doctor_module
 from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig,
                          ShellSSHConfig, StructuredToolsConfig)
@@ -1218,6 +1220,105 @@ def test_checkpoint_before_tool_follows_mission_workspace_redirect(tmp_path):
 
     assert checkpoint_store.status(redirected) is not None
     assert checkpoint_store.status(tmp_path / "workspace") is None  # the static default untouched
+
+
+# -- backup/restore (mist.backup) -------------------------------------------
+
+def test_create_backup_zips_mist_home_and_wiki(tmp_path, monkeypatch):
+    fake_home = tmp_path / "dot_mist"
+    fake_home.mkdir()
+    (fake_home / "config.yaml").write_text("backend: ollama", encoding="utf-8")
+    (fake_home / "mist.db").write_text("fake db bytes", encoding="utf-8")
+    monkeypatch.setattr(backup_module, "MIST_HOME", fake_home)
+
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    (wiki_root / "SCHEMA.md").write_text("# schema", encoding="utf-8")
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(wiki_root)
+
+    output = backup_module.create_backup(cfg, output_path=tmp_path / "out.zip")
+
+    assert output.is_file()
+    with zipfile.ZipFile(output) as zf:
+        names = set(zf.namelist())
+        assert "manifest.json" in names
+        assert "mist_home/config.yaml" in names
+        assert "mist_home/mist.db" in names
+        assert "wiki/SCHEMA.md" in names
+        manifest = json.loads(zf.read("manifest.json"))
+        assert manifest["mist_home"] == str(fake_home)
+        assert manifest["wiki_root"] == str(wiki_root)
+
+
+def test_create_backup_excludes_prior_backups_directory(tmp_path, monkeypatch):
+    fake_home = tmp_path / "dot_mist"
+    fake_home.mkdir()
+    (fake_home / "config.yaml").write_text("backend: ollama", encoding="utf-8")
+    old_backups = fake_home / "backups"
+    old_backups.mkdir()
+    (old_backups / "mist-backup-old.zip").write_bytes(b"not a real zip, just a marker")
+    monkeypatch.setattr(backup_module, "MIST_HOME", fake_home)
+
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "no_such_wiki")
+
+    output = backup_module.create_backup(cfg, output_path=tmp_path / "out.zip")
+    with zipfile.ZipFile(output) as zf:
+        names = zf.namelist()
+        assert not any("backups/" in n for n in names)
+
+
+def test_create_backup_defaults_output_path_under_mist_home_backups(tmp_path, monkeypatch):
+    fake_home = tmp_path / "dot_mist"
+    fake_home.mkdir()
+    monkeypatch.setattr(backup_module, "MIST_HOME", fake_home)
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "no_such_wiki")
+
+    output = backup_module.create_backup(cfg)
+
+    assert output.parent == fake_home / "backups"
+    assert output.name.startswith("mist-backup-")
+
+
+def test_restore_backup_recreates_files_at_manifest_paths(tmp_path, monkeypatch):
+    fake_home = tmp_path / "dot_mist"
+    fake_home.mkdir()
+    (fake_home / "config.yaml").write_text("backend: ollama", encoding="utf-8")
+    monkeypatch.setattr(backup_module, "MIST_HOME", fake_home)
+    wiki_root = tmp_path / "wiki"
+    wiki_root.mkdir()
+    (wiki_root / "SCHEMA.md").write_text("# schema", encoding="utf-8")
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(wiki_root)
+    output = backup_module.create_backup(cfg, output_path=tmp_path / "out.zip")
+
+    # Simulate data loss, then restore.
+    shutil.rmtree(fake_home)
+    shutil.rmtree(wiki_root)
+
+    restored = backup_module.restore_backup(output)
+
+    assert restored == {"mist_home": 1, "wiki": 1}
+    assert (fake_home / "config.yaml").read_text(encoding="utf-8") == "backend: ollama"
+    assert (wiki_root / "SCHEMA.md").read_text(encoding="utf-8") == "# schema"
+
+
+def test_restore_backup_honors_target_overrides(tmp_path, monkeypatch):
+    fake_home = tmp_path / "dot_mist"
+    fake_home.mkdir()
+    (fake_home / "config.yaml").write_text("backend: ollama", encoding="utf-8")
+    monkeypatch.setattr(backup_module, "MIST_HOME", fake_home)
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "no_such_wiki")
+    output = backup_module.create_backup(cfg, output_path=tmp_path / "out.zip")
+
+    new_home = tmp_path / "restored_elsewhere"
+    restored = backup_module.restore_backup(output, target_mist_home=new_home)
+
+    assert restored["mist_home"] == 1
+    assert (new_home / "config.yaml").read_text(encoding="utf-8") == "backend: ollama"
 
 
 def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):
