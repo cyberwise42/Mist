@@ -65,6 +65,23 @@ def compute_max_tokens(configured_max_tokens: int, token_budget: int,
     return min(configured_max_tokens, available)
 
 
+def compute_timeout(max_tokens: int, tokens_per_second: float = 65.0,
+                    min_timeout: float = 120.0, overhead_seconds: float = 30.0) -> float:
+    """Sizes the HTTP client timeout so it doesn't give up on a call before
+    generation.max_tokens' own reasoning budget does. 65 tok/s is the same
+    conservative real-hardware estimate max_tokens itself gets sized
+    against (see ~/.mist/config.yaml's own comment on generation.max_tokens)
+    — a call that takes longer than that genuinely IS taking longer than
+    the model was budgeted for. Confirmed live: with the old hardcoded
+    120s default, raising max_tokens to 40000 for a longer reasoning pass
+    did nothing to prevent a real call from being aborted by httpx.
+    ReadTimeout after 2 minutes, long before the ~10-minute budget that
+    max_tokens was actually sized for. `overhead_seconds` covers
+    connection setup/TTFB on top of pure generation time; `min_timeout`
+    preserves the old default as a floor for small max_tokens configs."""
+    return max(min_timeout, max_tokens / tokens_per_second + overhead_seconds)
+
+
 class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,

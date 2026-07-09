@@ -18,7 +18,7 @@ from mist.core.checkpoints import CheckpointStore
 from mist.core.context_compressor import ContextCompressor
 from mist.core.summarizer import BatchSummarizer
 from mist.core.tool_compressor import ToolOutputCompressor
-from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx
+from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx, compute_timeout
 from mist.llm.embeddings import EmbeddingClient
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
@@ -66,6 +66,7 @@ def _build_agent(config_path: str | None, backend: str | None,
 
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
                     cfg.generation.temperature, cfg.generation.max_tokens,
+                    timeout=compute_timeout(cfg.generation.max_tokens),
                     think=cfg.generation.think)
     # Discover the model's real max context length and explicitly request a
     # matching num_ctx — left unset, Ollama loads the model with whatever
@@ -308,6 +309,7 @@ def compact(config: str = typer.Option(None, help="Path to config.yaml"),
     cfg = _apply_overrides(load_config(config), backend, model, base_url)
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
                     cfg.generation.temperature, cfg.generation.max_tokens,
+                    timeout=compute_timeout(cfg.generation.max_tokens),
                     think=cfg.generation.think)
     store = MemoryStore(cfg.db_path)
     summarizer = BatchSummarizer(llm, store)

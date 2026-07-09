@@ -2787,7 +2787,8 @@ async def test_tui_kill_triggers_debrief(tmp_path):
 
 import httpx  # noqa: E402
 
-from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx  # noqa: E402
+from mist.llm.client import (LLMClient, compute_max_tokens, compute_num_ctx,  # noqa: E402
+                             compute_timeout)
 
 
 # -- context-window discovery (mist.llm.client) ---------------------------
@@ -2906,6 +2907,33 @@ def test_compute_num_ctx_returns_none_when_discovery_failed():
     # wrong as not setting num_ctx at all — None means "leave the backend's
     # own default alone," today's behavior, unchanged.
     assert compute_num_ctx(token_budget=6000, max_tokens=1024, discovered_max=None) is None
+
+
+def test_compute_timeout_scales_with_max_tokens():
+    # Regression case from a real run: generation.max_tokens was raised to
+    # 40000 (~10 min budget at a conservative 65 tok/s) specifically to
+    # give a stuck reasoning pass more room, but the HTTP client's
+    # hardcoded 120s timeout never followed along — a real call was
+    # aborted by httpx.ReadTimeout after 2 minutes, long before the
+    # ~10-minute budget max_tokens was actually sized for.
+    timeout = compute_timeout(40000)
+    assert timeout > 120.0
+    assert 600.0 < timeout < 700.0  # ~40000/65 + 30s overhead
+
+
+def test_compute_timeout_floors_at_min_timeout_for_small_max_tokens():
+    # A small max_tokens (e.g. the 1024 default) must not shrink the
+    # timeout below the old, safe 120s default.
+    assert compute_timeout(1024) == 120.0
+    assert compute_timeout(100) == 120.0
+
+
+def test_compute_timeout_respects_custom_tokens_per_second():
+    # Half the assumed throughput roughly doubles the token-generation
+    # portion of the timeout.
+    fast = compute_timeout(40000, tokens_per_second=65.0)
+    slow = compute_timeout(40000, tokens_per_second=32.5)
+    assert slow > fast
 
 
 def test_discover_context_length_extracts_family_prefixed_key():
