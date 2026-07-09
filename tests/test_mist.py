@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mist import doctor as doctor_module
 from mist.config import (ArtifactConfig, MistConfig, ShellConfig, ShellSSHConfig,
                          StructuredToolsConfig)
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
@@ -3473,3 +3474,183 @@ async def test_tui_up_down_recalls_history(tmp_path):
         assert input_widget.value == "second command"
         await pilot.press("down")
         assert input_widget.value == ""  # past the newest entry -> back to the draft
+
+
+# -- mist doctor (mist.doctor) ----------------------------------------------
+
+def test_check_config_loads_always_ok():
+    cfg = MistConfig()
+    result = doctor_module.check_config_loads(cfg)
+    assert result.status == "ok"
+
+
+def test_check_wiki_initialized_detects_missing_and_present(tmp_path):
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    assert doctor_module.check_wiki_initialized(cfg).status == "warn"
+
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "SCHEMA.md").write_text("# schema", encoding="utf-8")
+    assert doctor_module.check_wiki_initialized(cfg).status == "ok"
+
+
+def test_check_wiki_initialized_is_case_insensitive(tmp_path):
+    # Regression case from a real run: a long-populated real wiki had a
+    # lowercase schema.md from before the scaffold's SCHEMA.md convention
+    # solidified — a case-sensitive check reported a false "not
+    # initialized" against a wiki that clearly was.
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    (tmp_path / "wiki").mkdir()
+    (tmp_path / "wiki" / "schema.md").write_text("# schema", encoding="utf-8")
+    assert doctor_module.check_wiki_initialized(cfg).status == "ok"
+
+
+def test_check_backend_reachable_ok_and_fail(monkeypatch):
+    cfg = MistConfig()
+
+    monkeypatch.setattr(doctor_module.LLMClient, "list_models", lambda self: ["a", "b"])
+    result, models = doctor_module.check_backend_reachable(cfg)
+    assert result.status == "ok"
+    assert models == ["a", "b"]
+
+    def _raise(self):
+        raise ConnectionError("refused")
+    monkeypatch.setattr(doctor_module.LLMClient, "list_models", _raise)
+    result, models = doctor_module.check_backend_reachable(cfg)
+    assert result.status == "fail"
+    assert models is None
+    assert "ConnectionError" in result.detail  # repr-style, not a swallowed empty message
+
+
+def test_check_model_available_variants():
+    cfg = MistConfig()
+    cfg.model = "qwen2.5:14b"
+    assert doctor_module.check_model_available(cfg, None).status == "warn"
+    assert doctor_module.check_model_available(cfg, ["qwen2.5:14b", "other"]).status == "ok"
+    assert doctor_module.check_model_available(cfg, ["other"]).status == "fail"
+
+
+def test_check_model_available_tolerates_implicit_latest_tag():
+    # Regression case from a real run: config said "bge-m3" but Ollama's
+    # /api/tags reports "bge-m3:latest" — a genuinely available model
+    # reported as missing on an exact string comparison.
+    cfg = MistConfig()
+    cfg.model = "bge-m3"
+    assert doctor_module.check_model_available(cfg, ["bge-m3:latest"]).status == "ok"
+
+    cfg.model = "bge-m3:latest"
+    assert doctor_module.check_model_available(cfg, ["bge-m3"]).status == "ok"
+
+    # A genuinely different tag must still be reported as unavailable.
+    cfg.model = "qwen2.5:14b"
+    assert doctor_module.check_model_available(cfg, ["qwen2.5:7b"]).status == "fail"
+
+
+def test_check_num_ctx_warns_when_discovery_fails(monkeypatch):
+    cfg = MistConfig()
+    monkeypatch.setattr(doctor_module.LLMClient, "discover_context_length", lambda self, timeout=5.0: None)
+    assert doctor_module.check_num_ctx(cfg).status == "warn"
+
+
+def test_check_num_ctx_warns_when_budget_exceeds_window(monkeypatch):
+    cfg = MistConfig()
+    cfg.context.token_budget = 6000
+    cfg.generation.max_tokens = 260000  # 266000 total > the 262144 discovered window
+    monkeypatch.setattr(doctor_module.LLMClient, "discover_context_length",
+                        lambda self, timeout=5.0: 262144)
+    result = doctor_module.check_num_ctx(cfg)
+    assert result.status == "warn"
+    assert "capped" in result.detail
+
+
+def test_check_num_ctx_ok_when_it_fits(monkeypatch):
+    cfg = MistConfig()
+    cfg.context.token_budget = 6000
+    cfg.generation.max_tokens = 8192
+    monkeypatch.setattr(doctor_module.LLMClient, "discover_context_length",
+                        lambda self, timeout=5.0: 262144)
+    assert doctor_module.check_num_ctx(cfg).status == "ok"
+
+
+def test_check_shell_backend_local_is_always_ok():
+    cfg = MistConfig()
+    assert doctor_module.check_shell_backend(cfg).status == "ok"
+
+
+def test_check_shell_backend_ssh_missing_key(tmp_path):
+    cfg = MistConfig()
+    cfg.tools.shell.backend = "ssh"
+    cfg.tools.shell.ssh.host = "10.0.0.5"
+    cfg.tools.shell.ssh.key_path = str(tmp_path / "nonexistent_key")
+    result = doctor_module.check_shell_backend(cfg)
+    assert result.status == "fail"
+    assert "does not exist" in result.detail
+
+
+def test_check_shell_backend_ssh_reachable(monkeypatch):
+    cfg = MistConfig()
+    cfg.tools.shell.backend = "ssh"
+    cfg.tools.shell.ssh.host = "10.0.0.5"
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(doctor_module.subprocess, "run", lambda *a, **kw: FakeCompletedProcess())
+    assert doctor_module.check_shell_backend(cfg).status == "ok"
+
+
+def test_check_shell_backend_ssh_unreachable(monkeypatch):
+    cfg = MistConfig()
+    cfg.tools.shell.backend = "ssh"
+    cfg.tools.shell.ssh.host = "10.0.0.5"
+
+    class FakeCompletedProcess:
+        returncode = 255
+        stderr = "Connection refused"
+
+    monkeypatch.setattr(doctor_module.subprocess, "run", lambda *a, **kw: FakeCompletedProcess())
+    result = doctor_module.check_shell_backend(cfg)
+    assert result.status == "fail"
+    assert "Connection refused" in result.detail
+
+
+def test_check_db_writable_ok(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "sub" / "mist.db")
+    assert doctor_module.check_db_writable(cfg).status == "ok"
+
+
+def test_check_db_writable_fails_when_parent_is_a_file(tmp_path):
+    cfg = MistConfig()
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    cfg.memory.db_path = str(blocker / "mist.db")  # blocker is a file, not a dir
+    assert doctor_module.check_db_writable(cfg).status == "fail"
+
+
+def test_run_all_returns_one_result_per_check(monkeypatch):
+    monkeypatch.setattr(doctor_module.LLMClient, "list_models", lambda self: ["m"])
+    monkeypatch.setattr(doctor_module.LLMClient, "discover_context_length",
+                        lambda self, timeout=5.0: None)
+    cfg = MistConfig()
+    results = doctor_module.run_all(cfg)
+    names = {r.name for r in results}
+    assert names == {"config", "wiki", "db", "backend", "model", "num_ctx", "embeddings", "shell"}
+
+
+def test_fix_initializes_missing_wiki(tmp_path):
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    assert not (tmp_path / "wiki" / "SCHEMA.md").is_file()
+    fixed = doctor_module.fix(cfg)
+    assert any("wiki" in f for f in fixed)
+    assert (tmp_path / "wiki" / "SCHEMA.md").is_file()
+
+
+def test_fix_is_noop_when_wiki_already_initialized(tmp_path):
+    cfg = MistConfig()
+    cfg.wiki.root_path = str(tmp_path / "wiki")
+    doctor_module.fix(cfg)  # first call initializes it
+    assert doctor_module.fix(cfg) == []  # second call: nothing left to fix

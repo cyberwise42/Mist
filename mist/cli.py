@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from mist import doctor as doctor_module
 from mist.banner import BANNER, TAGLINE, help_lines
 from mist.config import load_config
 from mist.core.agent import MistAgent
@@ -315,6 +316,33 @@ def tui(config: str = typer.Option(None, help="Path to config.yaml"),
         raise typer.Exit(1) from exc
     agent = _build_agent(config, backend, model, base_url)
     MistTUI(agent).run()
+
+
+_STATUS_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
+
+
+@app.command()
+def doctor(config: str = typer.Option(None, help="Path to config.yaml"),
+          fix: bool = typer.Option(False, "--fix", help="Attempt to auto-fix issues found")):
+    """Diagnose config/connectivity issues: backend reachability, whether
+    the configured model is actually pulled, context-window sizing, the
+    embedding backend, the shell backend (SSH connectivity), the wiki, and
+    the memory DB path. Exits non-zero if anything failed."""
+    cfg = load_config(config)
+    if fix:
+        for description in doctor_module.fix(cfg):
+            console.print(f"[cyan]Fixed:[/] {description}")
+    results = doctor_module.run_all(cfg)
+    failed = False
+    for r in results:
+        style = _STATUS_STYLE.get(r.status, "white")
+        console.print(f"[{style}]{r.status.upper():5}[/] {r.name:12} {r.detail}")
+        if r.status == "fail":
+            failed = True
+    if failed:
+        console.print("\n[red]One or more checks failed.[/]")
+        raise typer.Exit(1)
+    console.print("\n[green]All checks passed (warnings, if any, are non-fatal).[/]")
 
 
 if __name__ == "__main__":
