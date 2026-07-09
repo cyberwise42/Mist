@@ -14,12 +14,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from mist.config import ArtifactConfig, ShellConfig, StructuredToolsConfig
+from mist.config import ArtifactConfig, SecurityConfig, ShellConfig, StructuredToolsConfig
 from mist.core.subagent import format_results, run_subagents, run_tool_subagents
 from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient
 from mist.skills.router import SkillRouter
 from mist.tools.artifacts import ArtifactStore
+from mist.tools.safety import check_command_dangerous
 from mist.tools.structured import detect_tool, summarize_tool_output
 
 
@@ -368,13 +369,31 @@ def _make_shell(shell_cfg: ShellConfig | None,
                 registry: ProcessRegistry | None = None,
                 workspace: MutableWorkspace | None = None,
                 artifacts: ArtifactStore | None = None,
-                structured_cfg: StructuredToolsConfig | None = None) -> Callable[..., str]:
+                structured_cfg: StructuredToolsConfig | None = None,
+                security_cfg: SecurityConfig | None = None) -> Callable[..., str]:
+    def _blocked(command: str) -> str | None:
+        # Checked before any cd-prefixing/workspace redirection is applied,
+        # against the model's own command text — a hard backstop, not a
+        # target-side restriction. See mist/tools/safety.py.
+        if security_cfg is not None and not security_cfg.command_safety_enabled:
+            return None
+        reason = check_command_dangerous(command, security_cfg.deny_patterns if security_cfg else None)
+        if reason is None:
+            return None
+        return (f"[blocked] Command not executed — {reason}. This is a hard safety gate "
+                "(security.command_safety_enabled in config.yaml), not a target-side "
+                "restriction. If this command is genuinely needed, ask the operator to "
+                "adjust security.deny_patterns or disable the gate.")
+
     if shell_cfg is None or shell_cfg.backend == "local":
         # Runs from a dedicated workspace dir rather than wherever the mist
         # process happened to be launched from — a real run found the model
         # wandering into an unrelated sibling project directory (agent-zero)
         # via relative paths that only "worked" because of the launch cwd.
         def _local_shell(command: str) -> str:
+            blocked = _blocked(command)
+            if blocked is not None:
+                return blocked
             cwd = workspace.path if workspace is not None else None
             if cwd is not None:
                 cwd.mkdir(parents=True, exist_ok=True)
@@ -385,6 +404,9 @@ def _make_shell(shell_cfg: ShellConfig | None,
     ssh = shell_cfg.ssh
 
     def _shell_ssh(command: str) -> str:
+        blocked = _blocked(command)
+        if blocked is not None:
+            return blocked
         args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
         if ssh.key_path:
             args += ["-i", str(Path(ssh.key_path).expanduser())]
@@ -484,7 +506,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       process_registry: ProcessRegistry | None = None,
                       artifact_config: ArtifactConfig | None = None,
                       structured_tools_config: StructuredToolsConfig | None = None,
-                      tool_compressor: ToolOutputCompressor | None = None) -> ToolRegistry:
+                      tool_compressor: ToolOutputCompressor | None = None,
+                      security_config: SecurityConfig | None = None) -> ToolRegistry:
     # read_file/write_file/search_files anchor relative paths to wiki_root,
     # but an absolute path used to be let through unconditionally — a real
     # run escaped the wiki root that way and read an unrelated project's
@@ -551,7 +574,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                     "required": ["command"]},
         fn=_make_shell(shell_config, process_registry, workspace_box,
                       artifacts=artifact_store,
-                      structured_cfg=structured_tools_config),
+                      structured_cfg=structured_tools_config,
+                      security_cfg=security_config),
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
     ))
     # Exposed so a caller (MistAgent.astream_mission) can redirect the

@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from mist import doctor as doctor_module
-from mist.config import (ArtifactConfig, MistConfig, ShellConfig, ShellSSHConfig,
-                         StructuredToolsConfig)
+from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig,
+                         ShellSSHConfig, StructuredToolsConfig)
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
@@ -22,6 +22,7 @@ from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.artifacts import ArtifactStore
 from mist.tools.registry import ProcessRegistry, default_registry
+from mist.tools.safety import check_command_dangerous
 from mist.tools.structured import detect_tool, summarize_tool_output
 from mist.llm.client import parse_json_relaxed
 from mist.tui.memory_commands import render_history_command, render_memories_command
@@ -934,6 +935,118 @@ def test_shell_ssh_backend_follows_mutable_workspace_redirect(monkeypatch):
 
     remote_command = captured["args"][-1]
     assert "cd '/home/kali/Desktop/HTB/10.129.33.21'" in remote_command
+
+
+# -- command-safety gate (mist.tools.safety, security config) --------------
+
+def test_check_command_dangerous_flags_known_catastrophic_patterns():
+    dangerous = [
+        "rm -rf /",
+        "rm -rf ~",
+        "rm -rf /*",
+        "dd if=/dev/zero of=/dev/sda",
+        "mkfs.ext4 /dev/sdb1",
+        ":(){ :|:& };:",
+        "chmod -R 777 /",
+        "shutdown -h now",
+        "reboot",
+        "iptables -F",
+    ]
+    for command in dangerous:
+        assert check_command_dangerous(command) is not None, command
+
+
+def test_check_command_dangerous_allows_normal_pentest_commands():
+    safe = [
+        "nmap -p- -T4 10.129.33.21",
+        "curl -s http://10.129.33.21/admin",
+        "rm -rf /tmp/scan_output",  # scoped, not the whole filesystem
+        "gobuster dir -u http://10.129.33.21 -w wordlist.txt",
+        "searchsploit freepbx",
+        "ssh root@10.129.33.21",
+    ]
+    for command in safe:
+        assert check_command_dangerous(command) is None, command
+
+
+def test_check_command_dangerous_honors_custom_patterns():
+    assert check_command_dangerous("echo hello", patterns=[r"echo"]) is not None
+    assert check_command_dangerous("rm -rf /", patterns=[r"echo"]) is None
+
+
+def test_shell_local_backend_blocks_dangerous_command(tmp_path, monkeypatch):
+    called = {"popen": False}
+
+    class FakePopen:
+        def __init__(self, *a, **kw):
+            called["popen"] = True
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    tools = default_registry(remember_fn=lambda c: None, workspace_root=tmp_path / "ws")
+    result = tools.get("shell").run(command="rm -rf /")
+
+    assert "[blocked]" in result
+    assert called["popen"] is False  # never actually executed
+
+
+def test_shell_ssh_backend_blocks_dangerous_command(monkeypatch):
+    called = {"popen": False}
+
+    class FakePopen:
+        def __init__(self, *a, **kw):
+            called["popen"] = True
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(host="10.0.0.5"))
+    tools = default_registry(remember_fn=lambda c: None, shell_config=shell_cfg)
+    result = tools.get("shell").run(command="dd if=/dev/zero of=/dev/sda")
+
+    assert "[blocked]" in result
+    assert called["popen"] is False
+
+
+def test_shell_allows_dangerous_command_when_gate_disabled(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, *a, **kw):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    security = SecurityConfig(command_safety_enabled=False)
+    tools = default_registry(remember_fn=lambda c: None, workspace_root=tmp_path / "ws",
+                             security_config=security)
+    result = tools.get("shell").run(command="rm -rf /")
+
+    assert "[blocked]" not in result
+
+
+def test_shell_respects_custom_deny_patterns_from_config(tmp_path, monkeypatch):
+    class FakePopen:
+        def __init__(self, *a, **kw):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("ok\n", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    security = SecurityConfig(deny_patterns=[r"\bhydra\b"])
+    tools = default_registry(remember_fn=lambda c: None, workspace_root=tmp_path / "ws",
+                             security_config=security)
+
+    # A command dangerous by the DEFAULT list is allowed, since a custom
+    # deny_patterns list replaces (not extends) the defaults.
+    assert "[blocked]" not in tools.get("shell").run(command="rm -rf /")
+    assert "[blocked]" in tools.get("shell").run(command="hydra -l root -P wordlist ssh://10.0.0.5")
 
 
 def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):

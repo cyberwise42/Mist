@@ -124,6 +124,16 @@ class ToolsConfig(BaseModel):
     structured: StructuredToolsConfig = Field(default_factory=StructuredToolsConfig)
 
 
+class SecurityConfig(BaseModel):
+    """Pre-execution command-safety gate for the `shell` tool — see
+    mist/tools/safety.py. Not a sandbox or an allowlist; a narrow backstop
+    against catastrophic self-destructive commands (rm -rf /, a raw disk
+    dd, a fork bomb, shutdown/reboot of the execution host, flushing
+    iptables and cutting off the operator's own SSH session, etc.)."""
+    command_safety_enabled: bool = True
+    deny_patterns: list[str] | None = None  # None = use safety.DEFAULT_DENY_PATTERNS
+
+
 class SubagentConfig(BaseModel):
     enabled: bool = True
     max_workers: int = 4    # concurrent subagent calls; raise this against vLLM
@@ -181,6 +191,7 @@ class MistConfig(BaseModel):
     mission: MissionConfig = Field(default_factory=MissionConfig)
     artifacts: ArtifactConfig = Field(default_factory=ArtifactConfig)
     summarizer: SummarizerLLMConfig = Field(default_factory=SummarizerLLMConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @property
     def history_file(self) -> Path:

@@ -50,8 +50,13 @@ def _parse_skills_option(values: list[str] | None) -> list[str] | None:
 
 def _build_agent(config_path: str | None, backend: str | None,
                  model: str | None, base_url: str | None,
-                 preload_skills: list[str] | None = None) -> MistAgent:
+                 preload_skills: list[str] | None = None,
+                 yolo: bool = False) -> MistAgent:
     cfg = _apply_overrides(load_config(config_path), backend, model, base_url)
+    if yolo:
+        cfg.security.command_safety_enabled = False
+        console.print("[yellow]--yolo: command-safety gate disabled for this run — "
+                      "shell commands run with no pre-execution safety check.[/]")
 
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
                     cfg.generation.temperature, cfg.generation.max_tokens,
@@ -120,6 +125,7 @@ def _build_agent(config_path: str | None, backend: str | None,
         artifact_config=cfg.artifacts,
         structured_tools_config=cfg.tools.structured,
         tool_compressor=tool_compressor,
+        security_config=cfg.security,
     )
     return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,
                      tool_compressor=tool_compressor, preload_skills=preload_skills)
@@ -213,9 +219,11 @@ def chat(config: str = typer.Option(None, help="Path to config.yaml"),
          base_url: str = typer.Option(None),
          skills: list[str] = typer.Option(None, "--skills", "-s",
                                           help="Preload one or more skills for the session "
-                                               "(repeat flag or comma-separate)")):
+                                               "(repeat flag or comma-separate)"),
+         yolo: bool = typer.Option(False, "--yolo",
+                                   help="Bypass the command-safety gate (use at your own risk)")):
     """Interactive chat session."""
-    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills), yolo)
     _print_welcome(agent)
     history_path = agent.cfg.history_file
     if readline is not None:
@@ -262,9 +270,11 @@ def ask(prompt: str,
         base_url: str = typer.Option(None),
         skills: list[str] = typer.Option(None, "--skills", "-s",
                                          help="Preload one or more skills for this call "
-                                              "(repeat flag or comma-separate)")):
+                                              "(repeat flag or comma-separate)"),
+        yolo: bool = typer.Option(False, "--yolo",
+                                  help="Bypass the command-safety gate (use at your own risk)")):
     """One-shot question."""
-    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills), yolo)
     try:
         result = agent.turn(prompt)
     except Exception as exc:
@@ -325,7 +335,9 @@ def tui(config: str = typer.Option(None, help="Path to config.yaml"),
         base_url: str = typer.Option(None),
         skills: list[str] = typer.Option(None, "--skills", "-s",
                                          help="Preload one or more skills for the session "
-                                              "(repeat flag or comma-separate)")):
+                                              "(repeat flag or comma-separate)"),
+        yolo: bool = typer.Option(False, "--yolo",
+                                  help="Bypass the command-safety gate (use at your own risk)")):
     """Full-screen streaming TUI: live token streaming, queued messages,
     Ctrl+C to interrupt the current turn (Ctrl+Q to quit)."""
     try:
@@ -334,7 +346,7 @@ def tui(config: str = typer.Option(None, help="Path to config.yaml"),
         console.print("[red]The TUI needs the optional `textual` dependency:[/] "
                       "pip install 'mist-agent[tui]'")
         raise typer.Exit(1) from exc
-    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills), yolo)
     MistTUI(agent).run()
 
 
