@@ -225,7 +225,11 @@ class MistConfig(BaseModel):
         return tuple(Path(os.path.expanduser(p)) for p in self.workspace.extra_roots)
 
 
-def load_config(path: str | None = None) -> MistConfig:
+def resolve_config_path(path: str | None = None) -> Path | None:
+    """The file load_config() would actually read, or None if none of the
+    candidates exist (meaning built-in defaults are in effect) — shared
+    with `mist config path`/`mist config edit` so they don't duplicate or
+    drift from load_config()'s own candidate order."""
     candidates = [path] if path else [
         os.environ.get("MIST_CONFIG"),
         os.path.expanduser("~/.mist/config.yaml"),
@@ -233,7 +237,14 @@ def load_config(path: str | None = None) -> MistConfig:
     ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
-            with open(candidate, "r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
-            return MistConfig(**data)
+            return Path(candidate)
+    return None
+
+
+def load_config(path: str | None = None) -> MistConfig:
+    resolved = resolve_config_path(path)
+    if resolved is not None:
+        with open(resolved, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return MistConfig(**data)
     return MistConfig()

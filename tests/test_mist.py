@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import zipfile
@@ -11,7 +12,8 @@ import pytest
 from mist import backup as backup_module
 from mist import doctor as doctor_module
 from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig,
-                         ShellSSHConfig, StructuredToolsConfig)
+                         ShellSSHConfig, StructuredToolsConfig, load_config,
+                         resolve_config_path)
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
@@ -1319,6 +1321,45 @@ def test_restore_backup_honors_target_overrides(tmp_path, monkeypatch):
 
     assert restored["mist_home"] == 1
     assert (new_home / "config.yaml").read_text(encoding="utf-8") == "backend: ollama"
+
+
+# -- config resolution (mist.config.resolve_config_path / load_config) -----
+
+def test_resolve_config_path_returns_explicit_path_when_it_exists(tmp_path):
+    path = tmp_path / "custom.yaml"
+    path.write_text("backend: ollama", encoding="utf-8")
+    assert resolve_config_path(str(path)) == path
+
+
+def test_resolve_config_path_returns_none_for_explicit_nonexistent_path(tmp_path):
+    assert resolve_config_path(str(tmp_path / "nope.yaml")) is None
+
+
+def test_resolve_config_path_falls_back_to_mist_config_env_var(tmp_path, monkeypatch):
+    path = tmp_path / "from_env.yaml"
+    path.write_text("backend: ollama", encoding="utf-8")
+    monkeypatch.setenv("MIST_CONFIG", str(path))
+    monkeypatch.chdir(tmp_path)  # no cwd-relative config.yaml to compete with it
+    assert resolve_config_path() == path
+
+
+def test_resolve_config_path_returns_none_when_nothing_exists(tmp_path, monkeypatch):
+    monkeypatch.delenv("MIST_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.path.expanduser",
+                        lambda p: str(tmp_path / "no_such_home" / "config.yaml")
+                        if p == "~/.mist/config.yaml" else os.path.expanduser(p))
+    assert resolve_config_path() is None
+
+
+def test_load_config_returns_defaults_when_nothing_resolves(tmp_path, monkeypatch):
+    monkeypatch.delenv("MIST_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.path.expanduser",
+                        lambda p: str(tmp_path / "no_such_home" / "config.yaml")
+                        if p == "~/.mist/config.yaml" else os.path.expanduser(p))
+    cfg = load_config()
+    assert cfg.backend == "ollama"  # the built-in default, untouched
 
 
 def test_shell_captures_stdout_and_stderr_separately_not_merged(monkeypatch):

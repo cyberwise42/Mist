@@ -1,15 +1,18 @@
 """Mist CLI."""
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 
 import typer
+import yaml
 from rich.console import Console
 
 from mist import backup as backup_module
 from mist import doctor as doctor_module
 from mist.banner import BANNER, TAGLINE, help_lines
-from mist.config import load_config
+from mist.config import load_config, resolve_config_path
 from mist.core.agent import MistAgent
 from mist.core.checkpoints import CheckpointStore
 from mist.core.summarizer import BatchSummarizer
@@ -472,6 +475,45 @@ def restore(zip_path: str,
     restored = backup_module.restore_backup(zip_path)
     console.print(f"Restored {restored['mist_home']} file(s) to ~/.mist, "
                  f"{restored['wiki']} file(s) to the wiki root.")
+
+
+config_app = typer.Typer(add_completion=False, help="View and edit configuration")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("show")
+def config_show(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Print the fully-resolved config (file values merged over built-in
+    defaults) as YAML."""
+    cfg = load_config(config)
+    console.print(yaml.dump(cfg.model_dump(), sort_keys=False, default_flow_style=False))
+
+
+@config_app.command("path")
+def config_path(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Print the path to the config file that would actually be loaded,
+    or say so if none exists yet (built-in defaults are in effect)."""
+    resolved = resolve_config_path(config)
+    if resolved is None:
+        console.print("[dim]No config file found — using built-in defaults. "
+                      "Default location: ~/.mist/config.yaml[/]")
+        raise typer.Exit(1)
+    console.print(str(resolved))
+
+
+@config_app.command("edit")
+def config_edit(config: str = typer.Option(None, help="Path to config.yaml")):
+    """Open the config file in $EDITOR. If none exists yet, creates one at
+    ~/.mist/config.yaml pre-filled with the current (default) settings."""
+    resolved = resolve_config_path(config)
+    if resolved is None:
+        resolved = Path(config).expanduser() if config else Path("~/.mist/config.yaml").expanduser()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(yaml.dump(load_config().model_dump(), sort_keys=False,
+                                      default_flow_style=False), encoding="utf-8")
+        console.print(f"[dim]No config file found — created {resolved} with default settings.[/]")
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.run([editor, str(resolved)])
 
 
 if __name__ == "__main__":
