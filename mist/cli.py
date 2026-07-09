@@ -38,8 +38,19 @@ def _apply_overrides(cfg, backend, model, base_url):
     return cfg
 
 
+def _parse_skills_option(values: list[str] | None) -> list[str] | None:
+    """`--skills` accepts either a repeated flag (`-s a -s b`) or
+    comma-separated values (`-s a,b`), matching the flag's own help text —
+    normalizes both into one flat list, or None if nothing was passed."""
+    if not values:
+        return None
+    result = [name.strip() for value in values for name in value.split(",") if name.strip()]
+    return result or None
+
+
 def _build_agent(config_path: str | None, backend: str | None,
-                 model: str | None, base_url: str | None) -> MistAgent:
+                 model: str | None, base_url: str | None,
+                 preload_skills: list[str] | None = None) -> MistAgent:
     cfg = _apply_overrides(load_config(config_path), backend, model, base_url)
 
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
@@ -111,7 +122,7 @@ def _build_agent(config_path: str | None, backend: str | None,
         tool_compressor=tool_compressor,
     )
     return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,
-                     tool_compressor=tool_compressor)
+                     tool_compressor=tool_compressor, preload_skills=preload_skills)
 
 
 def _print_welcome(agent: MistAgent) -> None:
@@ -199,9 +210,12 @@ def _handle_command(cmd: str, agent: MistAgent) -> bool:
 def chat(config: str = typer.Option(None, help="Path to config.yaml"),
          backend: str = typer.Option(None, help="ollama | vllm"),
          model: str = typer.Option(None),
-         base_url: str = typer.Option(None)):
+         base_url: str = typer.Option(None),
+         skills: list[str] = typer.Option(None, "--skills", "-s",
+                                          help="Preload one or more skills for the session "
+                                               "(repeat flag or comma-separate)")):
     """Interactive chat session."""
-    agent = _build_agent(config, backend, model, base_url)
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
     _print_welcome(agent)
     history_path = agent.cfg.history_file
     if readline is not None:
@@ -245,9 +259,12 @@ def ask(prompt: str,
         config: str = typer.Option(None),
         backend: str = typer.Option(None),
         model: str = typer.Option(None),
-        base_url: str = typer.Option(None)):
+        base_url: str = typer.Option(None),
+        skills: list[str] = typer.Option(None, "--skills", "-s",
+                                         help="Preload one or more skills for this call "
+                                              "(repeat flag or comma-separate)")):
     """One-shot question."""
-    agent = _build_agent(config, backend, model, base_url)
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
     try:
         result = agent.turn(prompt)
     except Exception as exc:
@@ -305,7 +322,10 @@ def wiki_init(config: str = typer.Option(None, help="Path to config.yaml"),
 def tui(config: str = typer.Option(None, help="Path to config.yaml"),
         backend: str = typer.Option(None, help="ollama | vllm"),
         model: str = typer.Option(None),
-        base_url: str = typer.Option(None)):
+        base_url: str = typer.Option(None),
+        skills: list[str] = typer.Option(None, "--skills", "-s",
+                                         help="Preload one or more skills for the session "
+                                              "(repeat flag or comma-separate)")):
     """Full-screen streaming TUI: live token streaming, queued messages,
     Ctrl+C to interrupt the current turn (Ctrl+Q to quit)."""
     try:
@@ -314,7 +334,7 @@ def tui(config: str = typer.Option(None, help="Path to config.yaml"),
         console.print("[red]The TUI needs the optional `textual` dependency:[/] "
                       "pip install 'mist-agent[tui]'")
         raise typer.Exit(1) from exc
-    agent = _build_agent(config, backend, model, base_url)
+    agent = _build_agent(config, backend, model, base_url, _parse_skills_option(skills))
     MistTUI(agent).run()
 
 

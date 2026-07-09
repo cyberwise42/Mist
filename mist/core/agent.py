@@ -335,12 +335,19 @@ class MistAgent:
     def __init__(self, config: MistConfig, llm: LLMClient, store: MemoryStore,
                  skills: SkillRouter, tools: ToolRegistry, session_id: int | None = None,
                  process_registry: ProcessRegistry | None = None,
-                 tool_compressor: ToolOutputCompressor | None = None):
+                 tool_compressor: ToolOutputCompressor | None = None,
+                 preload_skills: list[str] | None = None):
         self.cfg = config
         self.llm = llm
         self.store = store
         self.skills = skills
         self.tools = tools
+        # `mist tui --skills a,b` / `-s a -s b`: force these skills' full
+        # bodies into every turn's context for the whole session, bypassing
+        # the router entirely for them — skill routing is otherwise fully
+        # automatic with no way to pin a specific skill. Unknown names are
+        # silently ignored (no skill of that name to preload).
+        self.preload_skills = preload_skills or []
         self.session_id = session_id or store.new_session()
         # Tier 3 of tool-output handling (mist/core/tool_compressor.py): an
         # optional, independently-configured aux model that compresses
@@ -387,12 +394,21 @@ class MistAgent:
         )
 
         skill_section = ""
+        budget_chars = self.cfg.context.token_budget  # rough guard
         candidates = self.skills.route(routing_query, self.cfg.skills.max_candidates)
-        if candidates:
+        if self.preload_skills:
+            by_name = {s.name: s for s in self.skills.skills}
+            preloaded = [by_name[name] for name in self.preload_skills if name in by_name]
+            for skill in preloaded:
+                skill_section += f"\nPreloaded skill ({skill.name}):\n{skill.body()[:budget_chars]}\n"
+            extra = [c for c in candidates if c not in preloaded]
+            if extra:
+                others = "; ".join(f"{s.name}: {s.description}" for s in extra)
+                skill_section += f"Other possibly relevant skills: {others}\n"
+        elif candidates:
             # Load ONLY the top skill's full body; list the rest as one-liners.
             top = candidates[0]
             body = top.body()
-            budget_chars = self.cfg.context.token_budget  # rough guard
             skill_section = f"\nActive skill ({top.name}):\n{body[:budget_chars]}\n"
             if len(candidates) > 1:
                 others = "; ".join(f"{s.name}: {s.description}" for s in candidates[1:])

@@ -292,6 +292,51 @@ def test_skill_routing(tmp_path):
     assert router.route("bake a chocolate cake") == []
 
 
+def _make_agent_with_preload(tmp_path, preload_skills):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter(_isolated_skills_library(tmp_path))
+    tools = default_registry(remember_fn=store.remember)
+    return MistAgent(cfg, FakeLLM([]), store, skills, tools, preload_skills=preload_skills)
+
+
+def test_parse_skills_option_handles_repeat_comma_and_none():
+    from mist.cli import _parse_skills_option
+    assert _parse_skills_option(None) is None
+    assert _parse_skills_option([]) is None
+    assert _parse_skills_option(["a", "b"]) == ["a", "b"]
+    assert _parse_skills_option(["a,b", "c"]) == ["a", "b", "c"]
+    assert _parse_skills_option([" a , b "]) == ["a", "b"]
+
+
+def test_assemble_context_preloads_named_skill_regardless_of_routing_query(tmp_path):
+    # "bake a chocolate cake" is the exact query test_skill_routing asserts
+    # the router itself returns zero hits for — proving the preload really
+    # bypasses routing rather than just getting lucky on keyword overlap.
+    agent = _make_agent_with_preload(tmp_path, ["git-workflow"])
+    _, skill_section, _, _ = agent._assemble_context("bake a chocolate cake")
+    assert "Preloaded skill (git-workflow)" in skill_section
+    assert "commit" in skill_section.lower()  # the real skill body, not a stub
+
+
+def test_assemble_context_preload_not_double_counted_as_router_hit(tmp_path):
+    agent = _make_agent_with_preload(tmp_path, ["git-workflow"])
+    # This query also matches git-workflow via the router (see
+    # test_skill_routing) — the preloaded skill must appear exactly once,
+    # not again in an "Other possibly relevant skills" listing.
+    _, skill_section, _, _ = agent._assemble_context("help me commit my git changes")
+    assert skill_section.count("Preloaded skill (git-workflow)") == 1
+    assert "Other possibly relevant skills" not in skill_section
+
+
+def test_assemble_context_ignores_unknown_preload_names(tmp_path):
+    agent = _make_agent_with_preload(tmp_path, ["not-a-real-skill"])
+    _, skill_section, _, _ = agent._assemble_context("bake a chocolate cake")
+    assert "Preloaded skill" not in skill_section  # nothing valid to preload
+    assert "not-a-real-skill" not in skill_section
+
+
 def test_tool_selection_capped(tmp_path):
     tools = default_registry(remember_fn=lambda c: None)
     selected = tools.select("read a file", max_exposed=2)
@@ -1774,7 +1819,7 @@ def test_chat_repl_survives_llm_failure_via_graceful_turn_result(tmp_path, monke
     monkeypatch.setattr(cli_module.console, "print",
                         lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
 
-    cli_module.chat(config=None, backend=None, model=None, base_url=None)  # must not raise
+    cli_module.chat(config=None, backend=None, model=None, base_url=None, skills=None)  # must not raise
 
     text = "\n".join(printed)
     assert text.count("ERROR: LLM call failed") == 2  # both turns failed gracefully
@@ -1814,7 +1859,7 @@ def test_chat_repl_survives_unexpected_non_llm_exception(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module.console, "print",
                         lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
 
-    cli_module.chat(config=None, backend=None, model=None, base_url=None)  # must not raise
+    cli_module.chat(config=None, backend=None, model=None, base_url=None, skills=None)  # must not raise
 
     text = "\n".join(printed)
     assert text.count("turn crashed") == 2
