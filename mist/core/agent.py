@@ -32,11 +32,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from mist.config import MistConfig
 from mist.core.action import ActionValidationError, DecisionUseTool, parse_decision_action
 from mist.core.checkpoints import CheckpointStore
+from mist.core.context_compressor import ContextCompressor
 from mist.core.debrief import DebriefResult, MissionDebriefer
 from mist.core.mission import MissionControl, MissionEvent
 from mist.core.tool_compressor import ToolOutputCompressor
@@ -222,11 +223,34 @@ def _truncate_tool_output(text: str, budget: int, head_ratio: float = 0.3) -> st
     return text[:head_chars] + marker + text[-tail_chars:]
 
 
-def _fit_budget(messages: list[dict[str, str]], budget: int) -> list[dict[str, str]]:
+def _fit_budget(messages: list[dict[str, str]], budget: int,
+                compress_fn: Callable[[list[dict[str, str]]], str] | None = None
+                ) -> list[dict[str, str]]:
     """Enforce the token budget by dropping oldest history first (never the
-    system prompt at [0] or the current user message at [-1])."""
+    system prompt at [0] or the current user message at [-1]).
+
+    Without `compress_fn`: dropped messages just vanish, with no trace at
+    all. With it: the dropped messages are summarized first and folded
+    into one compact recap message in their place — see
+    ContextConfig.compress_on_overflow. A failure inside compress_fn (or
+    it returning nothing) leaves the drop as-is, same as the uncompressed
+    path; it must never raise out of here."""
+    dropped: list[dict[str, str]] = []
     while sum(_approx_tokens(m["content"]) for m in messages) > budget and len(messages) > 2:
-        messages.pop(1)
+        dropped.append(messages.pop(1))
+    if dropped and compress_fn is not None:
+        try:
+            summary = compress_fn(dropped)
+        except Exception:
+            summary = ""
+        if summary:
+            messages.insert(1, {"role": "user",
+                                "content": f"[Earlier in this conversation]: {summary}"})
+            # The recap itself counts toward budget — if it doesn't fit,
+            # fall back to the plain drop-oldest behavior (which may drop
+            # the recap right back out again, same ceiling either way).
+            while sum(_approx_tokens(m["content"]) for m in messages) > budget and len(messages) > 2:
+                messages.pop(1)
     return messages
 
 
@@ -338,12 +362,17 @@ class MistAgent:
                  process_registry: ProcessRegistry | None = None,
                  tool_compressor: ToolOutputCompressor | None = None,
                  preload_skills: list[str] | None = None,
-                 checkpoint_store: CheckpointStore | None = None):
+                 checkpoint_store: CheckpointStore | None = None,
+                 context_compressor: ContextCompressor | None = None):
         self.cfg = config
         self.llm = llm
         self.store = store
         self.skills = skills
         self.tools = tools
+        # Off by default (see ContextConfig.compress_on_overflow) — when
+        # set, _fit_budget summarizes history it would otherwise silently
+        # drop, instead of it vanishing with no trace.
+        self.context_compressor = context_compressor
         # Off by default (see CheckpointConfig) — when set, snapshots the
         # current workspace directory into a shadow git repo before every
         # shell/write_file call, so a bad mission action can be rolled back.
@@ -371,6 +400,10 @@ class MistAgent:
         # Real token count of the last assembled prompt (via _fit_budget,
         # not a synthetic estimate) — surfaced by the TUI's status line.
         self.last_context_tokens = 0
+
+    @property
+    def _compress_fn(self) -> Callable[[list[dict[str, str]]], str] | None:
+        return self.context_compressor.summarize if self.context_compressor is not None else None
 
     # ------------------------------------------------------------------
     def _assemble_context(self, user_msg: str, routing_query: str | None = None
@@ -493,6 +526,7 @@ class MistAgent:
         messages = _fit_budget(
             [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
             self.cfg.context.token_budget,
+            compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
         )
         self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
 
@@ -572,6 +606,7 @@ class MistAgent:
             [{"role": "system", "content": system}, *history,
              {"role": "user", "content": user_msg}, *tool_context],
             self.cfg.context.token_budget,
+            compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
         )
         self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
         try:
@@ -606,9 +641,14 @@ class MistAgent:
             self._build_decision_system, user_msg, routing_query
         )
         schema = self.tools.decision_schema(exposed)
-        messages = _fit_budget(
+        # A compress_fn (see ContextConfig.compress_on_overflow) can make a
+        # blocking LLM call, so the whole call goes through a thread the
+        # same way the context-assembly step above does.
+        messages = await asyncio.to_thread(
+            _fit_budget,
             [{"role": "system", "content": system}, *history, {"role": "user", "content": user_msg}],
             self.cfg.context.token_budget,
+            compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
         )
         self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
 
@@ -703,10 +743,12 @@ class MistAgent:
                               routing_query: str | None = None
                               ) -> AsyncIterator[TurnEvent]:
         system = await asyncio.to_thread(self._build_answer_system, user_msg, routing_query)
-        messages = _fit_budget(
+        messages = await asyncio.to_thread(
+            _fit_budget,
             [{"role": "system", "content": system}, *history,
              {"role": "user", "content": user_msg}, *(tool_context or [])],
             self.cfg.context.token_budget,
+            compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
         )
         self.last_context_tokens = sum(_approx_tokens(m["content"]) for m in messages)
         chunks: list[str] = []

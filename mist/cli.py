@@ -15,6 +15,7 @@ from mist.banner import BANNER, TAGLINE, help_lines
 from mist.config import load_config, resolve_config_path
 from mist.core.agent import MistAgent
 from mist.core.checkpoints import CheckpointStore
+from mist.core.context_compressor import ContextCompressor
 from mist.core.summarizer import BatchSummarizer
 from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient, compute_max_tokens, compute_num_ctx
@@ -101,17 +102,23 @@ def _build_agent(config_path: str | None, backend: str | None,
     skills = SkillRouter(cfg.skills.library_path, embeddings=embeddings,
                          embedding_threshold=cfg.embeddings.similarity_threshold)
 
+    # Both tool_compressor (tier 3 of tool-output handling) and
+    # context_compressor (ContextConfig.compress_on_overflow) are optional
+    # and independently toggled, but share the same aux-model connection
+    # (config.summarizer) — built once if either is on, rather than
+    # constructing two separate LLMClients for the same backend/model.
     tool_compressor = None
-    if cfg.summarizer.enabled:
-        # Tier 3 of tool-output handling: an independently-configured
-        # second model (same pattern as `embeddings` above), off by
-        # default since tiers 1-2 already cover the tools that actually
-        # blow the budget.
+    context_compressor = None
+    if cfg.summarizer.enabled or cfg.context.compress_on_overflow:
         summarizer_llm = LLMClient(cfg.summarizer.backend, cfg.summarizer.base_url,
                                    cfg.summarizer.model, cfg.summarizer.api_key)
-        tool_compressor = ToolOutputCompressor(summarizer_llm,
-                                               trigger_chars=cfg.summarizer.trigger_chars,
-                                               max_input_chars=cfg.summarizer.max_input_chars)
+        if cfg.summarizer.enabled:
+            tool_compressor = ToolOutputCompressor(summarizer_llm,
+                                                   trigger_chars=cfg.summarizer.trigger_chars,
+                                                   max_input_chars=cfg.summarizer.max_input_chars)
+        if cfg.context.compress_on_overflow:
+            context_compressor = ContextCompressor(summarizer_llm,
+                                                   max_input_chars=cfg.summarizer.max_input_chars)
 
     process_registry = ProcessRegistry()
     tools = default_registry(
@@ -135,7 +142,7 @@ def _build_agent(config_path: str | None, backend: str | None,
     checkpoint_store = CheckpointStore(cfg.checkpoints.base_dir) if cfg.checkpoints.enabled else None
     return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,
                      tool_compressor=tool_compressor, preload_skills=preload_skills,
-                     checkpoint_store=checkpoint_store)
+                     checkpoint_store=checkpoint_store, context_compressor=context_compressor)
 
 
 def _print_welcome(agent: MistAgent) -> None:

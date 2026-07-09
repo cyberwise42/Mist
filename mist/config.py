@@ -14,6 +14,14 @@ class ContextConfig(BaseModel):
     max_tool_output_chars: int = 2000
     max_tool_steps: int = 8  # bound on tool calls per turn; raise for longer chains
                              # (multi-step recon, full llm-wiki ingest) on stronger models
+    compress_on_overflow: bool = False
+    # When token_budget forces history out of the assembled prompt,
+    # _fit_budget (mist/core/agent.py) normally just drops the oldest
+    # messages with no trace at all. When this is on, the dropped messages
+    # are summarized first (via the same aux model as tier 3 tool-output
+    # compression, config.summarizer) and folded into one compact recap
+    # message in their place — off by default: an extra LLM call on every
+    # turn that overflows budget, not free.
 
 
 class MemoryConfig(BaseModel):

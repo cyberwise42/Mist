@@ -17,8 +17,9 @@ from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
-from mist.core.agent import MistAgent, _extract_target
+from mist.core.agent import MistAgent, _extract_target, _fit_budget
 from mist.core.checkpoints import CheckpointStore
+from mist.core.context_compressor import ContextCompressor
 from mist.core.mission import MissionControl
 from mist.core.subagent import run_subagents, run_tool_subagents
 from mist.core.summarizer import BatchSummarizer
@@ -3574,6 +3575,121 @@ def test_extract_target_falls_back_to_host_keyword_without_ip():
 
 def test_extract_target_returns_none_without_ip_or_hostname():
     assert _extract_target("perform a phased pentest on the target") is None
+
+
+# -- context compression (_fit_budget's compress_fn, ContextCompressor) ----
+
+def test_fit_budget_without_compress_fn_drops_oldest_silently():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "x" * 4000},
+        {"role": "user", "content": "y" * 4000},
+        {"role": "user", "content": "current message"},
+    ]
+    result = _fit_budget(list(messages), budget=500)
+    assert result[0]["content"] == "sys"
+    assert result[-1]["content"] == "current message"
+    assert "x" * 4000 not in "".join(m["content"] for m in result)
+
+
+def test_fit_budget_with_compress_fn_folds_dropped_into_recap():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old fact: the target runs FreePBX " + "x" * 400},
+        {"role": "user", "content": "current message"},
+    ]
+    # Budget too tight for the original 400-char message, but roomy enough
+    # for "sys" + "current message" + a short recap once it's dropped.
+    result = _fit_budget(list(messages), budget=30,
+                         compress_fn=lambda dropped: "recap: target runs FreePBX")
+    assert any("recap: target runs FreePBX" in m["content"] for m in result)
+    assert result[0]["content"] == "sys"
+    assert result[-1]["content"] == "current message"
+
+
+def test_fit_budget_compress_fn_receives_exactly_the_dropped_messages():
+    captured = []
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "z" * 4000},
+        {"role": "user", "content": "current message"},
+    ]
+
+    def compress_fn(dropped):
+        captured.extend(dropped)
+        return "summary"
+
+    _fit_budget(list(messages), budget=10, compress_fn=compress_fn)
+    assert len(captured) == 1
+    assert captured[0]["content"] == "z" * 4000
+
+
+def test_fit_budget_compress_fn_exception_falls_back_to_plain_drop():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "x" * 4000},
+        {"role": "user", "content": "current message"},
+    ]
+
+    def raising_compress_fn(dropped):
+        raise RuntimeError("summarizer backend unreachable")
+
+    result = _fit_budget(list(messages), budget=10, compress_fn=raising_compress_fn)
+    assert result[0]["content"] == "sys"
+    assert result[-1]["content"] == "current message"
+    assert len(result) == 2  # nothing inserted; behaves like the no-compress_fn path
+
+
+def test_fit_budget_compress_fn_empty_summary_falls_back_to_plain_drop():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "x" * 4000},
+        {"role": "user", "content": "current message"},
+    ]
+    result = _fit_budget(list(messages), budget=10, compress_fn=lambda dropped: "")
+    assert len(result) == 2
+
+
+def test_fit_budget_without_anything_to_drop_ignores_compress_fn():
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    called = []
+    result = _fit_budget(list(messages), budget=10_000,
+                         compress_fn=lambda dropped: called.append(dropped) or "x")
+    assert called == []
+    assert result == messages
+
+
+def test_context_compressor_uses_llm_and_returns_stripped_summary():
+    compressor = ContextCompressor(FakeLLM(["  a concise recap  "]))
+    summary = compressor.summarize([{"role": "user", "content": "some old message"}])
+    assert summary == "a concise recap"
+
+
+def test_context_compressor_falls_back_to_truncated_text_on_llm_failure():
+    compressor = ContextCompressor(RaisingLLM(), max_input_chars=8000)
+    summary = compressor.summarize([{"role": "user", "content": "a fact worth keeping"}])
+    assert "a fact worth keeping" in summary  # never just silently empty
+
+
+def test_context_compressor_falls_back_when_llm_returns_empty():
+    compressor = ContextCompressor(FakeLLM(["   "]))
+    summary = compressor.summarize([{"role": "user", "content": "important finding"}])
+    assert "important finding" in summary
+
+
+def test_agent_compress_fn_property_reflects_configured_compressor(tmp_path):
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+
+    agent_without = MistAgent(cfg, FakeLLM([]), store, skills, tools)
+    assert agent_without._compress_fn is None
+
+    compressor = ContextCompressor(FakeLLM(["summary"]))
+    agent_with = MistAgent(cfg, FakeLLM([]), store, skills, tools, context_compressor=compressor)
+    assert agent_with._compress_fn == compressor.summarize
 
 
 def test_normalize_tool_call_collapses_varying_literal():
