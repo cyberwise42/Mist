@@ -291,6 +291,97 @@ def test_render_history_clear_bad_session_id_returns_usage(tmp_path):
     assert out.startswith("Usage:")
 
 
+def test_rename_session_updates_title_and_reports_true(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("old title")
+    assert store.rename_session(sid, "new title") is True
+    assert store.list_sessions()[0]["title"] == "new title"
+
+
+def test_rename_session_nonexistent_returns_false(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert store.rename_session(999, "whatever") is False
+
+
+def test_export_session_renders_full_transcript(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("Reactor engagement")
+    store.add_turn(sid, "user", "scan the target")
+    store.add_turn(sid, "assistant", "found port 3000 open")
+    text = store.export_session(sid)
+    assert text is not None
+    assert "Reactor engagement" in text
+    assert "scan the target" in text
+    assert "found port 3000 open" in text
+
+
+def test_export_session_nonexistent_returns_none(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert store.export_session(999) is None
+
+
+def test_export_session_with_zero_turns_is_still_exportable(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("empty session")
+    text = store.export_session(sid)
+    assert text is not None
+    assert "empty session" in text
+
+
+def test_render_history_rename_updates_title(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("old")
+    out = render_history_command(store, f"rename {sid} new title here")
+    assert "Renamed session" in out
+    assert store.list_sessions()[0]["title"] == "new title here"
+
+
+def test_render_history_rename_nonexistent_session(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    out = render_history_command(store, "rename 999 whatever")
+    assert "No session 999" in out
+
+
+def test_render_history_rename_bad_args_returns_usage(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert render_history_command(store, "rename notanumber title").startswith("Usage:")
+    assert render_history_command(store, "rename 1").startswith("Usage:")
+
+
+def test_render_history_export_writes_file_and_reports_path(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session("Reactor")
+    store.add_turn(sid, "user", "hello")
+    dest = tmp_path / "exports" / "out.md"
+    out = render_history_command(store, f"export {sid} {dest}")
+    assert str(dest) in out
+    assert dest.is_file()
+    assert "hello" in dest.read_text(encoding="utf-8")
+
+
+def test_render_history_export_default_path_under_mist_exports(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    sid = store.new_session()
+    store.add_turn(sid, "user", "hi")
+    out = render_history_command(store, f"export {sid}")
+    expected = Path("~/.mist/exports").expanduser() / f"session-{sid}.md"
+    assert str(expected) in out
+    assert expected.is_file()
+    expected.unlink()  # clean up — this one lands outside tmp_path
+
+
+def test_render_history_export_nonexistent_session(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    out = render_history_command(store, "export 999")
+    assert "No session 999" in out
+
+
+def test_render_history_export_bad_args_returns_usage(tmp_path):
+    store = MemoryStore(tmp_path / "m.db")
+    assert render_history_command(store, "export notanumber").startswith("Usage:")
+    assert render_history_command(store, "export").startswith("Usage:")
+
+
 def test_skill_routing(tmp_path):
     router = SkillRouter(_isolated_skills_library(tmp_path))
     hits = router.route("help me commit my git changes")

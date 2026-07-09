@@ -144,6 +144,31 @@ class MemoryStore:
             self.conn.commit()
             return cur.rowcount
 
+    def rename_session(self, session_id: int, title: str) -> bool:
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def export_session(self, session_id: int) -> str | None:
+        """Renders a session's full turn history as markdown, or None if
+        the session doesn't exist at all — a session with zero turns is
+        still validly exportable (an empty transcript), so existence is
+        checked against the sessions table, not the turns returned."""
+        row = self.conn.execute(
+            "SELECT title, created_at FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        title = row["title"] or "(untitled)"
+        lines = [f"# Session {session_id}: {title}", ""]
+        for t in self.all_turns(session_id):
+            lines.append(f"**{t['role']}:** {t['content']}")
+            lines.append("")
+        return "\n".join(lines)
+
     # -- compaction ------------------------------------------------------
     def sessions_to_compact(self, exclude_session_id: int | None,
                              keep_recent: int = 1, min_turns: int = 4) -> list[int]:

@@ -12,6 +12,8 @@ check passes) — `--yes` is the only confirmation mechanism, by design.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from mist.memory.store import MemoryStore
 
 _PREVIEW_CHARS = 80
@@ -61,6 +63,28 @@ def render_memories_command(store: MemoryStore, rest: str) -> str:
 
 def render_history_command(store: MemoryStore, rest: str) -> str:
     parts = rest.split()
+    if parts and parts[0] == "rename":
+        args = parts[1:]
+        if len(args) < 2 or not args[0].isdigit():
+            return "Usage: /history rename <session_id> <new title>"
+        session_id = int(args[0])
+        title = " ".join(args[1:])
+        return (f'Renamed session {session_id} to "{title}".'
+                if store.rename_session(session_id, title)
+                else f"No session {session_id}.")
+    if parts and parts[0] == "export":
+        args = parts[1:]
+        if not args or not args[0].isdigit():
+            return "Usage: /history export <session_id> [path]"
+        session_id = int(args[0])
+        text = store.export_session(session_id)
+        if text is None:
+            return f"No session {session_id}."
+        dest = (Path(args[1]).expanduser() if len(args) > 1
+               else Path("~/.mist/exports").expanduser() / f"session-{session_id}.md")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        return f"Exported session {session_id} to {dest}."
     if parts and parts[0] == "forget":
         if len(parts) != 2 or not parts[1].isdigit():
             return "Usage: /history forget <turn_id>"
