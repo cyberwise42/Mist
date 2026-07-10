@@ -85,13 +85,20 @@ def compute_timeout(max_tokens: int, tokens_per_second: float = 65.0,
 class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,
-                 think: bool = True):
+                 think: bool = True, keep_alive: str | None = None):
         self.backend = backend
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Ollama-only, sent as the request's top-level `keep_alive` (added to
+        # each Ollama payload by `_apply_keep_alive`). Left None the server
+        # uses its own ~5-min default,
+        # which is shorter than a single long tool step — so a slow scan
+        # unloads the model and the next call pays a full cold reload. See
+        # GenerationConfig.keep_alive.
+        self.keep_alive = keep_alive
         # Reasoning-capable models (Qwen3, DeepSeek-R1, ...) emit a <think>
         # block. It's forced off (below) only on schema-constrained calls,
         # where valid JSON is a hard requirement — reasoning there buys little
@@ -132,6 +139,16 @@ class LLMClient:
         if self.num_ctx is not None:
             options["num_ctx"] = self.num_ctx
         return options
+
+    def _apply_keep_alive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Adds the top-level `keep_alive` field to an Ollama request payload
+        when configured. `keep_alive` is a request-level field on /api/chat,
+        NOT an `options` key — a long value (or -1) keeps the model resident in
+        VRAM so a long tool step doesn't trigger a cold reload on the next
+        call. No-op when unset (server default) or on the vLLM backend."""
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+        return payload
 
     def discover_context_length(self, timeout: float = 5.0) -> int | None:
         """Queries Ollama's /api/show for this model's maximum context
@@ -194,7 +211,7 @@ class LLMClient:
         }
         if json_schema is not None:
             payload["format"] = json_schema  # constrained decoding
-        resp = self._client.post(f"{self.base_url}/api/chat", json=payload)
+        resp = self._client.post(f"{self.base_url}/api/chat", json=self._apply_keep_alive(payload))
         resp.raise_for_status()
         return resp.json()["message"]["content"]
 
@@ -261,7 +278,8 @@ class LLMClient:
         }
         if json_schema is not None:
             payload["format"] = json_schema
-        resp = await self._aclient.post(f"{self.base_url}/api/chat", json=payload)
+        resp = await self._aclient.post(f"{self.base_url}/api/chat",
+                                        json=self._apply_keep_alive(payload))
         resp.raise_for_status()
         return resp.json()["message"]["content"]
 
@@ -312,7 +330,7 @@ class LLMClient:
             "options": self._ollama_options(),
         }
         async with self._aclient.stream(
-            "POST", f"{self.base_url}/api/chat", json=payload
+            "POST", f"{self.base_url}/api/chat", json=self._apply_keep_alive(payload)
         ) as resp:
             if think and resp.status_code == 400:
                 body = await resp.aread()

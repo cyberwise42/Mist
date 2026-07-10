@@ -164,6 +164,15 @@ class GenerationConfig(BaseModel):
     max_tokens: int = 1024
     think: bool = True  # reasoning-model <think> traces on the free-text answer step;
                         # forced off regardless on schema-constrained calls (see LLMClient)
+    keep_alive: str | None = None  # Ollama-only: how long to keep the model resident in
+                                    # VRAM between calls (sent as the request's top-level
+                                    # `keep_alive`). Left None, Ollama uses its own default
+                                    # (~5 min), which is SHORTER than a single long tool step
+                                    # (the ssh shell timeout is 480s; a full nuclei scan ~3
+                                    # min) — so a slow scan lets the model unload and the next
+                                    # LLM call pays a full cold reload before it can generate.
+                                    # Accepts Ollama's duration syntax ("30m", "60m") or -1 to
+                                    # pin forever. Ignored by the vLLM backend.
 
 
 class MissionConfig(BaseModel):

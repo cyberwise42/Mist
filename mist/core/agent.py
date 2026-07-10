@@ -400,6 +400,18 @@ class MistAgent:
         # Real token count of the last assembled prompt (via _fit_budget,
         # not a synthetic estimate) — surfaced by the TUI's status line.
         self.last_context_tokens = 0
+        # Turn-scoped memo for _assemble_context. A responding turn assembles
+        # context twice — once for the decision system prompt, once for the
+        # answer system prompt (_stream_answer) — with identical
+        # (user_msg, routing_query). That recomputes tool selection, skill
+        # routing (which can fire an embedding round-trip on a lexical miss),
+        # memory search, and the top skill's full-body disk read, all twice.
+        # Reset to a fresh dict at the START of each turn (see turn()/
+        # astream_turn) so it never spans turns — a memo that outlived the turn
+        # could serve a stale skill/memory selection to a later turn whose
+        # objective happens to route the same way. Every _assemble_context
+        # caller funnels through one of those two turn entrypoints.
+        self._ctx_cache: dict[tuple[str, str | None], tuple] = {}
 
     @property
     def _compress_fn(self) -> Callable[[list[dict[str, str]]], str] | None:
@@ -425,6 +437,9 @@ class MistAgent:
         10.129.30.204" purely on that boilerplate overlap, never letting
         the actually-relevant skill's full body load."""
         routing_query = user_msg if routing_query is None else routing_query
+        cached = self._ctx_cache.get((user_msg, routing_query))
+        if cached is not None:
+            return cached
         exposed = self.tools.select(routing_query, self.cfg.tools.max_exposed,
                                     always=self.always_exposed)
         tool_lines = "\n".join(
@@ -458,7 +473,9 @@ class MistAgent:
         if memories:
             memory_section = "\nRelevant memories:\n" + "\n".join(f"- {m}" for m in memories) + "\n"
 
-        return tool_lines, skill_section, memory_section, exposed
+        result = (tool_lines, skill_section, memory_section, exposed)
+        self._ctx_cache[(user_msg, routing_query)] = result
+        return result
 
     def _checkpoint_before_tool(self, tool_name: str, args: dict) -> None:
         """Snapshots the current workspace directory before a mutating
@@ -520,6 +537,7 @@ class MistAgent:
         than committing to `use_tool` — reliably reproduced across repeated
         attempts with a real target/model, while the two-step decision-only
         schema below did not exhibit it."""
+        self._ctx_cache = {}  # fresh per-turn context memo (see __init__)
         history = self._history()
         system, exposed = self._build_decision_system(user_msg)
         schema = self.tools.decision_schema(exposed)
@@ -633,6 +651,7 @@ class MistAgent:
         `routing_query` (see `_assemble_context`) lets a mission drive
         tool/skill/memory selection off the bare objective instead of the
         full boilerplate-wrapped continue-message."""
+        self._ctx_cache = {}  # fresh per-turn context memo (see __init__)
         history = self._history()
         # Context assembly can make a network call (embedding fallback in
         # skill routing); push it to a thread so a slow/unreachable embedding

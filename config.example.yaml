@@ -86,6 +86,13 @@ generation:
                # tool output/memory/wiki context before answering, with the
                # <think> trace filtered out of the displayed stream; set to
                # false to disable reasoning there too (faster, shallower).
+  # keep_alive: 30m  # Ollama only. How long to keep the model resident in VRAM
+                     # between calls. Unset, Ollama uses its own ~5-min default —
+                     # SHORTER than a single long tool step (the ssh shell timeout
+                     # is 480s; a full nuclei scan ~3 min), so a slow scan unloads
+                     # the model and the next call pays a full cold reload before
+                     # generating. Accepts Ollama duration syntax ("30m", "60m") or
+                     # -1 to pin forever. Trade GPU residency for latency to taste.
 
 mission:
   max_turns: 40         # autonomous turns before a mission force-stops

@@ -67,7 +67,7 @@ def _build_agent(config_path: str | None, backend: str | None,
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
                     cfg.generation.temperature, cfg.generation.max_tokens,
                     timeout=compute_timeout(cfg.generation.max_tokens),
-                    think=cfg.generation.think)
+                    think=cfg.generation.think, keep_alive=cfg.generation.keep_alive)
     # Discover the model's real max context length and explicitly request a
     # matching num_ctx — left unset, Ollama loads the model with whatever
     # its Modelfile/tag defaults to (often much smaller than what Mist
@@ -310,7 +310,7 @@ def compact(config: str = typer.Option(None, help="Path to config.yaml"),
     llm = LLMClient(cfg.backend, cfg.base_url, cfg.model, cfg.api_key,
                     cfg.generation.temperature, cfg.generation.max_tokens,
                     timeout=compute_timeout(cfg.generation.max_tokens),
-                    think=cfg.generation.think)
+                    think=cfg.generation.think, keep_alive=cfg.generation.keep_alive)
     store = MemoryStore(cfg.db_path)
     summarizer = BatchSummarizer(llm, store)
 

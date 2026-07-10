@@ -13,7 +13,7 @@ the cost of one embedding call instead of zero.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from mist.llm.embeddings import EmbeddingClient, cosine_similarity
@@ -25,9 +25,17 @@ class Skill:
     description: str
     path: Path
     category: str = "general"
+    # Lazily-cached file contents. A skill's body is read on every turn it's
+    # the active skill (twice per responding turn before context assembly is
+    # memoized) — the library is static during a session, so the first read
+    # is cached and reused. SkillRouter rebuilds Skill objects on `reload()`,
+    # which drops these caches with them.
+    _body_cache: str | None = field(default=None, repr=False, compare=False)
 
     def body(self) -> str:
-        return self.path.read_text(encoding="utf-8")
+        if self._body_cache is None:
+            self._body_cache = self.path.read_text(encoding="utf-8")
+        return self._body_cache
 
 
 _FRONT = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
