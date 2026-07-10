@@ -175,7 +175,7 @@ class MissionConfig(BaseModel):
                                         # differs, e.g. varying a search query or a grep
                                         # flag) -> auto-pause. Looser signal than the exact
                                         # match above, so it needs more repeats to fire.
-    manual_probe_threshold: int = 4    # consecutive `curl`/`wget` shell calls in a row
+    manual_probe_threshold: int = 8    # consecutive `curl`/`wget` shell calls in a row
                                         # (each to a genuinely different path, so neither
                                         # check above fires) -> auto-pause. A real mission
                                         # hand-guessed at a dozen+ invented API paths one at
