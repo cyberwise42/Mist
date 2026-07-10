@@ -3974,11 +3974,15 @@ async def test_mission_respond_streak_resets_on_tool_call(tmp_path):
 
 
 async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
-    # The reasoning-assisted recovery attempt must actually request thinking
-    # for that one turn (force_think=True), and only that turn — not every
-    # decision, which would make every routine turn needlessly slow (a real
-    # decision call with thinking enabled took ~13s in practice vs
-    # sub-second without).
+    # Two behaviors are asserted by the force_think sequence below:
+    #   1. The opening decision reasons (force_think=True) until the mission
+    #      has made its first tool call — but ONLY the first decision of a turn
+    #      (astream_turn's inner-loop toggle), so turn 1's first call reasons
+    #      and its second (post-tool) call does not.
+    #   2. The stuck-recovery turn also forces thinking on its first decision.
+    # It must NOT force thinking on routine post-action decisions, which would
+    # make each needlessly slow (a real decision call with thinking enabled
+    # took ~13s in practice vs sub-second without).
     class RecordingLLM(ScriptedAsyncLLM):
         def __init__(self, decisions):
             super().__init__(decisions)
@@ -4005,7 +4009,149 @@ async def test_mission_stuck_recovery_enables_thinking_then_reverts(tmp_path):
 
     assert any(e.kind == "recovering" for e in events)
     assert "finished" in [e.kind for e in events]
-    assert llm.force_think_calls == [False, False, True, False, False]
+    assert llm.force_think_calls == [True, False, True, False, False]
+
+
+async def test_mission_first_turn_uses_imperative_framing_not_bare_objective(tmp_path):
+    # Regression: the opening mission turn must get the same "this is not a
+    # request for a plan — take it with a tool right now" framing every later
+    # turn gets, NOT the bare objective. Seeded with the bare objective
+    # ("perform a phased pentest on <host>..."), the opening turn reads like a
+    # request for a plan and the model opens with a prose plan instead of a
+    # tool call — the actual cause of missions stalling at the very first step.
+    captured: dict[str, str] = {}
+
+    class CapturingLLM(ScriptedAsyncLLM):
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            captured.setdefault("first_user", messages[-1]["content"])
+            return self.decisions.pop(0)
+
+    llm = CapturingLLM([
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "done"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent = make_mission_agent(tmp_path, [])
+    agent.llm = llm
+    control = MissionControl()
+
+    _ = [e async for e in agent.astream_mission("get root on 10.10.10.5", control, max_turns=3)]
+
+    first_user = captured["first_user"]
+    assert "get root on 10.10.10.5" in first_user            # objective is present
+    assert "not a request for a plan" in first_user          # ... wrapped in the imperative framing
+    assert first_user.strip() != "get root on 10.10.10.5"    # not the bare objective
+
+
+async def test_mission_forces_think_only_on_first_decision_of_opening_turn(tmp_path):
+    # The opening-turn reasoning must cost exactly ONE forced-think decision,
+    # not one per inner tool-loop step. A mission turn's inner loop can run up
+    # to max_tool_steps decisions; reasoning on all of them (an earlier bug)
+    # made a single opening turn spend minutes per tool call. Here turn 1 makes
+    # two tool calls then responds — only its FIRST decision should force
+    # thinking; the post-tool decisions in the same turn must not.
+    class RecordingLLM(ScriptedAsyncLLM):
+        def __init__(self, decisions):
+            super().__init__(decisions)
+            self.force_think_calls: list[bool] = []
+
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            self.force_think_calls.append(force_think)
+            return self.decisions.pop(0)
+
+    llm = RecordingLLM([
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": "echo a"}}),   # turn 1, decision 1 (first -> think)
+        json.dumps({"action": "use_tool", "tool": "shell",
+                    "arguments": {"command": "echo b"}}),   # turn 1, decision 2 (post-tool -> fast)
+        json.dumps({"action": "respond"}),                  # turn 1, decision 3 (post-tool -> fast)
+        json.dumps({"action": "use_tool", "tool": "finish_objective",
+                    "arguments": {"summary": "ok"}}),       # turn 2 (already acted -> fast)
+        json.dumps({"action": "respond"}),                  # turn 2, second inner call
+    ])
+    agent = make_mission_agent(tmp_path, [])
+    agent.llm = llm
+    control = MissionControl()
+
+    events = [e async for e in agent.astream_mission("do the thing", control, max_turns=10)]
+
+    assert "finished" in [e.kind for e in events]
+    # Exactly one reasoning pass, on the very first decision of the mission.
+    assert llm.force_think_calls == [True, False, False, False, False]
+
+
+async def test_stream_aborts_runaway_thinking_with_no_content():
+    # Part B guard: a reasoning model can emit only "thinking" and never reach
+    # "content", burning its whole (minutes-sized) max_tokens budget producing
+    # nothing. With stream_no_content_timeout set, the stream must abort early
+    # with an explanatory message instead of waiting out the full budget.
+    client = LLMClient("ollama", "http://fake", "m", stream_no_content_timeout=0.02)
+
+    class _FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            # Thinking-only lines, never any content, with gaps so wall-clock
+            # elapses well past the tiny timeout.
+            for _ in range(5):
+                await asyncio.sleep(0.05)
+                yield json.dumps({"message": {"thinking": "reasoning..."}})
+
+    class _FakeStreamCtx:
+        async def __aenter__(self):
+            return _FakeResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def fake_stream(method, url, json=None):
+        return _FakeStreamCtx()
+
+    client._aclient.stream = fake_stream
+    chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
+    joined = "".join(chunks)
+    assert "aborted a runaway reasoning pass" in joined  # the guard fired
+    assert "reasoning..." not in joined                  # raw thinking never leaked as content
+    await client.aclose()
+
+
+async def test_stream_no_content_timeout_unset_does_not_abort():
+    # Default (None) must preserve prior behavior: no early abort. A short
+    # thinking-only stream that ends on its own should yield the existing
+    # "ran out of tokens while thinking" message, not the runaway-abort one.
+    client = LLMClient("ollama", "http://fake", "m")  # stream_no_content_timeout defaults None
+
+    class _FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            yield json.dumps({"message": {"thinking": "reasoning..."}})
+            yield json.dumps({"message": {"content": ""}, "done": True})
+
+    class _FakeStreamCtx:
+        async def __aenter__(self):
+            return _FakeResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    client._aclient.stream = lambda method, url, json=None: _FakeStreamCtx()
+    joined = "".join([c async for c in client.astream([{"role": "user", "content": "hi"}])])
+    assert "ran out of tokens" in joined
+    assert "aborted a runaway reasoning pass" not in joined
+    await client.aclose()
 
 
 async def test_mission_nudge_recaps_prior_tool_findings(tmp_path):

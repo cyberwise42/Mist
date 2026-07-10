@@ -678,13 +678,23 @@ class MistAgent:
         # final worded reply is grounded in what the tools actually returned,
         # instead of being generated blind to its own actions this turn.
         tool_context: list[dict[str, str]] = []
+        # force_think nudges the decision toward committing to a tool instead
+        # of narrating a plan — but only the FIRST decision of the turn needs
+        # it. Once a tool has run this turn, the follow-on decisions in the
+        # same inner loop revert to fast, non-reasoning mode. Combined with the
+        # mission loop only setting force_think until it has acted at all, this
+        # costs exactly one reasoning pass at mission start to get a broad
+        # objective moving, without the per-inner-call slowdown that reasoning
+        # across the whole (up to max_tool_steps-long) turn caused.
+        acted_this_turn = False
         for _ in range(self.cfg.context.max_tool_steps):
             raw_action = None
             last_error: Exception | None = None
             for _attempt in range(MAX_DECISION_RETRIES):
                 try:
-                    raw = await self.llm.acomplete(messages, json_schema=schema,
-                                                   force_think=force_think)
+                    raw = await self.llm.acomplete(
+                        messages, json_schema=schema,
+                        force_think=force_think and not acted_this_turn)
                 except Exception as exc:  # network/backend errors: retry, don't crash
                     last_error = exc
                     continue
@@ -728,6 +738,7 @@ class MistAgent:
                 continue
 
             args = action.arguments
+            acted_this_turn = True  # later decisions this turn skip forced reasoning
             yield TurnEvent(kind="tool_start", tool=tool.name, detail=json.dumps(args))
             await asyncio.to_thread(self._checkpoint_before_tool, tool.name, args)
             try:
@@ -874,8 +885,19 @@ class MistAgent:
         try:
             start = time.monotonic()
             turns = 0
-            user_msg = objective
-            routing_query = objective
+            # Seed the FIRST turn with the same imperative continue-framing
+            # every later turn gets (line ~1161), not the bare objective. The
+            # bare objective ("perform a phased pentest on <host>...") reads
+            # like a request for a plan, so the opening turn — the most
+            # narration-prone of the whole mission — was the ONE turn that
+            # never got MISSION_CONTINUE_TEMPLATE's "this is not a request for
+            # a plan — take it with a tool right now" instruction. That framing
+            # gap, not a lack of reasoning, is what made missions open with a
+            # prose plan instead of a tool call. routing_query stays the bare
+            # objective (the boilerplate must not drive skill/tool routing —
+            # see _assemble_context / _mission_routing_query).
+            user_msg = _mission_continue_message(objective, [])
+            routing_query = _mission_routing_query(objective, [])
             last_signature: str | None = None
             occurrences = 0
             near_dup_signature: str | None = None
@@ -885,13 +907,21 @@ class MistAgent:
             mission_findings: list[str] = []
             next_turn_think = False
             recovered_once = False
+            # Reason on the opening decision until the mission has made its
+            # first tool call, then run fast. astream_turn applies this only to
+            # the first decision of each turn (before any tool runs that turn),
+            # so in practice this is a single reasoning pass at mission start —
+            # enough to get a broad objective ("pentest <host>") to commit to a
+            # use_tool action instead of narrating a plan, without reasoning on
+            # every one of a turn's (up to max_tool_steps) inner decisions.
+            mission_has_acted = False
 
             while True:
                 await control.wait_while_paused()
 
                 turns += 1
                 yield MissionEvent(kind="turn_start", text=f"turn {turns}")
-                use_think = next_turn_think
+                use_think = next_turn_think or not mission_has_acted
                 next_turn_think = False
                 finished = False
                 stuck = False
@@ -968,6 +998,7 @@ class MistAgent:
                 if not finished and error_text is None:
                     if tool_called_this_turn:
                         respond_streak = 0
+                        mission_has_acted = True  # opening decisions now run fast
                     elif not stuck:
                         # A turn that ends in "respond" with no tool call at
                         # all is invisible to every check above — they're all

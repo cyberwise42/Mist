@@ -93,6 +93,12 @@ generation:
                      # the model and the next call pays a full cold reload before
                      # generating. Accepts Ollama duration syntax ("30m", "60m") or
                      # -1 to pin forever. Trade GPU residency for latency to taste.
+  # stream_no_content_timeout: 120  # seconds. Abort a streamed answer that has "thought"
+                     # this long without emitting any visible content, returning a short
+                     # message instead of stalling. Guards a runaway <think>: a reasoning
+                     # model can burn its whole max_tokens budget thinking and never reach
+                     # an answer — at a minutes-sized max_tokens that's a multi-minute stall
+                     # producing nothing. Unset (default) = wait out the full token budget.
 
 mission:
   max_turns: 40         # autonomous turns before a mission force-stops

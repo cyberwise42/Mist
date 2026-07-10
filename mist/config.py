@@ -173,6 +173,15 @@ class GenerationConfig(BaseModel):
                                     # LLM call pays a full cold reload before it can generate.
                                     # Accepts Ollama's duration syntax ("30m", "60m") or -1 to
                                     # pin forever. Ignored by the vLLM backend.
+    stream_no_content_timeout: float | None = None  # seconds; guards the streamed answer step
+                                    # against a runaway <think>. A reasoning model can spend its
+                                    # whole (large) max_tokens budget "thinking" and never emit a
+                                    # visible answer — with max_tokens sized for minutes of
+                                    # reasoning that's a multi-minute stall producing nothing. When
+                                    # set, the stream aborts if no visible content has appeared
+                                    # within this many seconds and returns a short explanatory
+                                    # message instead. None (default) = no guard, wait for the full
+                                    # token budget to run out (prior behavior).
 
 
 class MissionConfig(BaseModel):

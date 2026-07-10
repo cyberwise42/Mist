@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, AsyncIterator
 
 import httpx
@@ -85,7 +86,8 @@ def compute_timeout(max_tokens: int, tokens_per_second: float = 65.0,
 class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,
-                 think: bool = True, keep_alive: str | None = None):
+                 think: bool = True, keep_alive: str | None = None,
+                 stream_no_content_timeout: float | None = None):
         self.backend = backend
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -99,6 +101,11 @@ class LLMClient:
         # unloads the model and the next call pays a full cold reload. See
         # GenerationConfig.keep_alive.
         self.keep_alive = keep_alive
+        # Seconds before a streamed answer that has produced no visible content
+        # (a runaway <think> that never reaches an answer) is aborted with an
+        # explanatory message. None = off (wait for the full token budget). See
+        # GenerationConfig.stream_no_content_timeout and `_astream_ollama`.
+        self.stream_no_content_timeout = stream_no_content_timeout
         # Reasoning-capable models (Qwen3, DeepSeek-R1, ...) emit a <think>
         # block. It's forced off (below) only on schema-constrained calls,
         # where valid JSON is a hard requirement — reasoning there buys little
@@ -356,6 +363,8 @@ class LLMClient:
             # with a bare "(empty response)" and no clue why.
             saw_thinking = False
             saw_content = False
+            aborted_runaway = False
+            start = time.monotonic()
             async for line in resp.aiter_lines():
                 line = line.strip()
                 if not line:
@@ -370,7 +379,24 @@ class LLMClient:
                     yield content
                 if obj.get("done"):
                     break
-            if saw_thinking and not saw_content:
+                # Runaway-<think> guard: a reasoning model can spend its whole
+                # (large) max_tokens budget thinking and never reach "content",
+                # which at minutes-of-reasoning budgets is a multi-minute stall
+                # producing nothing. If no visible content has appeared within
+                # the configured window, stop reading (which cancels the
+                # request) rather than waiting out the full budget. Only bites
+                # while still content-less, so it never truncates a real answer
+                # that has already started streaming.
+                if (self.stream_no_content_timeout is not None and not saw_content
+                        and (time.monotonic() - start) > self.stream_no_content_timeout):
+                    aborted_runaway = True
+                    break
+            if aborted_runaway:
+                yield (f"[Mist: no visible answer after {self.stream_no_content_timeout:.0f}s of "
+                      "\"thinking\" — aborted a runaway reasoning pass. Lower generation."
+                      "max_tokens, set generation.think: false, or raise generation."
+                      "stream_no_content_timeout if it genuinely needs longer.]")
+            elif saw_thinking and not saw_content:
                 yield ("[Mist: the model ran out of tokens while still \"thinking\" and "
                       "never produced a visible answer. Try raising generation.max_tokens, "
                       "or set generation.think: false for a more concise reply.]")
