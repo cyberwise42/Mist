@@ -340,7 +340,17 @@ def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
         return (_finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
                + "\nERROR: command was killed by the operator")
     if not out and not err:
-        return "(no output)"
+        # Disambiguate an empty result by exit status. A bare "(no output)"
+        # can't distinguish "the command ran fine and simply printed nothing"
+        # from "the command (or the last stage of a pipe) failed / found no
+        # match" — a real mission read empty grep results as a nothing and
+        # re-tried variations of the same probe instead of treating the
+        # path/pattern as a dead end. A non-zero status on a filter like grep
+        # usually means "no match", which is the signal to change approach.
+        rc = proc.returncode
+        if rc:
+            return f"(no output; command exited with status {rc} — e.g. a grep/filter that matched nothing)"
+        return "(no output; command exited 0 — ran successfully but printed nothing)"
     return _finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
 
 

@@ -68,7 +68,9 @@ def _build_agent(config_path: str | None, backend: str | None,
                     cfg.generation.temperature, cfg.generation.max_tokens,
                     timeout=compute_timeout(cfg.generation.max_tokens),
                     think=cfg.generation.think, keep_alive=cfg.generation.keep_alive,
-                    stream_no_content_timeout=cfg.generation.stream_no_content_timeout)
+                    stream_no_content_timeout=cfg.generation.stream_no_content_timeout,
+                    decision_max_tokens=cfg.generation.decision_max_tokens,
+                    stream_max_content_tokens=cfg.generation.stream_max_content_tokens)
     # Discover the model's real max context length and explicitly request a
     # matching num_ctx — left unset, Ollama loads the model with whatever
     # its Modelfile/tag defaults to (often much smaller than what Mist
@@ -312,7 +314,9 @@ def compact(config: str = typer.Option(None, help="Path to config.yaml"),
                     cfg.generation.temperature, cfg.generation.max_tokens,
                     timeout=compute_timeout(cfg.generation.max_tokens),
                     think=cfg.generation.think, keep_alive=cfg.generation.keep_alive,
-                    stream_no_content_timeout=cfg.generation.stream_no_content_timeout)
+                    stream_no_content_timeout=cfg.generation.stream_no_content_timeout,
+                    decision_max_tokens=cfg.generation.decision_max_tokens,
+                    stream_max_content_tokens=cfg.generation.stream_max_content_tokens)
     store = MemoryStore(cfg.db_path)
     summarizer = BatchSummarizer(llm, store)
 

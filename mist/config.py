@@ -173,6 +173,27 @@ class GenerationConfig(BaseModel):
                                     # LLM call pays a full cold reload before it can generate.
                                     # Accepts Ollama's duration syntax ("30m", "60m") or -1 to
                                     # pin forever. Ignored by the vLLM backend.
+    decision_max_tokens: int | None = 2048  # num_predict cap for the constrained tool-DECISION
+                                    # call specifically, separate from max_tokens (which sizes
+                                    # the free-text answer step). A decision emits a tiny JSON
+                                    # action, so it never needs a big budget — but a forced-think
+                                    # decision (the mission opening-turn reasoning) runs think-ON
+                                    # and, inheriting a large max_tokens, could reason for the
+                                    # full budget (~10 min at max_tokens: 40000) UNGUARDED: the
+                                    # decision call is non-streaming, so stream_no_content_timeout
+                                    # (which only covers the streamed answer step) can't bound it.
+                                    # Effective cap is min(this, max_tokens); a non-thinking
+                                    # decision is unaffected (it stops at the JSON either way).
+                                    # None = no separate cap (use max_tokens).
+    stream_max_content_tokens: int | None = None  # hard cap on VISIBLE answer content in a
+                                    # streamed reply (approx, ~4 chars/token). Distinct from
+                                    # stream_no_content_timeout (which catches a reply producing
+                                    # NOTHING): this catches one producing too MUCH — e.g. a
+                                    # mission turn that, with no real tool output to report,
+                                    # streamed a long fabricated findings report. num_predict/
+                                    # max_tokens caps TOTAL generation, but that budget also
+                                    # covers reasoning; this bounds the visible answer itself.
+                                    # Aborts with a truncation notice once exceeded. None = off.
     stream_no_content_timeout: float | None = None  # seconds; guards the streamed answer step
                                     # against a runaway <think>. A reasoning model can spend its
                                     # whole (large) max_tokens budget "thinking" and never emit a

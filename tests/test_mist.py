@@ -17,7 +17,7 @@ from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
-from mist.core.agent import MistAgent, _extract_target, _fit_budget
+from mist.core.agent import MistAgent, _extract_target, _findings_recap, _fit_budget
 from mist.core.checkpoints import CheckpointStore
 from mist.core.context_compressor import ContextCompressor
 from mist.core.mission import MissionControl
@@ -3024,6 +3024,35 @@ async def test_aollama_options_includes_num_ctx_when_set():
     await client.acomplete([{"role": "user", "content": "hi"}])
 
 
+def test_decision_num_predict_caps_at_min_of_decision_and_max():
+    c = LLMClient("ollama", "http://fake", "m", max_tokens=40000, decision_max_tokens=4096)
+    assert c._decision_num_predict() == 4096                # capped below the huge answer budget
+    c2 = LLMClient("ollama", "http://fake", "m", max_tokens=1024, decision_max_tokens=4096)
+    assert c2._decision_num_predict() == 1024               # never exceeds the overall budget
+    c3 = LLMClient("ollama", "http://fake", "m", max_tokens=40000)  # decision_max_tokens None
+    assert c3._decision_num_predict() is None               # uncapped -> full max_tokens
+
+
+def test_decision_call_uses_capped_num_predict_but_answer_uses_full():
+    # A schema-constrained decision call must use the small decision cap (so a
+    # forced-think decision can't reason for the full, unguarded max_tokens);
+    # an unconstrained call keeps the full budget for the answer step.
+    seen = {}
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen["constrained" if "format" in body else "free"] = body["options"]["num_predict"]
+        return httpx.Response(200, json={"message": {"content": '{"action": "respond"}'}})
+
+    client = LLMClient("ollama", "http://fake", "m", max_tokens=40000, decision_max_tokens=4096)
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    client.complete([{"role": "user", "content": "hi"}],
+                    json_schema={"type": "object"})            # decision call
+    client.complete([{"role": "user", "content": "hi"}])       # free-text (answer-like) call
+    assert seen["constrained"] == 4096
+    assert seen["free"] == 40000
+
+
 async def test_astream_ollama_options_includes_num_ctx_when_set():
     def handler(request):
         body = json.loads(request.content)
@@ -4154,6 +4183,73 @@ async def test_stream_no_content_timeout_unset_does_not_abort():
     await client.aclose()
 
 
+async def test_stream_truncates_runaway_content_wall():
+    # The content-runaway guard: a reply that streams far more visible content
+    # than a real answer (a fabricated wall of text with no tool output behind
+    # it) must be cut off with a truncation notice, not streamed to the full
+    # token budget. Cap here is 10 tokens (~40 chars).
+    client = LLMClient("ollama", "http://fake", "m", stream_max_content_tokens=10)
+
+    class _FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            # ~40 chars/chunk of "content"; a few of these blow past 10 tokens.
+            for _ in range(20):
+                yield json.dumps({"message": {"content": "fabricated detail about the box, " * 2}})
+
+    class _FakeStreamCtx:
+        async def __aenter__(self):
+            return _FakeResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    client._aclient.stream = lambda method, url, json=None: _FakeStreamCtx()
+    chunks = [c async for c in client.astream([{"role": "user", "content": "hi"}])]
+    joined = "".join(chunks)
+    assert "answer truncated past" in joined            # the guard fired
+    # Cut off early: nowhere near all 20 chunks' worth of content streamed.
+    assert joined.count("fabricated detail about the box") < 20
+
+
+async def test_stream_max_content_tokens_unset_streams_full_answer():
+    # Default (None) must not truncate: a normal multi-chunk answer streams in full.
+    client = LLMClient("ollama", "http://fake", "m")  # stream_max_content_tokens defaults None
+
+    class _FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            yield json.dumps({"message": {"content": "hello "}})
+            yield json.dumps({"message": {"content": "world"}, "done": True})
+
+    class _FakeStreamCtx:
+        async def __aenter__(self):
+            return _FakeResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    client._aclient.stream = lambda method, url, json=None: _FakeStreamCtx()
+    joined = "".join([c async for c in client.astream([{"role": "user", "content": "hi"}])])
+    assert joined == "hello world"
+    assert "truncated" not in joined
+    await client.aclose()
+
+
 async def test_mission_nudge_recaps_prior_tool_findings(tmp_path):
     # Regression case from a real run: after a reasoning-assisted recovery
     # got the model to call a real tool again, it re-ran a scan it already
@@ -4205,6 +4301,43 @@ async def test_mission_nudge_recaps_prior_tool_findings(tmp_path):
     recap_messages = [m for m in llm.seen_user_messages if "Already found this mission" in m]
     assert len(recap_messages) >= 2  # reached both the recovery-stage and pause-stage nudges
     assert all("findme" in m for m in recap_messages)
+
+
+def test_findings_recap_keeps_real_findings_over_a_burst_of_noise():
+    # The exact live regression: a burst of empty/no-output probes must not
+    # evict the substantive findings (nmap ports, discovered version) from the
+    # recap window, or a recovering mission is shown only "(no output)" lines
+    # and re-runs recon it already completed. Substantive results are drawn
+    # from the WHOLE mission, not just the raw last-N entries.
+    findings = [
+        "shell: 22/tcp open ssh; 80/tcp open http; 443/tcp open https",   # nmap (early)
+        "shell: Apache 2.4.6, FreePBX 16.0.38.1 discovered on /ucp",       # version (early)
+        "shell: (no output)",
+        "shell: (no output; command exited with status 1 — e.g. a grep/filter that matched nothing)",
+        "shell: (no output)",
+        "shell: ERROR: command timed out after 480s",
+    ]
+    recap = _findings_recap(findings, max_items=5)
+    assert "22/tcp open ssh" in recap        # early real finding survived the noise burst
+    assert "FreePBX 16.0.38.1" in recap      # early real finding survived the noise burst
+    assert "(no output" not in recap         # empty/no-output results dropped
+    assert "ERROR" not in recap              # errors dropped
+
+
+def test_findings_recap_dedups_identical_entries_and_empty_when_all_noise():
+    assert _findings_recap(["shell: same", "shell: same", "shell: same"]).count("same") == 1
+    assert _findings_recap(["shell: (no output)", "shell: ERROR: boom"]) == ""
+
+
+def test_shell_empty_output_disambiguated_by_exit_status():
+    # A command that prints nothing but exits non-zero (e.g. grep with no
+    # match) must not read as a bare "(no output)" — the model needs to tell a
+    # matchless filter from a plain success, or it re-probes the same dead end.
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    nonzero = tools.get("shell").run(command="grep nomatch /dev/null")
+    assert "no output" in nonzero and "status 1" in nonzero
+    zero = tools.get("shell").run(command="true")
+    assert "no output" in zero and "exited 0" in zero
 
 
 async def test_mission_finish_objective_reachable_even_off_topic(tmp_path):

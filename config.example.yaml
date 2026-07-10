@@ -93,6 +93,19 @@ generation:
                      # the model and the next call pays a full cold reload before
                      # generating. Accepts Ollama duration syntax ("30m", "60m") or
                      # -1 to pin forever. Trade GPU residency for latency to taste.
+  # decision_max_tokens: 2048  # num_predict cap for the constrained tool-decision call,
+                     # separate from max_tokens (the answer step's budget). A decision is a
+                     # tiny JSON action, but a forced-think decision runs think-ON and would
+                     # otherwise reason for the whole max_tokens — and unlike the answer step
+                     # the decision call is non-streaming, so stream_no_content_timeout can't
+                     # bound it. Effective cap = min(this, max_tokens); a non-thinking decision
+                     # is unaffected. Defaults to 2048; None disables the separate cap.
+  # stream_max_content_tokens: 1500  # hard cap on VISIBLE answer content in a streamed reply
+                     # (approx, ~4 chars/token). The mirror of stream_no_content_timeout: that
+                     # catches a reply producing NOTHING, this catches one producing too MUCH —
+                     # e.g. a mission turn that, with no real tool output, streamed a long
+                     # fabricated findings report. Aborts with a truncation notice once exceeded.
+                     # A real answer is far shorter, so it only bites a runaway. None = off.
   # stream_no_content_timeout: 120  # seconds. Abort a streamed answer that has "thought"
                      # this long without emitting any visible content, returning a short
                      # message instead of stalling. Guards a runaway <think>: a reasoning

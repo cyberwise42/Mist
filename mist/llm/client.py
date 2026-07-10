@@ -87,7 +87,9 @@ class LLMClient:
     def __init__(self, backend: str, base_url: str, model: str, api_key: str = "",
                  temperature: float = 0.2, max_tokens: int = 1024, timeout: float = 120.0,
                  think: bool = True, keep_alive: str | None = None,
-                 stream_no_content_timeout: float | None = None):
+                 stream_no_content_timeout: float | None = None,
+                 decision_max_tokens: int | None = None,
+                 stream_max_content_tokens: int | None = None):
         self.backend = backend
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -106,6 +108,18 @@ class LLMClient:
         # explanatory message. None = off (wait for the full token budget). See
         # GenerationConfig.stream_no_content_timeout and `_astream_ollama`.
         self.stream_no_content_timeout = stream_no_content_timeout
+        # num_predict cap for the constrained tool-DECISION call (json_schema
+        # present), separate from the answer step's max_tokens. Bounds a
+        # forced-think decision, which is non-streaming and so escapes the
+        # stream guard. None = uncapped. See GenerationConfig.decision_max_tokens
+        # and `_decision_num_predict`.
+        self.decision_max_tokens = decision_max_tokens
+        # Hard cap on visible answer content streamed in one reply (approx via
+        # ~4 chars/token). Catches a reply that streams too MUCH — a fabricated
+        # wall of text — where stream_no_content_timeout only catches one that
+        # streams nothing. None = off. See GenerationConfig.stream_max_content_tokens
+        # and `_astream_ollama`.
+        self.stream_max_content_tokens = stream_max_content_tokens
         # Reasoning-capable models (Qwen3, DeepSeek-R1, ...) emit a <think>
         # block. It's forced off (below) only on schema-constrained calls,
         # where valid JSON is a hard requirement — reasoning there buys little
@@ -141,11 +155,22 @@ class LLMClient:
     def _effective_think(self) -> bool:
         return self.think and self.model not in self._think_unsupported
 
-    def _ollama_options(self) -> dict[str, Any]:
-        options: dict[str, Any] = {"temperature": self.temperature, "num_predict": self.max_tokens}
+    def _ollama_options(self, max_tokens: int | None = None) -> dict[str, Any]:
+        num_predict = self.max_tokens if max_tokens is None else max_tokens
+        options: dict[str, Any] = {"temperature": self.temperature, "num_predict": num_predict}
         if self.num_ctx is not None:
             options["num_ctx"] = self.num_ctx
         return options
+
+    def _decision_num_predict(self) -> int | None:
+        """num_predict for a schema-constrained DECISION call. A decision emits
+        a tiny JSON action, so it never needs the full answer-step budget — and
+        a forced-think decision would otherwise reason for the whole (unguarded,
+        non-streaming) max_tokens. Capped at min(decision_max_tokens, max_tokens);
+        None when uncapped, which leaves the historical full-budget behavior."""
+        if self.decision_max_tokens is None:
+            return None
+        return min(self.decision_max_tokens, self.max_tokens)
 
     def _apply_keep_alive(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Adds the top-level `keep_alive` field to an Ollama request payload
@@ -214,7 +239,8 @@ class LLMClient:
             # call back in for exactly the moments non-reasoning
             # decision-making has demonstrably failed (stuck-loop recovery).
             "think": self._effective_think() if (force_think or json_schema is None) else False,
-            "options": self._ollama_options(),
+            "options": self._ollama_options(
+                self._decision_num_predict() if json_schema is not None else None),
         }
         if json_schema is not None:
             payload["format"] = json_schema  # constrained decoding
@@ -281,7 +307,8 @@ class LLMClient:
             "messages": messages,
             "stream": False,
             "think": self._effective_think() if (force_think or json_schema is None) else False,
-            "options": self._ollama_options(),
+            "options": self._ollama_options(
+                self._decision_num_predict() if json_schema is not None else None),
         }
         if json_schema is not None:
             payload["format"] = json_schema
@@ -364,6 +391,10 @@ class LLMClient:
             saw_thinking = False
             saw_content = False
             aborted_runaway = False
+            aborted_overlong = False
+            content_chars = 0
+            content_char_cap = (self.stream_max_content_tokens * 4
+                                if self.stream_max_content_tokens is not None else None)
             start = time.monotonic()
             async for line in resp.aiter_lines():
                 line = line.strip()
@@ -376,6 +407,7 @@ class LLMClient:
                 content = message.get("content", "")
                 if content:
                     saw_content = True
+                    content_chars += len(content)
                     yield content
                 if obj.get("done"):
                     break
@@ -391,11 +423,24 @@ class LLMClient:
                         and (time.monotonic() - start) > self.stream_no_content_timeout):
                     aborted_runaway = True
                     break
+                # Runaway-content guard: the opposite failure — a reply that
+                # streams too MUCH. A mission turn with no real tool output to
+                # report streamed a ~30k-token wall of fabricated findings. Once
+                # visible content passes the cap, stop; a real answer is far
+                # shorter, so this only bites a runaway.
+                if content_char_cap is not None and content_chars > content_char_cap:
+                    aborted_overlong = True
+                    break
             if aborted_runaway:
                 yield (f"[Mist: no visible answer after {self.stream_no_content_timeout:.0f}s of "
                       "\"thinking\" — aborted a runaway reasoning pass. Lower generation."
                       "max_tokens, set generation.think: false, or raise generation."
                       "stream_no_content_timeout if it genuinely needs longer.]")
+            elif aborted_overlong:
+                yield (f"\n[Mist: answer truncated past ~{self.stream_max_content_tokens} tokens — "
+                      "a reply this long is almost always a runaway (e.g. fabricated detail with "
+                      "no tool output behind it). Raise generation.stream_max_content_tokens if a "
+                      "genuinely long answer is expected here.]")
             elif saw_thinking and not saw_content:
                 yield ("[Mist: the model ran out of tokens while still \"thinking\" and "
                       "never produced a visible answer. Try raising generation.max_tokens, "

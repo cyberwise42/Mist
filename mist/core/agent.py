@@ -164,22 +164,42 @@ def _mission_continue_message(objective: str, notes: list[str], nudge: str | Non
 
 
 def _findings_recap(findings: list[str], max_items: int = 5) -> str:
-    """A compact recap of the most recent tool results this mission, meant
-    to be appended to a stuck-recovery nudge specifically. Regression case
-    from a real run: after a reasoning-assisted recovery got the model to
-    call a real tool again, it re-ran the exact same `nmap` scan it had
-    already gotten full results from turns earlier — wasteful, but never
-    flagged by any detector, since a different `curl` call in between reset
-    every repeat/near-dup signature. The persisted chat history is supposed
-    to carry this forward, but relies on the model's own free-text summary
-    faithfully restating it every turn — this recap restates the raw
-    findings directly at exactly the moment (a nudge) the model is being
-    asked to pick a genuinely different next step, so it doesn't need to
-    rediscover what it already has."""
-    if not findings:
+    """A compact recap of this mission's SUBSTANTIVE tool results, meant to be
+    appended to a stuck-recovery nudge specifically. Regression case from a
+    real run: after a reasoning-assisted recovery got the model to call a real
+    tool again, it re-ran the exact same `nmap` scan it had already gotten full
+    results from turns earlier — wasteful, but never flagged by any detector,
+    since a different `curl` call in between reset every repeat/near-dup
+    signature. The persisted chat history is supposed to carry this forward,
+    but relies on the model's own free-text summary faithfully restating it
+    every turn — this recap restates the raw findings directly at exactly the
+    moment (a nudge) the model is being asked to pick a genuinely different
+    next step, so it doesn't need to rediscover what it already has.
+
+    Findings are filtered to substantive results and drawn from the WHOLE
+    mission before taking the last `max_items`, not the last `max_items` raw
+    entries. Confirmed live: a stuck mission had spammed a `curl` that returned
+    nothing several times in a row, and the raw last-5 recap was five
+    "(no output)" lines — the real findings (the nmap ports, the discovered
+    version) had scrolled out of the window entirely. The model, shown only
+    noise under "already found", promptly re-ran its initial nmap scan. Empty/
+    no-output results and errors carry nothing worth "not redoing", so they're
+    dropped, and identical entries are collapsed, so a burst of them can't
+    evict the findings that actually matter."""
+    substantive: list[str] = []
+    seen: set[str] = set()
+    for entry in findings:
+        _, _, text = entry.partition(": ")
+        text = text.strip()
+        if not text or text.startswith("(no output") or text.startswith("ERROR"):
+            continue
+        if entry in seen:      # collapse identical repeats
+            continue
+        seen.add(entry)
+        substantive.append(entry)
+    if not substantive:
         return ""
-    recent = findings[-max_items:]
-    lines = "\n".join(f"- {f}" for f in recent)
+    lines = "\n".join(f"- {f}" for f in substantive[-max_items:])
     return f"\n\nAlready found this mission (don't redo these):\n{lines}"
 
 
