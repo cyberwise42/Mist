@@ -933,9 +933,56 @@ def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     assert args[0] == "ssh"
     assert "-p" in args and args[args.index("-p") + 1] == "2222"
     assert "kali@10.0.0.5" in args
-    assert args[-1] == "hostname"
+    assert args[-1] == "bash -c hostname"   # run under bash, not the login shell
     assert captured["timeout"] == 90
     assert captured["shell"] is False
+
+
+def test_run_subprocess_timeout_message_is_actionable():
+    # A timed-out long scanner must return guidance the model can act on — not
+    # just a bare "timed out" — so it re-runs scoped/faster and reads the -o
+    # file rather than restarting the whole scan (session 126: gobuster ran
+    # into the 480s kill and the run was a dead loss).
+    from mist.tools.registry import _run_subprocess
+    out = _run_subprocess("sleep 5", shell=True, timeout=1, registry=None,
+                          command_text="sleep 5")
+    assert "timed out after 1s" in out
+    assert "-t 50" in out                 # suggests more threads
+    assert "-o" in out and "partial" in out  # points at the output file for partial results
+
+
+def test_findings_recap_header_discourages_restarting_earlier_phases():
+    recap = _findings_recap(["shell: 22/tcp open ssh; 80/tcp open http"])
+    assert "Already found this mission" in recap   # unchanged anchor other code/tests rely on
+    assert "FORWARD" in recap and "don't restart" in recap  # anti recon-regression framing
+
+
+def test_shell_ssh_wraps_glob_url_under_bash(monkeypatch):
+    # Regression (session 121): an unquoted query-string URL made the remote
+    # zsh login shell error with "no matches found" (nomatch on ?, *, [)
+    # before curl ran. Wrapping under bash -c passes the unmatched glob through
+    # literally, so the URL survives intact.
+    import shlex as _shlex
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, args, shell, stdout, stderr, text, cwd=None):
+            captured["args"] = args
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", None)
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", FakePopen)
+    shell_cfg = ShellConfig(backend="ssh", ssh=ShellSSHConfig(
+        host="h", user="u", port=22, key_path="", timeout=30))
+    tools = default_registry(remember_fn=lambda c: None, shell_config=shell_cfg)
+    cmd = "curl -sk http://enigma.htb/admin/config.php?display=api"
+    tools.get("shell").run(command=cmd)
+
+    remote = captured["args"][-1]
+    assert remote == f"bash -c {_shlex.quote(cmd)}"   # exact bash wrapping
+    assert "config.php?display=api" in remote          # the ? URL survived intact
 
 
 def test_shell_local_backend_uses_dedicated_workspace_cwd(tmp_path, monkeypatch):
@@ -979,7 +1026,9 @@ def test_shell_ssh_backend_cds_into_workspace_first(monkeypatch):
                              workspace_root="/home/kali/.mist/workspace")
     tools.get("shell").run(command="ls")
 
-    remote_command = captured["args"][-1]
+    import shlex as _shlex
+    assert captured["args"][-1].startswith("bash -c ")      # run under bash, not the login shell
+    remote_command = _shlex.split(captured["args"][-1])[2]   # unwrap the bash -c argument
     assert "cd '/home/kali/.mist/workspace'" in remote_command
     assert remote_command.endswith("&& ls")
 
@@ -1030,7 +1079,8 @@ def test_shell_ssh_backend_follows_mutable_workspace_redirect(monkeypatch):
     tools.workspace.path = Path("/home/kali/Desktop/HTB/10.129.33.21")
     tools.get("shell").run(command="ls")
 
-    remote_command = captured["args"][-1]
+    import shlex as _shlex
+    remote_command = _shlex.split(captured["args"][-1])[2]   # unwrap the bash -c argument
     assert "cd '/home/kali/Desktop/HTB/10.129.33.21'" in remote_command
 
 

@@ -200,7 +200,9 @@ def _findings_recap(findings: list[str], max_items: int = 5) -> str:
     if not substantive:
         return ""
     lines = "\n".join(f"- {f}" for f in substantive[-max_items:])
-    return f"\n\nAlready found this mission (don't redo these):\n{lines}"
+    return ("\n\nAlready found this mission — do NOT repeat any of these; build on them and move "
+            "FORWARD to the next phase, don't restart an earlier one (e.g. don't re-run a port "
+            f"scan you've already completed):\n{lines}")
 
 
 def _mission_routing_query(objective: str, notes: list[str], nudge: str | None = None) -> str:

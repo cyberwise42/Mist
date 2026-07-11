@@ -7,6 +7,7 @@ and constrains the model's output to a single-action schema built from them.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -332,7 +333,12 @@ def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
             proc.kill()
             out, err = proc.communicate()
             return (_finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
-                   + f"\nERROR: command timed out after {timeout:.0f}s")
+                   + f"\nERROR: command timed out after {timeout:.0f}s and was killed. If this was "
+                   "a long scanner (gobuster/ffuf/nuclei/nmap), it likely did NOT finish — re-run "
+                   "it scoped to fit the time budget (more threads e.g. `-t 50`, a smaller "
+                   "wordlist, or fewer templates), not verbatim. If it wrote to an output file "
+                   "(`-o`/`-oA`/`-oN <file>`), read that file — it holds whatever partial results "
+                   "were gathered before the timeout, so you don't need to start the scan over.")
     finally:
         if registry is not None:
             registry.clear()
@@ -433,6 +439,16 @@ def _make_shell(shell_cfg: ShellConfig | None,
             # default to.
             remote_command = (f"mkdir -p '{workspace_path}' 2>/dev/null; "
                               f"cd '{workspace_path}' && {command}")
+        # Run under bash on the remote, not whatever the login shell is. The
+        # default login shell here is zsh, whose `nomatch` option turns an
+        # unquoted glob char (?, *, [) with no matching file into a HARD ERROR
+        # instead of a literal — so `curl 'http://host/x?a=1'` written unquoted
+        # fails with "zsh: no matches found: http://host/x?a=1" before curl
+        # ever runs, silently costing a turn on essentially every query-string
+        # URL. bash (nullglob/failglob off by default) passes an unmatched glob
+        # through literally, which is what these commands expect. Confirmed live
+        # against Enigma (session 121).
+        remote_command = f"bash -c {shlex.quote(remote_command)}"
         args += ["-p", str(ssh.port), f"{ssh.user}@{ssh.host}" if ssh.user else ssh.host,
                 remote_command]
         return _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry,

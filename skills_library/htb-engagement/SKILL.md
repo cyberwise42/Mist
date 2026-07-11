@@ -17,7 +17,14 @@ downloads for this box.
 
 - No live/online brute-forcing (Hydra, Medusa, ffuf against login forms, password spraying).
   Offline hash cracking (John, Hashcat) is fine once hashes are obtained.
-- If a vhost/hostname is discovered, add it to `/etc/hosts` before continuing.
+- If a vhost/hostname is discovered, add it to `/etc/hosts` before continuing — but
+  idempotently, checking the FILE for an existing entry so repeated turns don't append the
+  same host over and over:
+  `grep -qF '<host>' /etc/hosts || echo '<ip> <host>' | sudo tee -a /etc/hosts`
+  Grep `/etc/hosts` itself — NOT an echo of the hostname. `echo '<host>' | grep '<host>'`
+  always matches (it's grepping the string you just echoed, not the file), so it reports
+  "already present" every time and never actually adds the entry, leaving the next `curl`
+  to fail with "Could not resolve host". (Confirmed live, session 121.)
 - Do not look up walkthroughs or writeups for this box online — solve it directly.
 
 ## Continuous documentation (regardless of chat updates)
