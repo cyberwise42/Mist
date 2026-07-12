@@ -484,6 +484,26 @@ def test_parse_json_relaxed_fenced():
     assert obj["action"] == "respond"
 
 
+def test_parse_json_relaxed_repairs_shell_regex_backslashes():
+    # The exact captured failure: a command with regex backslashes (\d, \s)
+    # that are invalid JSON escapes made json.loads reject the whole action,
+    # looping a mission forever on "no valid JSON". They must now be repaired.
+    raw = r'''{ "action": "shell", "command": "grep -oP '^\d+(?=/tcp\s+open)' scan.nmap | paste -sd, -" }'''
+    obj = parse_json_relaxed(raw)
+    assert obj["action"] == "shell"
+    assert r"\d+" in obj["command"] and r"\s+" in obj["command"]  # backslashes preserved literally
+    # more backslash shapes: sed with \. and a path with \w
+    obj2 = parse_json_relaxed(r'{"action":"shell","command":"sed \"s/\./_/g\" && echo C:\Windows\web"}')
+    assert obj2["action"] == "shell" and r"\." in obj2["command"]
+
+
+def test_parse_json_relaxed_preserves_valid_escapes():
+    # Repair must not corrupt legitimately-escaped content (a real newline, a
+    # real backslash, a quote inside the string).
+    obj = parse_json_relaxed(r'{"action":"shell","command":"echo line1\nline2 \\ done \"q\""}')
+    assert obj["command"] == 'echo line1\nline2 \\ done "q"'
+
+
 # -- embedding fallback for skill routing --------------------------------
 
 def test_skill_routing_falls_back_to_embeddings_when_lexical_fails(tmp_path):

@@ -526,10 +526,28 @@ async def _filter_thinking(source: AsyncIterator[str]) -> AsyncIterator[str]:
               "generation.think: false for a more concise reply.]")
 
 
+def _repair_json_escapes(obj: str) -> str:
+    r"""Double any backslash that isn't a valid JSON escape. Small models
+    routinely put a shell/regex command straight into a JSON string —
+    `grep -oP '^\d+(?=/tcp\s+open)'`, a Windows path, `sed 's/\./_/g'` — where
+    `\d`, `\s`, `\.`, `\w` etc. are perfectly valid in the command but ILLEGAL
+    JSON string escapes, so json.loads rejects the whole (otherwise fine)
+    action with 'Invalid \escape'. Confirmed live: a mission looped forever
+    re-emitting the exact same backslash-bearing grep and pausing on 'no valid
+    JSON' each time. Valid escapes (\" \\ \/ \b \f \n \r \t \uXXXX) are left
+    intact — the \\. match consumes backslash-pairs left to right, so a
+    correctly-escaped \\d stays \\d rather than becoming \\\\d."""
+    def repl(m: "re.Match[str]") -> str:
+        esc = m.group(0)
+        return esc if esc[1] in '"\\/bfnrtu' else '\\\\' + esc[1:]
+    return re.sub(r"\\.", repl, obj, flags=re.DOTALL)
+
+
 def parse_json_relaxed(text: str) -> dict[str, Any]:
-    """Parse JSON, tolerating markdown fences and stray <think>...</think>
+    """Parse JSON, tolerating markdown fences, stray <think>...</think>
     reasoning blocks (some models emit these even under constrained decoding,
-    or ignore the `think: false` request entirely)."""
+    or ignore the `think: false` request entirely), and shell/regex backslashes
+    that aren't valid JSON escapes (see `_repair_json_escapes`)."""
     text = _THINK_BLOCK_RE.sub("", text).strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -538,4 +556,11 @@ def parse_json_relaxed(text: str) -> dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
         raise ValueError(f"No JSON object found in model output: {text[:200]!r}")
-    return json.loads(text[start:end + 1])
+    obj = text[start:end + 1]
+    try:
+        return json.loads(obj)
+    except json.JSONDecodeError:
+        # Most common cause on small models: a command with regex/path
+        # backslashes (\d, \s, \.) that are invalid JSON escapes. Repair and
+        # retry once; if it still won't parse, let the error propagate.
+        return json.loads(_repair_json_escapes(obj))
