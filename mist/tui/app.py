@@ -462,6 +462,30 @@ class MistTUI(App):
                     Path(self._mission_log_path),
                 )
                 log.write(f"[dim]{debrief.summary()}[/]")
+        except Exception as exc:
+            # A mission must never vanish silently. Without this, any unhandled
+            # exception escaping astream_mission (e.g. a crash while processing
+            # a tool's output) ended the task with NO operator-visible event and
+            # left "no mission is running" with no clue why — confirmed live
+            # (session 128 died mid-turn, no notification, no diagnostic, the
+            # traceback lost to an unretrieved-task warning on stderr). Surface
+            # it, persist the traceback into the mission log as a durable
+            # terminal marker, and debrief what was accomplished — same shape as
+            # the operator-kill path above.
+            import traceback
+            log.write(f"[{ERROR}]‹ mission ended unexpectedly ›[/] {exc!r}")
+            if self._mission_log_path is not None:
+                self.agent._mission_log_append(
+                    Path(self._mission_log_path),
+                    f"\n**Ended** unexpectedly on an error: {exc!r}\n```\n"
+                    f"{traceback.format_exc()}```\n",
+                )
+                log.write("[dim]Debriefing what was accomplished before the crash…[/]")
+                debrief = await asyncio.to_thread(
+                    self.agent.debrief_mission, objective,
+                    f"ended on an unexpected error: {exc!r}", Path(self._mission_log_path),
+                )
+                log.write(f"[dim]{debrief.summary()}[/]")
         finally:
             typing.update("")
             self._mission_task = None

@@ -2682,6 +2682,42 @@ async def test_tui_mission_runs_autonomously_across_turns(tmp_path):
         assert app._mission_task is None  # cleared once the mission concludes
 
 
+async def test_tui_mission_surfaces_unexpected_crash_not_silently(tmp_path):
+    # Regression (session 128): an unhandled exception escaping astream_mission
+    # ended the mission task with NO operator-visible event — "no mission is
+    # running" with no clue why. It must instead surface a terminal event and
+    # a durable traceback in the mission log, like the operator-kill path.
+    from mist.core.agent import MissionEvent
+
+    agent = make_mission_tui_agent(tmp_path, ScriptedAsyncLLM([json.dumps({"action": "respond"})]))
+    log_path = tmp_path / "mission.md"
+    log_path.write_text("# Mission log\n")
+
+    async def _boom(*a, **k):
+        yield MissionEvent(kind="started", text=str(log_path))
+        raise RuntimeError("kaboom while processing tool output")
+
+    agent.astream_mission = _boom
+    agent.debrief_mission = lambda *a, **k: type("D", (), {"summary": lambda self: "debrief ok"})()
+
+    app = MistTUI(agent)
+    async with app.run_test() as pilot:
+        await pilot.click("#input")
+        for ch in "/mission crash test":
+            await pilot.press(ch)
+        await pilot.press("enter")
+        for _ in range(50):
+            await pilot.pause(0.05)
+            if app._mission_task is None:
+                break
+
+        text = _transcript_text(app)
+        assert "ended unexpectedly" in text            # operator sees a terminal event
+        assert "kaboom" in text                        # ... naming the actual error
+        assert app._mission_task is None               # task cleared, not left dangling
+        assert "kaboom" in log_path.read_text()        # durable traceback persisted to the log
+
+
 async def test_tui_mission_pause_and_resume(tmp_path):
     llm = GatedMissionLLM([
         json.dumps({"action": "respond"}),
