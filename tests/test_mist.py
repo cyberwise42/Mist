@@ -951,6 +951,33 @@ def test_run_subprocess_timeout_message_is_actionable():
     assert "-o" in out and "partial" in out  # points at the output file for partial results
 
 
+def test_run_subprocess_timeout_does_not_hang_when_kill_wont_release_pipes(monkeypatch):
+    # Regression (session 3): a hung SSH/NFS command timed out, but the
+    # post-kill communicate() had NO timeout and blocked forever — the mission
+    # silently stalled for 40+ min with no result and no marker. The second
+    # read is now bounded, so _run_subprocess always returns.
+    import subprocess as _sp
+    calls = {"n": 0}
+
+    class WedgedPopen:
+        def __init__(self, *a, **k):
+            self.returncode = None
+
+        def communicate(self, timeout=None):
+            calls["n"] += 1
+            raise _sp.TimeoutExpired(cmd="x", timeout=timeout or 0)  # both reads "hang"
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr("mist.tools.registry.subprocess.Popen", lambda *a, **k: WedgedPopen())
+    from mist.tools.registry import _run_subprocess
+    out = _run_subprocess("hung-nfs-read", shell=True, timeout=0.1, registry=None,
+                          command_text="hung-nfs-read")
+    assert "timed out" in out    # returns cleanly with the timeout message, no infinite block
+    assert calls["n"] == 2       # initial timed communicate + the now-BOUNDED post-kill one
+
+
 def test_findings_recap_header_discourages_restarting_earlier_phases():
     recap = _findings_recap(["shell: 22/tcp open ssh; 80/tcp open http"])
     assert "Already found this mission" in recap   # unchanged anchor other code/tests rely on

@@ -331,7 +331,17 @@ def _run_subprocess(args: str | list[str], shell: bool, timeout: float,
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, err = proc.communicate()
+            try:
+                out, err = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                # kill() didn't release the pipes within the grace window — e.g.
+                # an SSH command whose remote/NFS side is wedged, leaving a child
+                # holding stdout open. Do NOT fall into an un-timed communicate()
+                # here: a real mission hung for 40+ minutes on a `strings` of an
+                # NFS-mounted file because this second read had no timeout, and
+                # then silently stalled with no result and no marker. Return with
+                # whatever we have instead of blocking the mission forever.
+                out, err = "", ""
             return (_finalize_output(command_text, out or "", err or "", artifacts, structured_cfg)
                    + f"\nERROR: command timed out after {timeout:.0f}s and was killed. If this was "
                    "a long scanner (gobuster/ffuf/nuclei/nmap), it likely did NOT finish — re-run "
