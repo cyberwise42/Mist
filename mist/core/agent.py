@@ -48,6 +48,27 @@ from mist.tools.registry import ProcessRegistry, ToolRegistry
 
 MAX_DECISION_RETRIES = 2
 
+
+def _json_fail_detail(raw: str | None) -> str:
+    """Error text for a decision the model never returned parseable JSON for.
+    Carries the raw output (truncated) so the failure is diagnosable straight
+    from the mission log — the bare "failed to produce valid JSON" it replaced
+    gave zero clue what the model actually emitted (prose? empty? an unclosed
+    <think>? a near-miss shape?), which made a recurring pause-loop impossible
+    to root-cause without live reproduction. Flags the two most common
+    non-JSON shapes explicitly."""
+    if not raw or not raw.strip():
+        return (f"Model produced no valid JSON in {MAX_DECISION_RETRIES + 1} tries — "
+                "output was EMPTY (no content; the whole budget likely went to reasoning).")
+    snippet = raw.strip().replace("\n", " ")
+    if len(snippet) > 500:
+        snippet = snippet[:500] + "…"
+    kind = ""
+    if "<think>" in raw and "</think>" not in raw:
+        kind = " [UNCLOSED <think> — reasoning never reached a JSON action; likely ran out of tokens]"
+    return (f"Model produced no valid JSON in {MAX_DECISION_RETRIES + 1} tries{kind}. "
+            f"Raw output ({len(raw)} chars): {snippet!r}")
+
 DECISION_SYSTEM_TEMPLATE = """You are Mist, an autonomous penetration-testing operator. Follow instructions exactly.
 
 Decide exactly one action and reply with a single JSON object matching this shape:
@@ -722,6 +743,7 @@ class MistAgent:
         for _ in range(self.cfg.context.max_tool_steps):
             raw_action = None
             last_error: Exception | None = None
+            last_raw: str | None = None
             for _attempt in range(MAX_DECISION_RETRIES):
                 try:
                     raw = await self.llm.acomplete(
@@ -730,6 +752,7 @@ class MistAgent:
                 except Exception as exc:  # network/backend errors: retry, don't crash
                     last_error = exc
                     continue
+                last_raw = raw
                 try:
                     raw_action = parse_json_relaxed(raw)
                     break
@@ -741,7 +764,11 @@ class MistAgent:
                 if last_error is not None:
                     yield TurnEvent(kind="error", text=f"LLM call failed: {last_error!r}")
                 else:
-                    yield TurnEvent(kind="error", text="Model failed to produce valid JSON.")
+                    # Include the raw model output so a JSON-parse failure is
+                    # diagnosable from the mission log, not just "failed to
+                    # produce valid JSON" with no clue what it actually emitted
+                    # (prose? empty? an unclosed <think>? a near-miss shape?).
+                    yield TurnEvent(kind="error", text=_json_fail_detail(last_raw))
                 return
 
             try:

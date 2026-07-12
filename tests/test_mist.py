@@ -1033,6 +1033,29 @@ def test_cleanup_mounts_respects_disable_flag():
     assert calls == []
 
 
+def test_json_fail_detail_surfaces_raw_output_for_diagnosis():
+    # A decision that never parses must carry the raw model output into the
+    # error (and thus the mission log), not the old opaque "failed to produce
+    # valid JSON" — so a recurring JSON-error pause is diagnosable without live
+    # repro. Flags empty output and an unclosed <think> explicitly.
+    from mist.core.agent import _json_fail_detail
+
+    assert "EMPTY" in _json_fail_detail("")
+    assert "EMPTY" in _json_fail_detail(None)
+    assert "EMPTY" in _json_fail_detail("   \n  ")
+
+    unclosed = _json_fail_detail("<think>let me reason about which tool to use and")
+    assert "UNCLOSED <think>" in unclosed
+    assert "let me reason" in unclosed
+
+    prose = _json_fail_detail("Sure! First I'll run an nmap scan against the target.")
+    assert "First I'll run an nmap scan" in prose        # the actual raw output is shown
+    assert "no valid JSON" in prose
+
+    long = _json_fail_detail("x" * 2000)
+    assert "…" in long and len(long) < 700               # truncated, not dumping 2000 chars
+
+
 def test_findings_recap_header_discourages_restarting_earlier_phases():
     recap = _findings_recap(["shell: 22/tcp open ssh; 80/tcp open http"])
     assert "Already found this mission" in recap   # unchanged anchor other code/tests rely on
