@@ -9,7 +9,13 @@ def format_tool_call(tool: str, detail: str, max_len: int = 64) -> str:
     """Renders a compact `tool(key=value, ...)` summary instead of dumping
     `detail`'s raw JSON — falls back to `tool(...)` on anything unparseable.
     `detail`'s contract (a JSON args string, see agent.py's TurnEvent) is
-    unchanged; this is a display-only transform."""
+    unchanged; this is a display-only transform.
+
+    A `shell` tool's `command` is shown IN FULL (never elided): an operator
+    monitors Mist by reading this feed, and a truncated command hides what is
+    actually being run against the target. The TUI log wraps (wrap=True), so a
+    long command spans lines cleanly. Every other tool/arg stays compact so the
+    feed isn't flooded by e.g. a large write_file body."""
     try:
         args = json.loads(detail) if detail else {}
     except (ValueError, TypeError):
@@ -19,11 +25,12 @@ def format_tool_call(tool: str, detail: str, max_len: int = 64) -> str:
     parts = []
     for k, v in args.items():
         s = str(v).replace("\n", " ")
-        if len(s) > 40:
+        show_full = tool == "shell" and k == "command"
+        if not show_full and len(s) > 40:
             s = s[:37] + "…"
         parts.append(f"{k}={s!r}" if isinstance(v, str) else f"{k}={s}")
     inner = ", ".join(parts)
-    if len(inner) > max_len:
+    if tool != "shell" and len(inner) > max_len:  # shell commands are never capped
         inner = inner[: max_len - 1] + "…"
     return f"{tool}({inner})"
 

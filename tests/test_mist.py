@@ -2493,6 +2493,30 @@ def test_format_tool_call_renders_compact_summary_not_raw_json():
     assert "{" not in out and "}" not in out
 
 
+def test_format_tool_call_shows_full_shell_command_untruncated():
+    # An operator monitoring the feed must see the ENTIRE command being run —
+    # a long shell command must not be elided (the old 37/64-char truncation
+    # hid most of what mist was doing against the target).
+    from mist.tui.render import format_tool_call
+
+    cmd = ("gobuster dir -u http://enigma.htb/ -w /usr/share/wordlists/dirbuster/"
+           "directory-list-2.3-medium.txt -t 50 -o ~/Desktop/HTB/Enigma/gobuster.txt")
+    out = format_tool_call("shell", json.dumps({"command": cmd}))
+    assert cmd in out          # full command present verbatim
+    assert "…" not in out      # nothing elided
+    assert out == f"shell(command={cmd!r})"
+
+
+def test_format_tool_call_still_truncates_non_shell_tool_args():
+    # The full-command exception is scoped to shell; other tools/args stay
+    # compact so a big write_file body doesn't flood the feed.
+    from mist.tui.render import format_tool_call
+
+    big = "x" * 200
+    out = format_tool_call("write_file", json.dumps({"path": "a.md", "content": big}))
+    assert "…" in out and len(out) < 120
+
+
 def test_format_tool_call_falls_back_on_unparseable_detail():
     from mist.tui.render import format_tool_call
 
