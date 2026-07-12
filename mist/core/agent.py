@@ -154,12 +154,22 @@ def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def _mission_continue_message(objective: str, notes: list[str], nudge: str | None = None) -> str:
+def _mission_continue_message(objective: str, notes: list[str], nudge: str | None = None,
+                              findings: list[str] | None = None) -> str:
     msg = MISSION_CONTINUE_TEMPLATE.format(objective=objective)
     if nudge:
         msg = f"{nudge}\n\n{msg}"
     if notes:
         msg += "\n\nOperator note(s) since your last step:\n" + "\n".join(f"- {n}" for n in notes)
+    # Carry the mission's accumulated findings on EVERY continuing turn, not
+    # only stuck-recovery. A mission runs as one long turn whose in-turn work
+    # is never persisted to session history, so when any NEW turn starts
+    # (recovery, error-pause resume, or a normal advance) the history is empty
+    # — and without this recap the model has no record of what it already did
+    # and restarts recon from scratch. Confirmed live: session 129 re-ran its
+    # entire recon after an error-pause + operator /resume, because only the
+    # stuck path carried the recap. Empty/absent findings -> empty string.
+    msg += _findings_recap(findings or [])
     return msg
 
 
@@ -1093,9 +1103,9 @@ class MistAgent:
                                     "actually think through why this specific approach isn't "
                                     "working, then commit to a genuinely different next step — "
                                     "not a minor variation of the same command.")
-                        nudge += _findings_recap(mission_findings)
                         notes = control.pop_notes()
-                        user_msg = _mission_continue_message(objective, notes, nudge)
+                        user_msg = _mission_continue_message(objective, notes, nudge,
+                                                             findings=mission_findings)
                         routing_query = _mission_routing_query(objective, notes, nudge)
                         occurrences = 0
                         near_dup_occurrences = 0
@@ -1135,9 +1145,9 @@ class MistAgent:
                                 f"{stuck_repeat_count} times in a row with no new result — that approach "
                                 "isn't working. Try something different, or explain what you're "
                                 "blocked on if you need the operator's judgment.")
-                    nudge += _findings_recap(mission_findings)
                     notes = control.pop_notes()
-                    user_msg = _mission_continue_message(objective, notes, nudge)
+                    user_msg = _mission_continue_message(objective, notes, nudge,
+                                                         findings=mission_findings)
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     occurrences = 0
                     near_dup_occurrences = 0
@@ -1157,7 +1167,8 @@ class MistAgent:
                     )
                     notes = control.pop_notes()
                     nudge = f"Your previous attempt failed: {error_text}. Try again."
-                    user_msg = _mission_continue_message(objective, notes, nudge)
+                    user_msg = _mission_continue_message(objective, notes, nudge,
+                                                         findings=mission_findings)
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     continue
 
@@ -1195,7 +1206,7 @@ class MistAgent:
                 if tool_called_this_turn:
                     recovered_once = False
                 notes = control.pop_notes()
-                user_msg = _mission_continue_message(objective, notes)
+                user_msg = _mission_continue_message(objective, notes, findings=mission_findings)
                 routing_query = _mission_routing_query(objective, notes)
         finally:
             self.always_exposed.discard("finish_objective")

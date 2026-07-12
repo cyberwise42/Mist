@@ -957,6 +957,27 @@ def test_findings_recap_header_discourages_restarting_earlier_phases():
     assert "FORWARD" in recap and "don't restart" in recap  # anti recon-regression framing
 
 
+def test_mission_continue_message_carries_findings_on_every_path():
+    # Regression (session 129): after an error-pause + operator /resume, the
+    # continuing turn re-ran all its recon because only the stuck path carried
+    # the findings recap. The continue message must now fold findings in on any
+    # path (with or without a nudge), so a resumed turn always knows what it
+    # already accomplished. Empty findings -> no recap.
+    from mist.core.agent import _mission_continue_message
+    findings = ["shell: 22/tcp open ssh; NFS export /srv/nfs/onboarding"]
+
+    plain = _mission_continue_message("get root on host", [], findings=findings)
+    assert "Already found this mission" in plain and "NFS export /srv/nfs/onboarding" in plain
+
+    with_nudge = _mission_continue_message("get root on host", ["check nfs"],
+                                           nudge="Your previous attempt failed. Try again.",
+                                           findings=findings)
+    assert "Try again." in with_nudge and "check nfs" in with_nudge
+    assert "NFS export /srv/nfs/onboarding" in with_nudge   # findings survive alongside a nudge/notes
+
+    assert "Already found" not in _mission_continue_message("obj", [])  # no findings -> no recap
+
+
 def test_shell_ssh_wraps_glob_url_under_bash(monkeypatch):
     # Regression (session 121): an unquoted query-string URL made the remote
     # zsh login shell error with "no matches found" (nomatch on ?, *, [)
