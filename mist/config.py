@@ -228,6 +228,16 @@ class MissionConfig(BaseModel):
                                         # whole token budget still "thinking" and never
                                         # calling a tool, which could otherwise run
                                         # undetected all the way to max_turns/max_seconds.
+    unmount_shares_on_end: bool = True  # SSH backend only: when a mission ends, best-effort
+                                        # force-lazy-unmount the NFS/SMB shares it mounted on
+                                        # the shell host (scoped to /mnt and the engagement
+                                        # workspace tree). Left mounted, they accumulate
+                                        # run-to-run — and a `hard` mount to a target IP that
+                                        # later changes (HTB revert) wedges FOREVER, hanging
+                                        # every subsequent filesystem op that touches it. A
+                                        # real incident: four stale mounts (two to a dead IP)
+                                        # silently poisoned later sessions. Never touches the
+                                        # local machine Mist itself runs on.
 
 
 class MistConfig(BaseModel):

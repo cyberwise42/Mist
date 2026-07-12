@@ -855,6 +855,37 @@ class MistAgent:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(entry)
 
+    def _cleanup_mounts(self) -> None:
+        """Best-effort: force-lazy-unmount NFS/SMB shares the mission left
+        mounted on the SSH shell host, so they don't accumulate run-to-run. A
+        share left mounted survives the mission; a `hard` mount to a target IP
+        that later changes (an HTB revert) then wedges FOREVER, hanging every
+        later filesystem op that touches it — a real incident where four stale
+        mounts (two to a since-dead IP) silently poisoned subsequent sessions.
+
+        Scoped hard for safety: only the SSH backend (never the local machine
+        Mist runs on), only NFS/SMB filesystem types, and only mount points
+        under /mnt or an engagement workspace tree — so it can't unmount a
+        system share. Reads /proc/mounts (which never blocks, unlike df/mount)
+        and uses `umount -f -l` (force+lazy) which detaches even a wedged mount.
+        Fully swallowed: cleanup must never be what fails a finished mission."""
+        if not self.cfg.mission.unmount_shares_on_end:
+            return
+        if getattr(self.cfg.tools.shell, "backend", None) != "ssh":
+            return  # only the dedicated remote shell host, never the local box
+        shell = self.tools.get("shell")
+        if shell is None:
+            return
+        cmd = (
+            r"grep -E ' (nfs|nfs4|cifs|smb3?) ' /proc/mounts 2>/dev/null | awk '{print $2}' "
+            r"| grep -E '(^/mnt/|/Desktop/HTB/|/\.mist/workspace/)' "
+            r'| while read -r m; do umount -f -l "$m" 2>/dev/null; done; true'
+        )
+        try:
+            shell.run(command=cmd)
+        except Exception:
+            pass
+
     def debrief_mission(self, objective: str, status: str, log_path: Path) -> DebriefResult:
         """Deterministically persists whatever a mission accomplished —
         called at every end state (finished, limit hit, or killed) rather
@@ -1210,3 +1241,4 @@ class MistAgent:
                 routing_query = _mission_routing_query(objective, notes)
         finally:
             self.always_exposed.discard("finish_objective")
+            self._cleanup_mounts()

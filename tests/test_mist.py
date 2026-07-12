@@ -978,6 +978,61 @@ def test_run_subprocess_timeout_does_not_hang_when_kill_wont_release_pipes(monke
     assert calls["n"] == 2       # initial timed communicate + the now-BOUNDED post-kill one
 
 
+def _cleanup_agent(backend="ssh", enabled=True):
+    """A bare MistAgent with just enough wired for _cleanup_mounts, plus a fake
+    shell tool that records the commands it's asked to run."""
+    from mist.core.agent import MistAgent
+    from mist.config import MistConfig, ShellConfig, ShellSSHConfig
+    cfg = MistConfig()
+    cfg.mission.unmount_shares_on_end = enabled
+    cfg.tools.shell = (ShellConfig(backend="ssh", ssh=ShellSSHConfig(host="h"))
+                       if backend == "ssh" else ShellConfig(backend="local"))
+    calls: list[str] = []
+
+    class FakeShell:
+        name = "shell"
+
+        def run(self, **kw):
+            calls.append(kw.get("command", ""))
+            return ""
+
+    class FakeTools:
+        def get(self, n):
+            return FakeShell() if n == "shell" else None
+
+    agent = MistAgent.__new__(MistAgent)
+    agent.cfg = cfg
+    agent.tools = FakeTools()
+    return agent, calls
+
+
+def test_cleanup_mounts_unmounts_network_shares_on_ssh_backend():
+    # On mission end (SSH backend), force-lazy-unmount NFS/SMB shares so they
+    # don't accumulate — a stale `hard` mount to a since-changed target IP
+    # wedges every later filesystem op (real incident: four stale mounts).
+    agent, calls = _cleanup_agent(backend="ssh", enabled=True)
+    agent._cleanup_mounts()
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "umount -f -l" in cmd            # force + lazy: detaches even a wedged mount
+    assert "/proc/mounts" in cmd            # reads /proc/mounts (never blocks, unlike df/mount)
+    assert "nfs" in cmd and "/mnt/" in cmd  # scoped to network fs types + engagement paths
+
+
+def test_cleanup_mounts_skips_local_backend():
+    # Must NEVER touch the machine Mist itself runs on — only the dedicated
+    # remote shell host.
+    agent, calls = _cleanup_agent(backend="local", enabled=True)
+    agent._cleanup_mounts()
+    assert calls == []
+
+
+def test_cleanup_mounts_respects_disable_flag():
+    agent, calls = _cleanup_agent(backend="ssh", enabled=False)
+    agent._cleanup_mounts()
+    assert calls == []
+
+
 def test_findings_recap_header_discourages_restarting_earlier_phases():
     recap = _findings_recap(["shell: 22/tcp open ssh; 80/tcp open http"])
     assert "Already found this mission" in recap   # unchanged anchor other code/tests rely on

@@ -117,3 +117,9 @@ mission:
   max_turns: 40         # autonomous turns before a mission force-stops
   max_seconds: 3600     # wall-clock budget before a mission force-stops
   stuck_repeat_threshold: 3  # identical tool+args calls in a row -> auto-pause
+  unmount_shares_on_end: true  # SSH backend only: on mission end, best-effort force-lazy-unmount
+                               # the NFS/SMB shares it mounted on the shell host (scoped to /mnt
+                               # and the engagement workspace). Prevents stale mounts piling up
+                               # run-to-run — a `hard` mount to a target IP that later changes
+                               # (HTB revert) wedges forever and hangs later sessions. Never
+                               # touches the local machine Mist runs on.
