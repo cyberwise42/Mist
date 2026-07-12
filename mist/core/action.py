@@ -14,11 +14,17 @@ diagnostic clue as to what actually went wrong, which is why the parent
 mission just blindly retried the identical call three times before a
 stuck-detector caught it.
 
-This does not change the existing fallback behavior (a schema-deviant
-action still falls through to "respond"/free-text generation, exactly as
-before) — it only makes that fallback an explicit, named case instead of
-an accidental side effect of loose dict access, and gives every call site
-a real `ActionValidationError` with the raw dict attached for logging.
+A genuinely unrecognizable action still falls through to "respond"/free-text
+generation with a real `ActionValidationError` (raw dict attached) — an
+explicit, named case rather than the old accidental side effect of loose dict
+access. But one specific, dominant malformation is now *repaired* rather than
+discarded: a non-reasoning/opening decision reliably puts the TOOL NAME in
+`action` with the args at top level (`{"action": "shell", "command": ...}`)
+instead of `{"action": "use_tool", "tool": "shell", "arguments": {...}}`.
+`_coerce_tool_named_action` coerces that to a proper `use_tool`, so a
+clearly-intended tool call isn't turned into a narrated plan (the exact
+opening-turn mis-route — confirmed across both qwen3.6 models, ~5/5 think-off
+decisions emit this shape).
 
 Two schema shapes, matching `ToolRegistry.decision_schema`/`action_schema`
 in `mist/tools/registry.py`:
@@ -62,7 +68,36 @@ DecisionActionT = Annotated[Union[DecisionRespond, DecisionUseTool], Field(discr
 _decision_adapter: TypeAdapter = TypeAdapter(DecisionActionT)
 
 
+def _coerce_tool_named_action(raw: dict) -> dict:
+    """Repair the most common malformed decision shape. A non-reasoning (or
+    opening-turn) call frequently puts the TOOL NAME directly in `action`, with
+    the arguments at top level or under `arguments`, instead of the schema's
+    `{"action": "use_tool", "tool": "<name>", "arguments": {...}}`:
+
+        {"action": "shell", "command": "nmap -sV ..."}
+        {"action": "finish_objective", "summary": "done"}
+
+    Left un-coerced this fails validation and the loop treats it as "respond"
+    (a narrated plan) — the exact opening-turn mis-route. Coerce it to a real
+    `use_tool` instead. An unknown tool name still fails downstream
+    (`tools.get` -> "Unknown tool", which re-prompts the model), identical to a
+    well-formed `use_tool` with a bad tool name. `respond`/`use_tool` actions
+    and any shape whose `action` isn't a plain string are returned untouched,
+    so they validate (or raise) exactly as before."""
+    if not isinstance(raw, dict):
+        return raw
+    action = raw.get("action")
+    if not isinstance(action, str) or action in ("respond", "use_tool"):
+        return raw
+    tool = raw["tool"] if isinstance(raw.get("tool"), str) else action
+    args = raw.get("arguments")
+    if not isinstance(args, dict):
+        args = {k: v for k, v in raw.items() if k not in ("action", "tool", "arguments")}
+    return {"action": "use_tool", "tool": tool, "arguments": args}
+
+
 def parse_decision_action(raw: dict) -> DecisionRespond | DecisionUseTool:
+    raw = _coerce_tool_named_action(raw)
     try:
         return _decision_adapter.validate_python(raw)
     except ValidationError as exc:

@@ -2171,15 +2171,14 @@ async def test_astream_turn_runs_tool_then_streams_answer(tmp_path):
 
 
 async def test_astream_turn_falls_back_to_respond_on_schema_deviant_action(tmp_path):
-    # Regression case from a real run: a model can emit valid JSON that
-    # matches neither "respond" nor a well-formed "use_tool"
-    # (e.g. {"action": "finish_objective", "summary": "..."} — this schema
-    # has no such top-level action, and no "summary" property). This must
-    # fall through to the same free-text answer path as an explicit
-    # "respond", not error out — unchanged behavior from before Pydantic
-    # validation replaced the old duck-typed dict check.
+    # A model can emit valid JSON that's still structurally invalid — here a
+    # "use_tool" with no `tool`. (A tool-NAMED action like {"action":
+    # "finish_objective", ...} is now repaired to a real use_tool instead — see
+    # test_parse_decision_action_coerces_tool_name_in_action_field.) A shape
+    # that can't be coerced must fall through to the same free-text answer path
+    # as an explicit "respond", not error out.
     llm = GatedAsyncLLM(
-        decisions=[json.dumps({"action": "finish_objective", "summary": "done scanning"})],
+        decisions=[json.dumps({"action": "use_tool"})],  # no tool -> uncoercible, invalid
         streams=[["here's my summary"]],
     )
     agent = make_async_agent(tmp_path, llm)
@@ -2230,10 +2229,11 @@ class RaisingMidStreamLLM:
 
 
 def test_turn_falls_back_to_respond_on_schema_deviant_action(tmp_path):
-    # Same regression case as the astream_turn version, for the sync turn()
-    # path used by `mist chat`/`ask`.
+    # Same as the astream_turn version, for the sync turn() path used by
+    # `mist chat`/`ask`: an uncoercible invalid shape (use_tool with no tool)
+    # degrades to respond. (Tool-named actions now coerce — see the parser test.)
     agent = make_agent(tmp_path, [
-        json.dumps({"action": "finish_objective", "summary": "done scanning"}),
+        json.dumps({"action": "use_tool"}),
         "here's my summary",
     ])
     result = agent.turn("what did you find")
@@ -2887,21 +2887,43 @@ def test_parse_decision_action_defaults_missing_arguments_to_empty_dict():
     assert use_tool.arguments == {}
 
 
-def test_parse_decision_action_rejects_unexpected_action_value():
-    # Regression case from a real run: {"action": "finish_objective", ...}
-    # matches neither "respond" nor "use_tool" — must raise, not silently
-    # coerce into one of them.
-    with pytest.raises(ActionValidationError) as exc_info:
-        parse_decision_action({"action": "finish_objective", "summary": "done"})
-    assert exc_info.value.raw == {"action": "finish_objective", "summary": "done"}
+def test_parse_decision_action_coerces_tool_name_in_action_field():
+    # The dominant malformed shape from a non-reasoning/opening decision: the
+    # TOOL NAME sits in `action` with args at top level. Confirmed ~5/5 on both
+    # qwen3.6 models with think off. Must be coerced to a real use_tool (act),
+    # not raised/narrated. Two arg placements — top-level key and explicit
+    # `arguments` — both repaired.
+    a = parse_decision_action({"action": "shell", "command": "nmap -sV 10.0.0.1"})
+    assert isinstance(a, DecisionUseTool)
+    assert a.tool == "shell" and a.arguments == {"command": "nmap -sV 10.0.0.1"}
+
+    b = parse_decision_action({"action": "finish_objective", "summary": "done"})
+    assert isinstance(b, DecisionUseTool)
+    assert b.tool == "finish_objective" and b.arguments == {"summary": "done"}
+
+    c = parse_decision_action({"action": "shell", "arguments": {"command": "ls"}})
+    assert isinstance(c, DecisionUseTool)
+    assert c.tool == "shell" and c.arguments == {"command": "ls"}
+
+
+def test_parse_decision_action_coercion_leaves_respond_and_use_tool_untouched():
+    # Coercion must only touch tool-named actions — the two valid shapes pass
+    # through exactly as before.
+    assert isinstance(parse_decision_action({"action": "respond"}), DecisionRespond)
+    ut = parse_decision_action({"action": "use_tool", "tool": "shell",
+                                "arguments": {"command": "id"}})
+    assert isinstance(ut, DecisionUseTool) and ut.tool == "shell"
 
 
 def test_parse_decision_action_rejects_use_tool_missing_tool_field():
+    # action == "use_tool" is left untouched by coercion, so a missing `tool`
+    # still raises rather than being silently repaired.
     with pytest.raises(ActionValidationError):
         parse_decision_action({"action": "use_tool"})
 
 
 def test_parse_decision_action_rejects_missing_action_key():
+    # No `action` at all is not a tool-named shape (nothing to coerce) — raises.
     with pytest.raises(ActionValidationError):
         parse_decision_action({"tool": "shell", "arguments": {}})
 
