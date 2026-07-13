@@ -25,6 +25,16 @@ downloads for this box.
   always matches (it's grepping the string you just echoed, not the file), so it reports
   "already present" every time and never actually adds the entry, leaving the next `curl`
   to fail with "Could not resolve host". (Confirmed live, session 121.)
+- **Your attack IP (LHOST / reverse-shell callback / `LHOST=`) is the VPN `tun0` address, NOT
+  your LAN IP.** The target routes back to you over the HTB VPN, so a reverse shell, a
+  `msfvenom`/Metasploit `LHOST`, or a `nc`/`bash -i` callback must use your `tun0` interface IP
+  (the `10.10.x.x`/`10.10.14.x`-style VPN address). `hostname -I | awk '{print $1}'` returns the
+  FIRST interface — your eth0/LAN IP — which the target cannot reach, so the shell never
+  connects. Get the right one explicitly:
+  `ip -4 addr show tun0 2>/dev/null | grep -oP 'inet \K[0-9.]+'`
+  and if the VPN interface isn't literally named `tun0`, fall back to any tunnel interface:
+  `ip -4 -o addr show | awk '$2 ~ /tun|tap|wg/ {print $4}' | cut -d/ -f1 | head -1`.
+  Set `LHOST` to that value; use the same address as the listener bind for `nc -lvnp <port>`.
 - Do not look up walkthroughs or writeups for this box online — solve it directly.
 
 ## Continuous documentation (regardless of chat updates)
