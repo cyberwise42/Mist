@@ -614,6 +614,16 @@ async def test_format_pending_task_stacks_names_a_parked_coroutine():
     assert "parked-mission" not in format_pending_task_stacks(asyncio.all_tasks())
 
 
+def test_effective_stall_threshold_floors_to_shell_timeout():
+    from mist.core.stall_watchdog import effective_stall_threshold
+    # A configured value below the shell timeout is raised above it (+margin) so
+    # a legitimately slow scan running up to the timeout can't trip the watchdog.
+    assert effective_stall_threshold(300.0, 480.0) == 600.0   # floored to 480+120
+    assert effective_stall_threshold(300.0, 60.0) == 300.0    # local backend: config wins
+    assert effective_stall_threshold(900.0, 480.0) == 900.0   # already above floor: unchanged
+    assert effective_stall_threshold(0.0, 480.0) == 0.0       # disabled stays disabled
+
+
 async def test_mission_stall_watchdog_fires_once_per_episode_and_rearms():
     from mist.core.stall_watchdog import mission_stall_watchdog
     fired: list[float] = []

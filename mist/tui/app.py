@@ -35,7 +35,8 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 from mist.banner import help_lines
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
-from mist.core.stall_watchdog import format_pending_task_stacks, mission_stall_watchdog
+from mist.core.stall_watchdog import (effective_stall_threshold, format_pending_task_stacks,
+                                       mission_stall_watchdog)
 from mist.core.summarizer import BatchSummarizer
 from mist.history import HistoryStore
 from mist.tui.memory_commands import render_history_command, render_memories_command
@@ -436,7 +437,13 @@ class MistTUI(App):
         # log if no event arrives for cfg.mission.stall_watchdog_seconds. Purely
         # diagnostic — see mist.core.stall_watchdog.
         self._mission_last_progress = time.monotonic()
-        stall_after = self.agent.cfg.mission.stall_watchdog_seconds
+        # Floor the threshold to the shell timeout (+margin): a slow scan can run
+        # right up to that timeout with no event and is NOT a stall, so firing
+        # below it just cries wolf on healthy long tools.
+        shell_to = (self.agent.cfg.tools.shell.ssh.timeout
+                    if self.agent.cfg.tools.shell.backend == "ssh" else 60)
+        stall_after = effective_stall_threshold(
+            self.agent.cfg.mission.stall_watchdog_seconds, shell_to)
         watchdog = (
             asyncio.create_task(mission_stall_watchdog(
                 lambda: self._mission_last_progress, self._on_mission_stall,

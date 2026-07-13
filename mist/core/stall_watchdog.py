@@ -46,6 +46,19 @@ def format_pending_task_stacks(tasks: Iterable[asyncio.Task]) -> str:
     return "\n".join(out) if out else "(no pending tasks)"
 
 
+def effective_stall_threshold(configured: float, shell_timeout: float,
+                              margin: float = 120.0) -> float:
+    """A tool can legitimately run right up to the shell timeout with no mission
+    event in between (a slow gobuster/nuclei), so a watchdog threshold BELOW
+    that timeout guarantees false-positive "stall" dumps on healthy long scans.
+    Floor the configured value to `shell_timeout + margin` so the watchdog can
+    only fire once a turn has been silent LONGER than any tool could legitimately
+    take — i.e. a genuine wedge. 0 (disabled) passes through unchanged."""
+    if not configured or configured <= 0:
+        return 0.0
+    return max(configured, shell_timeout + margin)
+
+
 async def mission_stall_watchdog(
     get_last_progress: Callable[[], float],
     on_stall: Callable[[float], None],
