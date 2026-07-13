@@ -389,8 +389,62 @@ class MutableWorkspace:
     own directory (not one flat folder every mission/target ever shares).
     `MistAgent.astream_mission` mutates `.path` at mission start once it
     knows the target; every `shell` call after that point picks it up
-    automatically, with no need to reconstruct the tool itself."""
+    automatically, with no need to reconstruct the tool itself.
+
+    `.target_ip` is set the same way and for the same reason: it's the
+    mission's single authorized target, read at call time by the scope guard
+    (see `_scope_violation`) so a `shell` command can't drift to a different
+    host. None outside a mission (or when the objective named no IP), which
+    disables the guard."""
     path: Path | None = None
+    target_ip: str | None = None
+
+
+# An IPv4 used as a recon/enumeration TARGET: the host of an http(s) URL, or a
+# bare address argument to a scanner/enumeration/client binary aimed at it.
+_TARGET_URL_IP_RE = re.compile(r"https?://(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE)
+_TARGET_TOOL_IP_RE = re.compile(
+    r"\b(?:curl|wget|nmap|masscan|showmount|smbclient|smbmap|rpcinfo|enum4linux|"
+    r"nbtscan|nikto|whatweb|wpscan|gobuster|ffuf|feroxbuster|dirb|dirsearch|wfuzz|"
+    r"hydra|medusa|crackmapexec|nxc|snmpwalk|onesixtyone|mount|ftp|tftp|telnet|"
+    r"rsync|ldapsearch|dig|host|nslookup|nc|ncat)\b[^|;&\n]*?"
+    r"(\d{1,3}(?:\.\d{1,3}){3})", re.IGNORECASE)
+# Reverse-shell / callback / listener context: a non-target IP here is the
+# ATTACKER's own address (LHOST, a /dev/tcp reverse shell), legitimately not
+# the host under test — such a command must NOT be scope-blocked.
+_CALLBACK_MARKERS_RE = re.compile(
+    r"/dev/tcp/|/dev/udp/|lhost|lport|bash\s+-i|sh\s+-i|mkfifo|reverse|"
+    r"-lvn?p|-lvp|\s-e\s|socat", re.IGNORECASE)
+# Never a scope drift even when not the target: loopback, link-local, any-host.
+_BENIGN_IP_RE = re.compile(r"^(?:127\.|0\.0\.0\.0$|169\.254\.)")
+_IPV4_FULL_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
+def _scope_violation(command: str, target_ip: str | None) -> str | None:
+    """Block message if `command` aims a recon/enumeration tool at an IPv4 that
+    is NOT the mission's authorized target — the guard against an autonomous
+    run drifting to a hallucinated or unrelated host (a real incident: a
+    mission that dead-ended on the target's static site fabricated a stock HTB
+    `10.10.11.x` address and began probing it). Returns None when there's no
+    authorized IP to compare against, when a reverse-shell/callback marker is
+    present (the non-target IP is the attacker's own listener), or when every
+    targeted IP is the authorized target or a benign loopback/link-local
+    address. Hostnames (e.g. `enigma.htb`) are never blocked — they resolve to
+    the target via /etc/hosts and carry no drift risk."""
+    if not target_ip or not _IPV4_FULL_RE.match(target_ip):
+        return None
+    if _CALLBACK_MARKERS_RE.search(command):
+        return None
+    targeted = set(_TARGET_URL_IP_RE.findall(command)) | set(_TARGET_TOOL_IP_RE.findall(command))
+    for ip in targeted:
+        if ip == target_ip or _BENIGN_IP_RE.match(ip):
+            continue
+        return (f"[blocked] {ip} is not the authorized target {target_ip} — not executed. "
+                f"Only run recon/attack commands against {target_ip} (or its hostname). If "
+                f"you are out of leads, enumerate OTHER ports/services on {target_ip} or run a "
+                f"scanner against it — do not invent or switch to a different host. This is a "
+                f"hard scope gate (security.target_scope_enforced), not a target-side block.")
+    return None
 
 
 def _make_shell(shell_cfg: ShellConfig | None,
@@ -413,13 +467,22 @@ def _make_shell(shell_cfg: ShellConfig | None,
                 "restriction. If this command is genuinely needed, ask the operator to "
                 "adjust security.deny_patterns or disable the gate.")
 
+    def _out_of_scope(command: str) -> str | None:
+        # Same shape as _blocked: checked against the model's own command text
+        # before any cd-prefixing, keying off the mission's authorized target
+        # (workspace.target_ip, set per-mission). See _scope_violation.
+        if security_cfg is not None and not security_cfg.target_scope_enforced:
+            return None
+        target_ip = workspace.target_ip if workspace is not None else None
+        return _scope_violation(command, target_ip)
+
     if shell_cfg is None or shell_cfg.backend == "local":
         # Runs from a dedicated workspace dir rather than wherever the mist
         # process happened to be launched from — a real run found the model
         # wandering into an unrelated sibling project directory (agent-zero)
         # via relative paths that only "worked" because of the launch cwd.
         def _local_shell(command: str) -> str:
-            blocked = _blocked(command)
+            blocked = _blocked(command) or _out_of_scope(command)
             if blocked is not None:
                 return blocked
             cwd = workspace.path if workspace is not None else None
@@ -432,7 +495,7 @@ def _make_shell(shell_cfg: ShellConfig | None,
     ssh = shell_cfg.ssh
 
     def _shell_ssh(command: str) -> str:
-        blocked = _blocked(command)
+        blocked = _blocked(command) or _out_of_scope(command)
         if blocked is not None:
             return blocked
         args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]

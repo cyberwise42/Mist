@@ -167,6 +167,13 @@ class SecurityConfig(BaseModel):
     iptables and cutting off the operator's own SSH session, etc.)."""
     command_safety_enabled: bool = True
     deny_patterns: list[str] | None = None  # None = use safety.DEFAULT_DENY_PATTERNS
+    target_scope_enforced: bool = True  # block a `shell` command that aims a recon/attack
+                                        # tool (nmap/curl/ffuf/mount/...) at an IPv4 that is
+                                        # NOT the mission's authorized target — the guard
+                                        # against an autonomous run drifting to a hallucinated
+                                        # or unrelated host. Reverse-shell/callback IPs (the
+                                        # attacker's own listener) are exempt. Off = no scope
+                                        # gate (prior behavior).
 
 
 class SubagentConfig(BaseModel):

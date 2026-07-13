@@ -138,6 +138,12 @@ if you have nothing further to do this step. If the objective is fully achieved,
 `finish_objective` with a summary. If you are genuinely stuck and need the operator's judgment
 (a missing credential, an ambiguous scope decision), say so plainly instead of guessing.
 
+Stay strictly on the authorized target named in the objective above. Never invent, guess, or
+switch to a different IP address or host — the only host you may scan, curl, or probe is that
+one target (or its hostname). If you run out of leads, that means enumerate the SAME target's
+other ports/services or run a content/vulnerability scanner against it — it is NEVER a reason
+to pick a new address. Commands aimed at any other host are blocked and wasted.
+
 If you confirm something is a genuine dead end (a path that doesn't exist, a technique that
 doesn't apply here) or land on a working technique, persist it immediately with `remember` — it
 gets retrieved automatically in later turns, so you won't rediscover the same dead end twice.
@@ -984,14 +990,20 @@ class MistAgent:
         # mission's scan output/downloaded exploits/payloads land in their
         # own folder instead of the one flat workspace every mission ever
         # run shares regardless of target.
-        if self.cfg.workspace.mission_root:
-            target = _extract_target(objective)
-            if target and getattr(self.tools, "workspace", None) is not None:
-                mission_dir = Path(self.cfg.workspace.mission_root).expanduser() / target
-                self.tools.workspace.path = mission_dir
-                self._mission_log_append(
-                    log_path, f"\n**Working directory:** `{mission_dir}`\n"
-                )
+        target = _extract_target(objective)
+        workspace = getattr(self.tools, "workspace", None)
+        if workspace is not None and target and _IPV4_RE.fullmatch(target):
+            # Pin the mission's single authorized target so the shell scope
+            # guard blocks any command that aims a recon/attack tool at a
+            # different host (see registry._scope_violation). Only an IP target
+            # is enforceable; a hostname-only objective leaves it unset.
+            workspace.target_ip = target
+        if self.cfg.workspace.mission_root and target and workspace is not None:
+            mission_dir = Path(self.cfg.workspace.mission_root).expanduser() / target
+            workspace.path = mission_dir
+            self._mission_log_append(
+                log_path, f"\n**Working directory:** `{mission_dir}`\n"
+            )
 
         self.always_exposed.add("finish_objective")
         try:

