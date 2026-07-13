@@ -125,11 +125,28 @@ class StructuredToolsConfig(BaseModel):
     tools: list[str] = Field(default_factory=list)  # empty = every tool structured.py knows
 
 
+class BrowserConfig(BaseModel):
+    """Headless-browser render tool (`browse`). Renders a page in chromium on
+    the shell host (`--dump-dom`, JS executed) and returns its text/forms/links
+    — what curl can't get, because curl never runs the page's JavaScript. The
+    value is the rendered *text* (a text-only model can't use a screenshot);
+    visual browsing is a separate, multimodal concern."""
+    enabled: bool = True
+    binary: str = "chromium"     # remote binary name (chromium-browser / google-chrome-stable / ...)
+    timeout_seconds: int = 45    # hard per-render cap via coreutils `timeout`, independent of ssh.timeout
+    virtual_time_ms: int = 8000  # chromium --virtual-time-budget: how long to let the page's JS/timers run
+
+
 class ToolsConfig(BaseModel):
-    max_exposed: int = 5
+    max_exposed: int = 6  # ranked tools shown per decision. Sized to fit the always-useful
+                          # core set so none is silently crowded out of the ranked pool:
+                          # {read_file, write_file, search_files, shell, browse, remember}.
+                          # (Was 5 before `browse` joined the core set; raising it kept
+                          # `remember` reachable — see the tool-select regression tests.)
     enabled: list[str] | None = None  # opt-in allow-list; None = every tool Mist supports
     shell: ShellConfig = Field(default_factory=ShellConfig)
     structured: StructuredToolsConfig = Field(default_factory=StructuredToolsConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
 
 
 class CheckpointConfig(BaseModel):

@@ -142,6 +142,7 @@ def _build_agent(config_path: str | None, backend: str | None,
         structured_tools_config=cfg.tools.structured,
         tool_compressor=tool_compressor,
         security_config=cfg.security,
+        browser_config=cfg.tools.browser,
     )
     checkpoint_store = CheckpointStore(cfg.checkpoints.base_dir) if cfg.checkpoints.enabled else None
     return MistAgent(cfg, llm, store, skills, tools, process_registry=process_registry,

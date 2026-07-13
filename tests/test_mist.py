@@ -926,6 +926,94 @@ def test_shell_local_backend_unaffected_by_shell_config_none():
     assert "local-backend-test" in out
 
 
+# -- browse tool (headless-browser render) -------------------------------
+
+def _run_browse_extractor(html: str, url: str = "") -> str:
+    """Run the exact EXTRACTOR_SRC that executes remotely, against sample
+    HTML, so the test covers the real extraction code path (python3 stdlib)."""
+    import subprocess
+    import sys
+
+    from mist.tools.browser import EXTRACTOR_SRC
+    return subprocess.run([sys.executable, "-c", EXTRACTOR_SRC, url],
+                          input=html, capture_output=True, text=True).stdout
+
+
+def test_browse_extractor_pulls_title_forms_links_and_hides_secrets():
+    html = ('<html><head><title>Webmail Login</title><style>b{}</style></head><body>'
+            '<script>var leak="TOPSECRET";</script>'
+            '<form method="post" action="/?_task=login">'
+            '<input name="_user" type="text" placeholder="Username">'
+            '<input name="_pass" type="password" value="hunter2"></form>'
+            '<a href="/inbox">inbox</a><a href="#">x</a>'
+            '<a href="javascript:void(0)">j</a><p>hello world</p></body></html>')
+    out = _run_browse_extractor(html, "http://t/")
+    assert "TITLE: Webmail Login" in out
+    assert "form#1 POST action=/?_task=login" in out
+    assert "input name=_user type=text" in out
+    assert "input name=_pass type=password" in out
+    assert "hunter2" not in out          # a password field's value is never surfaced
+    assert "TOPSECRET" not in out        # <script>/<style> contents are skipped
+    assert "[LINKS] (1 unique)" in out   # '#' and javascript: links filtered out
+    assert "/inbox" in out
+    assert "hello world" in out
+
+
+def test_browse_extractor_flags_an_empty_render():
+    out = _run_browse_extractor("<html><body></body></html>")
+    assert "no visible text" in out
+
+
+def test_build_browse_command_normalizes_and_quotes_url():
+    from mist.tools.browser import build_browse_command, normalize_url
+    assert normalize_url("enigma.htb") == "http://enigma.htb"
+    assert normalize_url("https://x/") == "https://x/"
+    cmd = build_browse_command("enigma.htb/login")
+    assert "--dump-dom" in cmd
+    assert "http://enigma.htb/login" in cmd
+    assert "timeout -k 5 45" in cmd
+    assert "python3 -c" in cmd
+
+
+def test_build_browse_command_is_injection_safe():
+    import shlex
+
+    from mist.tools.browser import build_browse_command
+    hostile = "http://x/; rm -rf ~ #"
+    cmd = build_browse_command(hostile)
+    # The hostile URL survives only as a single shell-quoted token (an argument
+    # to chromium/python3), never as a separate command — no bare `rm` token.
+    tokens = shlex.split(cmd)
+    assert hostile in tokens
+    assert "rm" not in tokens
+
+
+def test_default_registry_exposes_browse_by_default():
+    tools = default_registry(remember_fn=lambda c: None)
+    assert tools.get("browse") is not None
+
+
+def test_default_registry_omits_browse_when_disabled():
+    from mist.config import BrowserConfig
+    tools = default_registry(remember_fn=lambda c: None,
+                             browser_config=BrowserConfig(enabled=False))
+    assert tools.get("browse") is None
+
+
+def test_browse_delegates_to_shell_with_a_render_command():
+    from mist.tools.registry import _make_browse
+    captured = {}
+
+    def fake_shell(command):
+        captured["command"] = command
+        return "RENDERED: http://enigma.htb\nTITLE: X"
+
+    out = _make_browse(fake_shell, None)(url="enigma.htb")
+    assert "--dump-dom" in captured["command"]
+    assert "http://enigma.htb" in captured["command"]
+    assert "RENDERED" in out
+
+
 def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     captured = {}
 
@@ -2181,11 +2269,11 @@ def test_tool_select_always_is_additive_not_subtracted_from_cap():
     # of {read_file, write_file, search_files, shell, remember}).
     tools = default_registry(remember_fn=lambda c: None)
     selected = tools.select("totally unrelated query about baking",
-                            max_exposed=5, always={"finish_objective"})
-    assert len(selected) == 6  # 5 ranked + 1 forced, not 5 total
+                            max_exposed=6, always={"finish_objective"})
+    assert len(selected) == 7  # 6 ranked + 1 forced, not 6 total
     names = {t.name for t in selected}
     assert "finish_objective" in names
-    assert {"read_file", "write_file", "search_files", "shell", "remember"} <= names
+    assert {"read_file", "write_file", "search_files", "shell", "browse", "remember"} <= names
 
 
 def test_finish_objective_never_selected_without_always_even_with_keyword_overlap():
@@ -2199,7 +2287,7 @@ def test_finish_objective_never_selected_without_always_even_with_keyword_overla
     selected = tools.select(
         "perform a complete pentest of the HTB machine named CAP at "
         "10.129.30.111 to get the user and root flags",
-        max_exposed=5,
+        max_exposed=6,
     )
     names = {t.name for t in selected}
     assert "finish_objective" not in names

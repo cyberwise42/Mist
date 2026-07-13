@@ -57,8 +57,8 @@ embeddings:
   similarity_threshold: 0.35  # min cosine similarity to accept a semantic skill match
 
 tools:
-  max_exposed: 5           # tools exposed to the model per call
-  # enabled: [read_file, write_file, shell, search_files, remember, write_skill, spawn_subagents]
+  max_exposed: 6           # tools exposed to the model per call
+  # enabled: [read_file, write_file, shell, browse, search_files, remember, write_skill, spawn_subagents]
   #   ^ opt-in allow-list; omit (default) to expose every tool Mist supports
   shell:
     backend: local          # local | ssh
@@ -68,6 +68,14 @@ tools:
       port: 22
       key_path: ~/.ssh/id_ed25519
       timeout: 120
+  browser:
+    enabled: true           # `browse <url>` — renders a page in headless chromium on the
+                            # shell host (JS executed) and returns its text/forms/links.
+                            # Use for JS-heavy pages / login screens where curl only sees the
+                            # un-rendered HTML shell. Needs a chromium binary on the shell host.
+    binary: chromium        # chromium | chromium-browser | google-chrome-stable | ...
+    timeout_seconds: 45     # hard per-render cap (independent of the ssh shell timeout)
+    virtual_time_ms: 8000   # how long chromium lets the page's JS/timers run before dumping
 
 subagents:
   enabled: true

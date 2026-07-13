@@ -15,12 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from mist.config import ArtifactConfig, SecurityConfig, ShellConfig, StructuredToolsConfig
+from mist.config import (ArtifactConfig, BrowserConfig, SecurityConfig, ShellConfig,
+                         StructuredToolsConfig)
 from mist.core.subagent import format_results, run_subagents, run_tool_subagents
 from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient
 from mist.skills.router import SkillRouter
 from mist.tools.artifacts import ArtifactStore
+from mist.tools.browser import build_browse_command
 from mist.tools.safety import check_command_dangerous
 from mist.tools.structured import detect_tool, summarize_tool_output
 
@@ -466,6 +468,25 @@ def _make_shell(shell_cfg: ShellConfig | None,
     return _shell_ssh
 
 
+def _make_browse(shell_fn: Callable[..., str],
+                browser_cfg: BrowserConfig | None) -> Callable[..., str]:
+    """The `browse` tool renders a URL in headless chromium on the shell host
+    and returns the post-JS DOM as compact text (see mist/tools/browser.py).
+    It delegates execution to the already-configured `shell` callable, so it
+    inherits that backend's transport (local or SSH), workspace cwd, timeout,
+    kill-registry, and artifact persistence with no separate plumbing — the
+    rendering+extraction happens remotely and only the small text result comes
+    back over the same channel a normal shell command would."""
+    cfg = browser_cfg or BrowserConfig()
+
+    def _browse(url: str) -> str:
+        command = build_browse_command(url, binary=cfg.binary,
+                                       timeout_seconds=cfg.timeout_seconds,
+                                       virtual_time_ms=cfg.virtual_time_ms)
+        return shell_fn(command)
+    return _browse
+
+
 def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
@@ -543,7 +564,8 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
                       artifact_config: ArtifactConfig | None = None,
                       structured_tools_config: StructuredToolsConfig | None = None,
                       tool_compressor: ToolOutputCompressor | None = None,
-                      security_config: SecurityConfig | None = None) -> ToolRegistry:
+                      security_config: SecurityConfig | None = None,
+                      browser_config: BrowserConfig | None = None) -> ToolRegistry:
     # read_file/write_file/search_files anchor relative paths to wiki_root,
     # but an absolute path used to be let through unconditionally — a real
     # run escaped the wiki root that way and read an unrelated project's
@@ -602,18 +624,34 @@ def default_registry(remember_fn: Callable[[str], Any] | None = None,
         fn=_make_search_files(wiki_root, allowed_roots),
         keywords={"search", "find", "grep", "wiki", "index"},
     ))
+    shell_fn = _make_shell(shell_config, process_registry, workspace_box,
+                          artifacts=artifact_store,
+                          structured_cfg=structured_tools_config,
+                          security_cfg=security_config)
     reg.register(Tool(
         name="shell",
         description="Run a shell command and return its output",
         parameters={"type": "object",
                     "properties": {"command": {"type": "string"}},
                     "required": ["command"]},
-        fn=_make_shell(shell_config, process_registry, workspace_box,
-                      artifacts=artifact_store,
-                      structured_cfg=structured_tools_config,
-                      security_cfg=security_config),
+        fn=shell_fn,
         keywords={"run", "shell", "command", "execute", "ls", "git", "install"},
     ))
+    if browser_config is None or browser_config.enabled:
+        reg.register(Tool(
+            name="browse",
+            description=(
+                "Render a web page in a headless browser (JavaScript executed) and return "
+                "its text, form fields, and links. Use this instead of curl/wget for a "
+                "JS-heavy page or a login screen — curl sees only the un-rendered HTML shell, "
+                "browse sees the actual page. Argument: url."
+            ),
+            parameters={"type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"]},
+            fn=_make_browse(shell_fn, browser_config),
+            keywords={"browse", "browser", "page", "web", "url", "http", "render", "login"},
+        ))
     # Exposed so a caller (MistAgent.astream_mission) can redirect the
     # shell's cwd to a per-mission target directory once the objective's
     # target is known — see MutableWorkspace.
