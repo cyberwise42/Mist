@@ -109,8 +109,10 @@ Available tools:
   webserver's JS/assets is a fine follow-up once a scan or search has pointed at something
   specific to confirm — it is not the first move against an unscanned target or port.
 - Content discovery on any web server has TWO standard parts, and you run BOTH automatically the
-  moment you find a web service — not just when stuck: (1) directory/route fuzzing (`gobuster dir`,
-  `ffuf -u http://<host>/FUZZ`, `dirsearch`), and (2) virtual-host / subdomain fuzzing (`gobuster
+  moment you find a web service — not just when stuck: (1) directory/route fuzzing at HIGH
+  concurrency so it finishes inside the tool timeout (`gobuster dir ... -t 50`, `ffuf -u
+  http://<host>/FUZZ ... -t 50`, `dirsearch`) — the default thread count on a large wordlist is
+  too slow and gets killed with no usable output, and (2) virtual-host / subdomain fuzzing (`gobuster
   vhost -u http://<domain> -w <subdomain-wordlist> --append-domain`, or `ffuf -u http://<ip>/ -H
   'Host: FUZZ.<domain>' -w <subdomain-wordlist> -fs <default-page-size>`). Vhost
   fuzzing is not optional or a last resort — a sparse or static web root very often means the real
@@ -1000,6 +1002,36 @@ class MistAgent:
         except Exception:
             pass
 
+    def _cleanup_orphaned_scans(self) -> None:
+        """Best-effort: kill recon scanners the mission left running on the SSH
+        shell host. When a long scan (gobuster/ffuf/nuclei) exceeds the shell
+        timeout, Mist kills its LOCAL ssh process — but the REMOTE command
+        outlives the dropped session (reparented to init) and keeps churning. A
+        real incident: a timed-out `gobuster dir` was still running 11+ minutes
+        after the mission had already moved on; left alone these accumulate
+        run-to-run, loading the box and skewing later scans.
+
+        Scoped like _cleanup_mounts: only the SSH backend (never the local
+        machine Mist runs on), only known scanner binaries, and only those whose
+        command line references an engagement workspace path — so it can't kill
+        an unrelated process. Fully swallowed: cleanup must never fail a mission."""
+        if not self.cfg.mission.reap_orphaned_scans_on_end:
+            return
+        if getattr(self.cfg.tools.shell, "backend", None) != "ssh":
+            return  # only the dedicated remote shell host, never the local box
+        shell = self.tools.get("shell")
+        if shell is None:
+            return
+        cmd = (
+            r"pgrep -af '(gobuster|ffuf|feroxbuster|dirb|dirsearch|wfuzz|nuclei|nikto)' 2>/dev/null "
+            r"| awk '/\/Desktop\/HTB\/|\/\.mist\/workspace\//{print $1}' "
+            r"| xargs -r kill -9 2>/dev/null; true"
+        )
+        try:
+            shell.run(command=cmd)
+        except Exception:
+            pass
+
     def debrief_mission(self, objective: str, status: str, log_path: Path) -> DebriefResult:
         """Deterministically persists whatever a mission accomplished —
         called at every end state (finished, limit hit, or killed) rather
@@ -1331,3 +1363,4 @@ class MistAgent:
         finally:
             self.always_exposed.discard("finish_objective")
             self._cleanup_mounts()
+            self._cleanup_orphaned_scans()

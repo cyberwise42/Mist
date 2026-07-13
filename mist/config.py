@@ -261,6 +261,13 @@ class MissionConfig(BaseModel):
                                            # right up to that timeout with no event and is NOT a
                                            # stall, so firing below it just cries wolf. Purely
                                            # diagnostic: never cancels or alters the mission. 0 disables.
+    reap_orphaned_scans_on_end: bool = True  # SSH backend only: at mission end, kill recon
+                                             # scanners (gobuster/ffuf/nuclei/...) left running on
+                                             # the shell host after a timed-out scan's LOCAL ssh was
+                                             # killed but the REMOTE command outlived the dropped
+                                             # session and kept churning. Scoped to engagement
+                                             # workspace paths so it can't touch unrelated processes.
+                                             # False disables.
     unmount_shares_on_end: bool = True  # SSH backend only: when a mission ends, best-effort
                                         # force-lazy-unmount the NFS/SMB shares it mounted on
                                         # the shell host (scoped to /mnt and the engagement

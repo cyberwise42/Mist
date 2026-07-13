@@ -1285,6 +1285,32 @@ def test_cleanup_mounts_respects_disable_flag():
     assert calls == []
 
 
+def test_cleanup_orphaned_scans_kills_scanners_on_ssh_backend():
+    # A scan that outruns the shell timeout leaves its REMOTE process orphaned
+    # (local ssh killed, remote command reparented to init) — reap it at mission
+    # end so it doesn't keep loading the box and skewing later scans.
+    agent, calls = _cleanup_agent(backend="ssh", enabled=True)
+    agent._cleanup_orphaned_scans()
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "gobuster" in cmd and "ffuf" in cmd and "nuclei" in cmd  # known scanner binaries
+    assert "kill -9" in cmd
+    assert "Desktop" in cmd and "HTB" in cmd  # scoped to engagement workspace, not any scanner anywhere
+
+
+def test_cleanup_orphaned_scans_skips_local_backend():
+    agent, calls = _cleanup_agent(backend="local", enabled=True)
+    agent._cleanup_orphaned_scans()
+    assert calls == []
+
+
+def test_cleanup_orphaned_scans_respects_disable_flag():
+    agent, calls = _cleanup_agent(backend="ssh", enabled=True)
+    agent.cfg.mission.reap_orphaned_scans_on_end = False
+    agent._cleanup_orphaned_scans()
+    assert calls == []
+
+
 def test_json_fail_detail_surfaces_raw_output_for_diagnosis():
     # A decision that never parses must carry the raw model output into the
     # error (and thus the mission log), not the old opaque "failed to produce
