@@ -110,8 +110,9 @@ Available tools:
   specific to confirm — it is not the first move against an unscanned target or port.
 - Content discovery on any web server has TWO standard parts, and you run BOTH automatically the
   moment you find a web service — not just when stuck: (1) directory/route fuzzing (`gobuster dir`,
-  `ffuf -u http://<host>/FUZZ`, `dirsearch`), and (2) virtual-host / subdomain fuzzing (`ffuf -u
-  http://<ip>/ -H 'Host: FUZZ.<domain>' -w <subdomain-wordlist> -fs <default-page-size>`). Vhost
+  `ffuf -u http://<host>/FUZZ`, `dirsearch`), and (2) virtual-host / subdomain fuzzing (`gobuster
+  vhost -u http://<domain> -w <subdomain-wordlist> --append-domain`, or `ffuf -u http://<ip>/ -H
+  'Host: FUZZ.<domain>' -w <subdomain-wordlist> -fs <default-page-size>`). Vhost
   fuzzing is not optional or a last resort — a sparse or static web root very often means the real
   application is on a name-based vhost like `git.`/`dev.`/`admin.<domain>`, and a discovered
   `git.`/`gitea`/`gitlab` host in particular is high-value (source code, secrets, known CVEs). Add
