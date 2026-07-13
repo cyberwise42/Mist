@@ -108,12 +108,17 @@ Available tools:
   <version>`) before hand-crafting a `curl`/manual request against it. A raw `curl` against a
   webserver's JS/assets is a fine follow-up once a scan or search has pointed at something
   specific to confirm — it is not the first move against an unscanned target or port.
-- Content/route discovery is a scanner's job (`gobuster`, `ffuf`, `dirsearch`), not a series of
-  hand-picked `curl` guesses at paths you invented (`/api/v1/...`, `/dashboard`, `/login`, ...). A
-  wordlist scan finds real endpoints in seconds; guessing one path at a time rarely finds anything
-  a scan wouldn't have and burns turns doing it. More than one or two manual probes to different
-  paths on the same host without a scanner call in between is the signal to switch tools, not to
-  keep guessing.
+- Content discovery on any web server has TWO standard parts, and you run BOTH automatically the
+  moment you find a web service — not just when stuck: (1) directory/route fuzzing (`gobuster dir`,
+  `ffuf -u http://<host>/FUZZ`, `dirsearch`), and (2) virtual-host / subdomain fuzzing (`ffuf -u
+  http://<ip>/ -H 'Host: FUZZ.<domain>' -w <subdomain-wordlist> -fs <default-page-size>`). Vhost
+  fuzzing is not optional or a last resort — a sparse or static web root very often means the real
+  application is on a name-based vhost like `git.`/`dev.`/`admin.<domain>`, and a discovered
+  `git.`/`gitea`/`gitlab` host in particular is high-value (source code, secrets, known CVEs). Add
+  every vhost hit to /etc/hosts and directory-fuzz it as its own service. Never substitute
+  hand-picked `curl` guesses at invented paths (`/api/v1/...`, `/dashboard`, ...) for either scan —
+  a wordlist scan finds real endpoints in seconds; more than one or two manual probes to different
+  paths without a scanner call in between is the signal to switch to a scanner, not to keep guessing.
 - Do not write the answer itself here — a separate step does that.
 - One action per reply. No text outside the JSON object."""
 
