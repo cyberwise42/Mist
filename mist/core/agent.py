@@ -604,6 +604,13 @@ class MistAgent:
         trace: list[str] = []
         tool_context: list[dict[str, str]] = []
         for _ in range(self.cfg.context.max_tool_steps):
+            # Re-fit each step so this turn's accumulated tool outputs can't
+            # crowd num_ctx's shared window and truncate a long decision
+            # mid-string. See astream_turn for the full rationale.
+            messages = _fit_budget(
+                messages, self.cfg.context.token_budget,
+                compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
+            )
             try:
                 raw = self.llm.complete(messages, json_schema=schema)
             except Exception as exc:  # network/backend errors must not crash the caller
@@ -741,6 +748,21 @@ class MistAgent:
         # across the whole (up to max_tool_steps-long) turn caused.
         acted_this_turn = False
         for _ in range(self.cfg.context.max_tool_steps):
+            # Re-fit before EVERY decision, not just the first. This turn's tool
+            # results are appended to `messages` each step (below) and never
+            # removed, so a long chain — a basic nmap, then a full nmap, then
+            # NFS enumeration, each carrying up to max_tool_output_chars of
+            # output — grows the assembled prompt until it crowds num_ctx's
+            # shared prompt+generation window. Once that headroom collapses, a
+            # long decision (a big ffuf/curl command) gets truncated mid-string
+            # by the backend and fails to parse ("Model failed to produce valid
+            # JSON"). The turn-start fit above only bounds the FIRST decision;
+            # this bounds every subsequent one, dropping the oldest
+            # (already-acted-on) results first so recent context survives.
+            messages = await asyncio.to_thread(
+                _fit_budget, messages, self.cfg.context.token_budget,
+                compress_fn=self._compress_fn if self.cfg.context.compress_on_overflow else None,
+            )
             raw_action = None
             last_error: Exception | None = None
             last_raw: str | None = None

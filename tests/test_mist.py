@@ -17,7 +17,7 @@ from mist.config import (ArtifactConfig, MistConfig, SecurityConfig, ShellConfig
 from mist.core.action import (ActionValidationError, DecisionRespond, DecisionUseTool,
                               SubagentRespond, SubagentUseTool, parse_decision_action,
                               parse_subagent_action)
-from mist.core.agent import MistAgent, _extract_target, _findings_recap, _fit_budget
+from mist.core.agent import MistAgent, _approx_tokens, _extract_target, _findings_recap, _fit_budget
 from mist.core.checkpoints import CheckpointStore
 from mist.core.context_compressor import ContextCompressor
 from mist.core.mission import MissionControl
@@ -27,7 +27,7 @@ from mist.core.tool_compressor import ToolOutputCompressor
 from mist.memory.store import MemoryStore
 from mist.skills.router import SkillRouter
 from mist.tools.artifacts import ArtifactStore
-from mist.tools.registry import ProcessRegistry, default_registry
+from mist.tools.registry import ProcessRegistry, Tool, default_registry
 from mist.tools.safety import check_command_dangerous
 from mist.tools.structured import detect_tool, summarize_tool_output
 from mist.llm.client import parse_json_relaxed
@@ -2347,6 +2347,57 @@ async def test_astream_turn_errors_on_persistent_bad_json(tmp_path):
     agent = make_async_agent(tmp_path, llm)
     events = [e async for e in agent.astream_turn("hi")]
     assert events[-1].kind == "error"
+
+
+async def test_astream_turn_refits_budget_across_a_long_tool_chain(tmp_path):
+    """A long chain of tool calls in one turn (basic nmap, full nmap, NFS
+    enumeration, ...) appends each result to `messages` and never removes it.
+    Without a per-step re-fit, the assembled prompt grows past token_budget
+    and eventually crowds num_ctx's shared prompt+generation window, so a
+    later decision gets truncated mid-string by the backend and fails to
+    parse. Assert every decision the model is asked to make stays within
+    token_budget no matter how many large results have accumulated."""
+    big_output = "X" * 20_000  # each tool result, capped to max_tool_output_chars
+
+    class RecordingLLM:
+        def __init__(self, decisions):
+            self.decisions = list(decisions)
+            self.prompt_tokens: list[int] = []
+
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            self.prompt_tokens.append(sum(_approx_tokens(m["content"]) for m in messages))
+            return self.decisions.pop(0)
+
+        async def astream(self, messages):
+            yield "done"
+
+    n_steps = 8
+    decisions = [json.dumps({"action": "use_tool", "tool": "bigtool", "arguments": {}})] * n_steps
+    decisions.append(json.dumps({"action": "respond"}))
+    llm = RecordingLLM(decisions)
+
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "test.db")
+    cfg.context.token_budget = 3000
+    cfg.context.max_tool_output_chars = 4000  # ~1000 tokens per result
+    cfg.context.max_tool_steps = 20           # room for the whole chain
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    tools.register(Tool(name="bigtool", description="returns a large output",
+                        parameters={"type": "object", "properties": {}},
+                        fn=lambda: big_output))
+    agent = MistAgent(cfg, llm, store, skills, tools)
+
+    events = [e async for e in agent.astream_turn("go")]
+
+    # The chain actually ran (a bounded prompt didn't come for free by skipping steps).
+    assert sum(1 for e in events if e.kind == "tool_result") == n_steps
+    assert len(llm.prompt_tokens) >= n_steps
+    # Every decision stayed within budget despite ~1000 tokens/result accumulating —
+    # this is exactly what the per-step _fit_budget guarantees. Without the re-fit,
+    # step 8's prompt alone would carry 8 * ~1000 tokens of results, far over 3000.
+    assert max(llm.prompt_tokens) <= cfg.context.token_budget
 
 
 # -- resilience: a crashed LLM/network call must not crash the caller ----
