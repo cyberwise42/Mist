@@ -594,6 +594,53 @@ def test_recovery_nudge_no_action_demands_a_tool_without_pivot_noise():
     assert "FUZZ" not in n
 
 
+# -- stall watchdog (diagnose a wedged mission) --------------------------
+
+async def test_format_pending_task_stacks_names_a_parked_coroutine():
+    from mist.core.stall_watchdog import format_pending_task_stacks
+    gate = asyncio.Event()
+
+    async def parked_here():
+        await gate.wait()  # suspends exactly here
+
+    t = asyncio.create_task(parked_here(), name="parked-mission")
+    await asyncio.sleep(0)  # let it start and suspend on gate.wait()
+    dump = format_pending_task_stacks(asyncio.all_tasks())
+    assert "parked-mission" in dump          # task named
+    assert "parked_here" in dump             # the parked coroutine's frame
+    gate.set()
+    await t
+    # a completed task is not reported
+    assert "parked-mission" not in format_pending_task_stacks(asyncio.all_tasks())
+
+
+async def test_mission_stall_watchdog_fires_once_per_episode_and_rearms():
+    from mist.core.stall_watchdog import mission_stall_watchdog
+    fired: list[float] = []
+    clock = [0.0]
+    last = [0.0]
+    step = [0]
+
+    async def fake_sleep(_):
+        clock[0] += 30.0        # each poll advances the virtual clock 30s
+        step[0] += 1
+        if step[0] == 5:
+            last[0] = clock[0]  # progress resumes here -> watchdog must re-arm
+        if step[0] >= 10:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await mission_stall_watchdog(
+            lambda: last[0], fired.append,
+            threshold=90.0, poll_interval=30.0,
+            now=lambda: clock[0], sleep=fake_sleep,
+        )
+    # idle crosses 90s at step 3 -> one fire; stays stalled (no re-fire); progress
+    # at step 5 re-arms; idle crosses 90s again at step 8 -> second fire.
+    assert len(fired) == 2
+    assert all(idle >= 90.0 for idle in fired)
+
+
 # -- batch summarizer -----------------------------------------------------
 
 def test_batch_summarizer_compacts_session_into_memory(tmp_path):

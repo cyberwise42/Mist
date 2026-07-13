@@ -35,6 +35,7 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 from mist.banner import help_lines
 from mist.core.agent import MistAgent
 from mist.core.mission import MissionControl
+from mist.core.stall_watchdog import format_pending_task_stacks, mission_stall_watchdog
 from mist.core.summarizer import BatchSummarizer
 from mist.history import HistoryStore
 from mist.tui.memory_commands import render_history_command, render_memories_command
@@ -123,6 +124,7 @@ class MistTUI(App):
         self._mission_control: MissionControl | None = None
         self._mission_objective: str = ""
         self._mission_turn: int = 0
+        self._mission_last_progress: float = 0.0  # monotonic ts of last mission event (stall watchdog)
         self._mission_log_path: str | None = None
         # Status-line state: `_status_state` is the free-text phase ("idle",
         # "thinking…", "tool: shell", ...); `_turn_started_at` (wall-clock,
@@ -429,6 +431,19 @@ class MistTUI(App):
         control = self._mission_control
         log.write(f"[bold magenta]‹ mission started ›[/] {objective}")
         self._refresh_status("mission: turn 0")
+        # Stall watchdog: a separate task (so it keeps running even when every
+        # mission coroutine is parked) that dumps pending task stacks into the
+        # log if no event arrives for cfg.mission.stall_watchdog_seconds. Purely
+        # diagnostic — see mist.core.stall_watchdog.
+        self._mission_last_progress = time.monotonic()
+        stall_after = self.agent.cfg.mission.stall_watchdog_seconds
+        watchdog = (
+            asyncio.create_task(mission_stall_watchdog(
+                lambda: self._mission_last_progress, self._on_mission_stall,
+                threshold=stall_after, poll_interval=min(15.0, stall_after / 3),
+            ))
+            if stall_after and stall_after > 0 else None
+        )
         try:
             async for event in self.agent.astream_mission(
                 objective, control,
@@ -436,6 +451,7 @@ class MistTUI(App):
                 max_seconds=self.agent.cfg.mission.max_seconds,
                 stuck_repeat_threshold=self.agent.cfg.mission.stuck_repeat_threshold,
             ):
+                self._mission_last_progress = time.monotonic()
                 if event.kind == "started":
                     self._mission_log_path = event.text
                 elif event.kind == "turn_start":
@@ -487,12 +503,32 @@ class MistTUI(App):
                 )
                 log.write(f"[dim]{debrief.summary()}[/]")
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             typing.update("")
             self._mission_task = None
             self._mission_control = None
             self._mission_turn = 0
             self._mission_log_path = None
             self._refresh_status("idle")
+
+    def _on_mission_stall(self, idle: float) -> None:
+        """Stall-watchdog callback: the mission stream has been silent past the
+        threshold. Capture every pending task's stack into the mission log
+        (durable) and flag it in the transcript, so a wedged turn that would
+        otherwise leave no trace names its parked coroutine. Diagnostic only —
+        the mission itself is never touched."""
+        dump = format_pending_task_stacks(asyncio.all_tasks())
+        log = self.query_one("#transcript", RichLog)
+        log.write(f"[{WARNING}]‹ mission stalled ›[/] no event for {idle:.0f}s — "
+                  "pending task stacks captured to the mission log")
+        if self._mission_log_path is not None:
+            ts = time.strftime("%H:%M:%S", time.gmtime())
+            self.agent._mission_log_append(
+                Path(self._mission_log_path),
+                f"\n**Stall watchdog** at {ts} UTC: no mission event for {idle:.0f}s — "
+                f"pending asyncio task stacks:\n```\n{dump}\n```\n",
+            )
 
     # ------------------------------------------------------------------
     def action_interrupt(self) -> None:

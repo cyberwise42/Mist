@@ -56,6 +56,13 @@ embeddings:
   api_key: ""
   similarity_threshold: 0.35  # min cosine similarity to accept a semantic skill match
 
+# mission:
+#   stall_watchdog_seconds: 300   # if a running mission emits no event for this long, dump
+#                                 # every pending asyncio task's stack into the mission log — a
+#                                 # diagnostic for a wedged turn that goes idle with no marker.
+#                                 # Keep it ABOVE your longest single tool runtime (>= the ssh
+#                                 # shell timeout) so a slow scan doesn't trip it. 0 disables.
+
 tools:
   max_exposed: 6           # tools exposed to the model per call
   # enabled: [read_file, write_file, shell, browse, search_files, remember, write_skill, spawn_subagents]

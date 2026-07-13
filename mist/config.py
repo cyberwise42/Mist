@@ -252,6 +252,16 @@ class MissionConfig(BaseModel):
                                         # whole token budget still "thinking" and never
                                         # calling a tool, which could otherwise run
                                         # undetected all the way to max_turns/max_seconds.
+    stall_watchdog_seconds: float = 300.0  # if a running mission emits no event for this many
+                                           # seconds, dump every pending asyncio task's stack into
+                                           # the mission log — a diagnostic for a wedged turn that
+                                           # goes fully idle mid-mission with no pause/error marker
+                                           # (observed but not yet root-caused). Set ABOVE the
+                                           # longest single tool runtime (>= tools.shell.ssh.timeout)
+                                           # so a legitimately slow scan doesn't trip it; a stack
+                                           # parked at `to_thread(tool.run)` is a healthy long tool,
+                                           # a park elsewhere is the real stall. Purely diagnostic:
+                                           # never cancels or alters the mission. 0 disables.
     unmount_shares_on_end: bool = True  # SSH backend only: when a mission ends, best-effort
                                         # force-lazy-unmount the NFS/SMB shares it mounted on
                                         # the shell host (scoped to /mnt and the engagement
