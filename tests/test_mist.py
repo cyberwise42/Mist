@@ -565,6 +565,35 @@ def test_mission_routing_query_omits_boilerplate():
     assert "search_files" not in q
 
 
+# -- stuck-recovery nudges (dead-end pivot) ------------------------------
+
+def test_recovery_nudge_manual_probe_carries_pivot_playbook():
+    from mist.core.agent import _recovery_nudge
+    n = _recovery_nudge("manual_probe", "8x curl/wget", 8, escalated=False)
+    assert "scanner" in n.lower()                 # existing steer preserved
+    assert "Host: FUZZ" in n                       # vhost pivot added
+    assert "SAME target" in n                      # widen, don't switch
+    assert "new host" in n.lower()
+
+
+def test_recovery_nudge_repeat_carries_pivot_and_escalation_wording():
+    from mist.core.agent import _recovery_nudge
+    first = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=False)
+    assert "think through" in first.lower()        # first-time recovery wording
+    assert "Host: FUZZ" in first                    # pivot playbook attached
+    escalated = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=True)
+    assert "blocked on" in escalated.lower()        # escalated defers to operator
+    assert "Host: FUZZ" in escalated
+
+
+def test_recovery_nudge_no_action_demands_a_tool_without_pivot_noise():
+    from mist.core.agent import _recovery_nudge
+    n = _recovery_nudge("no_action", "2x turns", 2, escalated=False)
+    assert "call a tool" in n.lower()
+    # not a dead-end-on-a-service case — the vhost/port pivot would be off-topic
+    assert "FUZZ" not in n
+
+
 # -- batch summarizer -----------------------------------------------------
 
 def test_batch_summarizer_compacts_session_into_memory(tmp_path):

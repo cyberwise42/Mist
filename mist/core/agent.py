@@ -152,6 +152,59 @@ techniques, past engagements) relevant to whatever service or technology you're 
 right now — that's real material worth consulting, not just your own session history."""
 
 
+_DEAD_END_PIVOT = (
+    "If a service is genuinely exhausted, PIVOT — do not narrow onto it and do not switch to a "
+    "different target: re-read your nmap output and enumerate an open port/service you haven't "
+    "worked yet (a mail service on 25/110/143, SMB on 445, a database, a second web port), fuzz "
+    "for virtual hosts (`ffuf -w <subdomains> -u http://<ip>/ -H 'Host: FUZZ.<domain>' -fs "
+    "<default-page-size>`, then add any hit to /etc/hosts), check the TLS cert for hostnames, or "
+    "widen content discovery (bigger wordlist, `-x php,txt,bak`). Running out of leads on one "
+    "service is a reason to enumerate the SAME target more broadly, never to move to a new host."
+)
+
+
+def _recovery_nudge(stuck_kind: str, stuck_display: str, count: int, escalated: bool) -> str:
+    """The steering message injected into the next mission turn when a
+    stuck-loop guard fires. `escalated` is the second time on the same streak
+    (a reasoning-assisted recovery already failed, now pausing for the
+    operator): its wording asks the model to explain what it's blocked on
+    rather than just "try again". Kept as one function so the recovery and
+    pause branches can't drift apart — and so the dead-end pivot playbook is
+    attached consistently to the two kinds where "out of leads" is the real
+    problem (manual probing and repeating), but not to `no_action` (which is
+    about not acting at all, a different failure)."""
+    if stuck_kind == "manual_probe":
+        if escalated:
+            return (f"You're still making manual curl/wget requests ({stuck_display}) instead of "
+                    "switching to a scanner (gobuster/ffuf/nuclei/searchsploit) or recognizing the "
+                    "objective is already done. Explain what you're blocked on if you need the "
+                    f"operator's judgment. {_DEAD_END_PIVOT}")
+        return (f"You've made {count} manual curl/wget requests in a row, each to a different path, "
+                "without running a scanner. Content/route discovery is a scanner's job (gobuster/"
+                "ffuf/dirsearch) and vulnerability checks come from nmap --script vuln / nuclei / "
+                "searchsploit — not hand-picked URLs. Also check whether the objective is already "
+                "satisfied by what you've already found; if it is, call finish_objective now instead "
+                f"of continuing to explore. {_DEAD_END_PIVOT}")
+    if stuck_kind == "no_action":
+        if escalated:
+            return (f"You're still responding in plain text ({stuck_display}) instead of calling a "
+                    "tool. Call a tool for a concrete next step, or explain what you're blocked on "
+                    "if you need the operator's judgment.")
+        return (f"You've given a plain-text response for {count} turns in a row without calling a "
+                "tool. This objective requires action, not a description of what you would do — pick "
+                "one concrete next step and call a tool for it right now instead of writing out "
+                "commands as text.")
+    # exact- or near-duplicate repeat
+    if escalated:
+        return (f"You've repeated the same tool call ({stuck_display}) {count} times in a row with "
+                "no new result — that approach isn't working. Try something different, or explain "
+                f"what you're blocked on if you need the operator's judgment. {_DEAD_END_PIVOT}")
+    return (f"You've repeated the same tool call ({stuck_display}) {count} times in a row with no "
+            "new result. Stop and actually think through why this specific approach isn't working, "
+            "then commit to a genuinely different next step — not a minor variation of the same "
+            f"command. {_DEAD_END_PIVOT}")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
@@ -1174,27 +1227,8 @@ class MistAgent:
                                   f"({stuck_display}) — reasoning through a different "
                                   "approach before giving up."),
                         )
-                        if stuck_kind == "manual_probe":
-                            nudge = (f"You've made {stuck_repeat_count} manual curl/wget requests in "
-                                    "a row, each to a different path, without running a scanner. "
-                                    "Content/route discovery is a scanner's job (gobuster/ffuf/"
-                                    "dirsearch) and vulnerability checks come from nmap --script "
-                                    "vuln / nuclei / searchsploit — not hand-picked URLs. Also check "
-                                    "whether the objective is already satisfied by what you've "
-                                    "already found; if it is, call finish_objective now instead of "
-                                    "continuing to explore.")
-                        elif stuck_kind == "no_action":
-                            nudge = (f"You've given a plain-text response for {stuck_repeat_count} "
-                                    "turns in a row without calling a tool. This objective requires "
-                                    "action, not a description of what you would do — pick one "
-                                    "concrete next step and call a tool for it right now instead of "
-                                    "writing out commands as text.")
-                        else:
-                            nudge = (f"You've repeated the same tool call ({stuck_display}) "
-                                    f"{stuck_repeat_count} times in a row with no new result. Stop and "
-                                    "actually think through why this specific approach isn't "
-                                    "working, then commit to a genuinely different next step — "
-                                    "not a minor variation of the same command.")
+                        nudge = _recovery_nudge(stuck_kind, stuck_display,
+                                                stuck_repeat_count, escalated=False)
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge,
                                                              findings=mission_findings)
@@ -1223,20 +1257,8 @@ class MistAgent:
                               f"the same tool call {stuck_repeat_count}x in a row again "
                               f"({stuck_display}) — paused for operator review."),
                     )
-                    if stuck_kind == "manual_probe":
-                        nudge = (f"You're still making manual curl/wget requests ({stuck_display}) "
-                                "instead of switching to a scanner (gobuster/ffuf/nuclei/"
-                                "searchsploit) or recognizing the objective is already done. "
-                                "Explain what you're blocked on if you need the operator's judgment.")
-                    elif stuck_kind == "no_action":
-                        nudge = (f"You're still responding in plain text ({stuck_display}) instead of "
-                                "calling a tool. Call a tool for a concrete next step, or explain "
-                                "what you're blocked on if you need the operator's judgment.")
-                    else:
-                        nudge = (f"You've repeated the same tool call ({stuck_display}) "
-                                f"{stuck_repeat_count} times in a row with no new result — that approach "
-                                "isn't working. Try something different, or explain what you're "
-                                "blocked on if you need the operator's judgment.")
+                    nudge = _recovery_nudge(stuck_kind, stuck_display,
+                                            stuck_repeat_count, escalated=True)
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge,
                                                          findings=mission_findings)
