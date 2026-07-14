@@ -448,6 +448,7 @@ class MistTUI(App):
             asyncio.create_task(mission_stall_watchdog(
                 lambda: self._mission_last_progress, self._on_mission_stall,
                 threshold=stall_after, poll_interval=min(15.0, stall_after / 3),
+                paused=lambda: control.paused,  # a paused mission isn't wedged
             ))
             if stall_after and stall_after > 0 else None
         )

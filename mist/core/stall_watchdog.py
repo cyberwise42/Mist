@@ -67,17 +67,31 @@ async def mission_stall_watchdog(
     poll_interval: float = 15.0,
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    paused: Callable[[], bool] = lambda: False,
 ) -> None:
     """Poll `get_last_progress()` — a monotonic timestamp the mission consumer
     updates on every event. When the gap since the last progress first crosses
     `threshold`, call `on_stall(idle_seconds)` exactly ONCE for that stall
-    episode (not once per poll), then re-arm only after progress resumes. Runs
-    forever until cancelled; `now`/`sleep` are injectable for deterministic
-    tests."""
+    episode (not once per poll), then re-arm only after progress resumes.
+
+    A mission legitimately PAUSED for the operator emits no events, which is not
+    a wedge — so while `paused()` is true the watchdog never fires and keeps
+    resetting the idle baseline to now, so it also can't fire on the paused time
+    accumulated once the operator resumes. Runs forever until cancelled;
+    `now`/`sleep`/`paused` are injectable for deterministic tests."""
     armed = True
+    resumed_at = 0.0
+    was_paused = False
     while True:
         await sleep(poll_interval)
-        idle = now() - get_last_progress()
+        if paused():
+            was_paused = True
+            armed = True
+            continue
+        if was_paused:
+            resumed_at = now()  # measure idle from the resume, not from before the pause
+            was_paused = False
+        idle = now() - max(get_last_progress(), resumed_at)
         if idle >= threshold:
             if armed:
                 on_stall(idle)

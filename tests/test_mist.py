@@ -624,6 +624,33 @@ def test_effective_stall_threshold_floors_to_shell_timeout():
     assert effective_stall_threshold(0.0, 480.0) == 0.0       # disabled stays disabled
 
 
+async def test_mission_stall_watchdog_does_not_fire_while_paused():
+    from mist.core.stall_watchdog import mission_stall_watchdog
+    fired: list[float] = []
+    clock = [0.0]
+    is_paused = [True]
+    step = [0]
+
+    async def fake_sleep(_):
+        clock[0] += 60.0        # 60s per poll — idle would blow past 90s threshold
+        step[0] += 1
+        if step[0] == 6:
+            is_paused[0] = False  # operator resumes; idle baseline must reset to ~now
+        if step[0] >= 8:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await mission_stall_watchdog(
+            lambda: 0.0, fired.append,          # last progress is ancient (t=0)
+            threshold=90.0, poll_interval=60.0,
+            now=lambda: clock[0], sleep=fake_sleep,
+            paused=lambda: is_paused[0],
+        )
+    # Never fired during the long pause, and did NOT fire on the pause time
+    # accumulated once resumed (baseline reset) — only genuine post-resume idle counts.
+    assert fired == []
+
+
 async def test_mission_stall_watchdog_fires_once_per_episode_and_rearms():
     from mist.core.stall_watchdog import mission_stall_watchdog
     fired: list[float] = []
