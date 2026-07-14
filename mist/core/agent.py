@@ -39,6 +39,7 @@ from mist.core.action import ActionValidationError, DecisionUseTool, parse_decis
 from mist.core.checkpoints import CheckpointStore
 from mist.core.context_compressor import ContextCompressor
 from mist.core.debrief import DebriefResult, MissionDebriefer
+from mist.core.engagement_state import EngagementState
 from mist.core.mission import MissionControl, MissionEvent
 from mist.core.tool_compressor import ToolOutputCompressor
 from mist.llm.client import LLMClient, parse_json_relaxed
@@ -243,10 +244,17 @@ def _slugify(name: str) -> str:
 
 
 def _mission_continue_message(objective: str, notes: list[str], nudge: str | None = None,
-                              findings: list[str] | None = None) -> str:
+                              findings: list[str] | None = None,
+                              state_summary: str | None = None) -> str:
     msg = MISSION_CONTINUE_TEMPLATE.format(objective=objective)
     if nudge:
         msg = f"{nudge}\n\n{msg}"
+    # The deterministic engagement-state ledger goes at the very TOP, before the
+    # objective boilerplate — it's the model's persistent picture of the target
+    # (ports/hosts/done-actions) and is what stops it re-running finished recon.
+    # See mist.core.engagement_state.
+    if state_summary:
+        msg = f"{state_summary}\n\n{msg}"
     if notes:
         msg += "\n\nOperator note(s) since your last step:\n" + "\n".join(f"- {n}" for n in notes)
     # Carry the mission's accumulated findings on EVERY continuing turn, not
@@ -1120,6 +1128,8 @@ class MistAgent:
             manual_probe_streak = 0
             respond_streak = 0
             mission_findings: list[str] = []
+            engagement = EngagementState(objective)  # deterministic ports/hosts/done ledger
+            last_command = ""                          # cmd from the current tool_start, for observe()
             next_turn_think = False
             recovered_once = False
             # Reason on the opening decision until the mission has made its
@@ -1151,6 +1161,14 @@ class MistAgent:
                         self._mission_log_append(
                             log_path, f"\n### {_now()} — {event.tool}\n**args:** `{event.detail}`\n"
                         )
+                        # Remember this call's shell command so the matching
+                        # tool_result can be folded into the engagement ledger.
+                        last_command = ""
+                        if event.tool == "shell":
+                            try:
+                                last_command = json.loads(event.detail or "{}").get("command", "")
+                            except (ValueError, TypeError):
+                                last_command = ""
                         if event.tool == "finish_objective":
                             finished = True
                         sig = f"{event.tool}:{event.detail}"
@@ -1201,6 +1219,7 @@ class MistAgent:
                     elif event.kind == "tool_result":
                         self._mission_log_append(log_path, f"```\n{event.text}\n```\n")
                         mission_findings.append(f"{event.tool}: {event.text[:200]}")
+                        engagement.observe(last_command, event.text)
                     elif event.kind == "error":
                         # A crashed LLM/network call ends astream_turn's own
                         # generator, but the mission loop must not just spin
@@ -1269,7 +1288,7 @@ class MistAgent:
                                                 stuck_repeat_count, escalated=False)
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge,
-                                                             findings=mission_findings)
+                                                             findings=mission_findings, state_summary=engagement.render())
                         routing_query = _mission_routing_query(objective, notes, nudge)
                         occurrences = 0
                         near_dup_occurrences = 0
@@ -1299,7 +1318,7 @@ class MistAgent:
                                             stuck_repeat_count, escalated=True)
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge,
-                                                         findings=mission_findings)
+                                                         findings=mission_findings, state_summary=engagement.render())
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     occurrences = 0
                     near_dup_occurrences = 0
@@ -1320,7 +1339,7 @@ class MistAgent:
                     notes = control.pop_notes()
                     nudge = f"Your previous attempt failed: {error_text}. Try again."
                     user_msg = _mission_continue_message(objective, notes, nudge,
-                                                         findings=mission_findings)
+                                                         findings=mission_findings, state_summary=engagement.render())
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     continue
 
@@ -1358,7 +1377,7 @@ class MistAgent:
                 if tool_called_this_turn:
                     recovered_once = False
                 notes = control.pop_notes()
-                user_msg = _mission_continue_message(objective, notes, findings=mission_findings)
+                user_msg = _mission_continue_message(objective, notes, findings=mission_findings, state_summary=engagement.render())
                 routing_query = _mission_routing_query(objective, notes)
         finally:
             self.always_exposed.discard("finish_objective")

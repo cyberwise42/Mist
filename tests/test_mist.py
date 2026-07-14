@@ -565,6 +565,55 @@ def test_mission_routing_query_omits_boilerplate():
     assert "search_files" not in q
 
 
+# -- deterministic engagement-state ledger -------------------------------
+
+def test_engagement_state_extracts_target_ports_hosts_actions():
+    from mist.core.engagement_state import EngagementState
+    st = EngagementState('perform a phased pentest on the host "Nexus" at target ip 10.129.36.101')
+    assert st.target_ip == "10.129.36.101"
+    assert st.target_name == "Nexus"
+    # nmap output -> ports/services
+    st.observe("nmap -p- --min-rate=10000 10.129.36.101", "irrelevant")
+    st.observe("nmap -p 22,80 -sV -sC 10.129.36.101",
+               "22/tcp   open  ssh     OpenSSH 9.6p1 (Ubuntu)\n80/tcp   open  http    nginx 1.24.0\n")
+    assert st.ports[22][0] == "ssh" and "OpenSSH" in st.ports[22][1]
+    assert st.ports[80][0] == "http"
+    # /etc/hosts add -> hosts
+    st.observe("grep -qF 'git.nexus.htb' /etc/hosts || echo '10.129.36.101 git.nexus.htb' | sudo tee -a /etc/hosts", "")
+    assert "git.nexus.htb" in st.hosts
+    # completed recon actions, deduped
+    st.observe("gobuster dir -u http://nexus.htb -w big.txt -t 50", "")
+    st.observe("gobuster vhost -u http://nexus.htb -w subs.txt", "")
+    st.observe("searchsploit gitea 1.26", "")
+    block = st.render()
+    assert "port-scan" in block and "service-scan" in block
+    assert "dir-fuzz" in block and "vhost-fuzz" in block and "searchsploit" in block
+    assert "PORTS" in block and "22/ssh" in block and "80/http" in block
+    assert "TARGET Nexus 10.129.36.101" in block
+
+
+def test_engagement_state_dedupes_and_separates_by_host():
+    from mist.core.engagement_state import EngagementState
+    st = EngagementState("target ip 10.10.10.5")
+    st.observe("gobuster dir -u http://nexus.htb/ -w w.txt", "")
+    st.observe("gobuster dir -u http://nexus.htb/ -w w.txt", "")   # same host -> no dup
+    st.observe("gobuster dir -u http://git.nexus.htb/ -w w.txt", "")  # new host -> new entry
+    dir_actions = [a for a in st.actions if a.startswith("dir-fuzz")]
+    assert dir_actions == ["dir-fuzz:nexus.htb", "dir-fuzz:git.nexus.htb"]
+    # a vhost ffuf is NOT double-counted as directory fuzzing
+    st2 = EngagementState("target ip 10.10.10.5")
+    st2.observe("ffuf -u http://10.10.10.5/ -H 'Host: FUZZ.nexus.htb' -w s.txt", "")
+    assert any(a.startswith("vhost-fuzz") for a in st2.actions)
+    assert not any(a.startswith("dir-fuzz") for a in st2.actions)
+
+
+def test_engagement_state_empty_until_facts_exist():
+    from mist.core.engagement_state import EngagementState
+    assert EngagementState("").render() == ""          # nothing at all
+    st = EngagementState("target ip 10.10.10.5")
+    assert "TARGET" in st.render()                       # a target alone is enough to show
+
+
 # -- stuck-recovery nudges (dead-end pivot) ------------------------------
 
 def test_recovery_nudge_manual_probe_carries_pivot_playbook():
