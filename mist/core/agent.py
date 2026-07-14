@@ -1125,6 +1125,10 @@ class MistAgent:
         # run shares regardless of target.
         target = _extract_target(objective)
         workspace = getattr(self.tools, "workspace", None)
+        if workspace is not None:
+            # Fresh per-mission repeat-scan memory (see registry._annotate_repeat_scan).
+            workspace.seen_scans = set()
+            workspace.flag_repeat_scans = self.cfg.mission.flag_repeat_scans
         if workspace is not None and target and _IPV4_RE.fullmatch(target):
             # Pin the mission's single authorized target so the shell scope
             # guard blocks any command that aims a recon/attack tool at a

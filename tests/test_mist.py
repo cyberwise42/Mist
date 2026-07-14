@@ -1319,6 +1319,52 @@ def test_browse_to_out_of_scope_ip_is_blocked_via_shell():
     assert out.startswith("[blocked]") and "10.10.11.238" in out
 
 
+# -- repeat-scan warning (cross-turn re-running) -------------------------
+
+def test_repeat_scan_warns_on_identical_rerun_but_still_returns_the_result():
+    from mist.tools.registry import MutableWorkspace, _annotate_repeat_scan
+    ws = MutableWorkspace()
+    cmd = "gobuster dir -u http://x.htb -w common.txt"
+    r1 = _annotate_repeat_scan(cmd, "index.html (Status: 200)", ws)
+    assert not r1.startswith("[note]")            # first run: clean
+    r2 = _annotate_repeat_scan(cmd, "index.html (Status: 200)", ws)
+    assert r2.startswith("[note]")                # identical rerun: warned...
+    assert "index.html" in r2                     # ...but the real (fresh) result is still there
+
+
+def test_repeat_scan_ignores_different_commands_and_non_scans():
+    from mist.tools.registry import MutableWorkspace, _annotate_repeat_scan
+    ws = MutableWorkspace()
+    _annotate_repeat_scan("gobuster dir -u http://x -w common.txt", "out", ws)
+    # a different wordlist is a different command — not a repeat
+    assert not _annotate_repeat_scan(
+        "gobuster dir -u http://x -w big.txt", "out", ws).startswith("[note]")
+    # non-scan commands (curl/cat/etc.) are never flagged, even identical, since
+    # they can be stateful (a re-curl after login legitimately differs)
+    _annotate_repeat_scan("cat notes.md", "hi", ws)
+    assert not _annotate_repeat_scan("cat notes.md", "hi", ws).startswith("[note]")
+
+
+def test_repeat_scan_failed_first_run_is_retryable():
+    from mist.tools.registry import MutableWorkspace, _annotate_repeat_scan
+    ws = MutableWorkspace()
+    cmd = "gobuster dir -u http://x.htb -w common.txt"
+    # first run failed (e.g. vhost not in /etc/hosts yet) -> not recorded
+    _annotate_repeat_scan(cmd, "ERROR: could not resolve host x.htb", ws)
+    # the retry runs clean (no warning) and succeeds
+    assert not _annotate_repeat_scan(cmd, "index.html (Status: 200)", ws).startswith("[note]")
+    # a third identical run, now that it has succeeded, IS warned
+    assert _annotate_repeat_scan(cmd, "index.html (Status: 200)", ws).startswith("[note]")
+
+
+def test_repeat_scan_respects_disable_flag():
+    from mist.tools.registry import MutableWorkspace, _annotate_repeat_scan
+    ws = MutableWorkspace(flag_repeat_scans=False)
+    cmd = "nmap -p- 10.10.10.5"
+    _annotate_repeat_scan(cmd, "22/tcp open ssh", ws)
+    assert not _annotate_repeat_scan(cmd, "22/tcp open ssh", ws).startswith("[note]")
+
+
 def test_shell_ssh_backend_builds_correct_command(monkeypatch):
     captured = {}
 

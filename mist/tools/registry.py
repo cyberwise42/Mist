@@ -395,9 +395,54 @@ class MutableWorkspace:
     mission's single authorized target, read at call time by the scope guard
     (see `_scope_violation`) so a `shell` command can't drift to a different
     host. None outside a mission (or when the objective named no IP), which
-    disables the guard."""
+    disables the guard.
+
+    `.seen_scans` / `.flag_repeat_scans` back the repeat-scan warning (see
+    `_annotate_repeat_scan`): the set of scan commands already run this mission,
+    cleared at mission start, so an identical re-issued scan gets a warning
+    appended to its (still-fresh) result."""
     path: Path | None = None
     target_ip: str | None = None
+    seen_scans: set[str] = field(default_factory=set)
+    flag_repeat_scans: bool = True
+
+
+# Enumeration scanners whose output is deterministic against a static target —
+# re-running the byte-identical command is almost always wasted work (the exact
+# across-turn redundancy the engagement ledger's DONE list didn't always deter).
+_SCAN_CMD_RE = re.compile(
+    r"\b(?:nmap|masscan|gobuster|ffuf|feroxbuster|dirb|dirsearch|wfuzz|nuclei|"
+    r"nikto|whatweb|wpscan)\b", re.IGNORECASE)
+
+
+def _scan_looks_failed(result: str) -> bool:
+    """A scan result that errored / timed out / found nothing isn't a real
+    'already got this' — so it's NOT recorded, and a legitimate retry (e.g. the
+    first run failed because the vhost wasn't in /etc/hosts yet) runs clean."""
+    head = result.lstrip()[:400]
+    return (head.startswith(("ERROR", "[blocked]", "(no output"))
+            or "timed out after" in head or "was killed by the operator" in head)
+
+
+def _annotate_repeat_scan(command: str, result: str, workspace: "MutableWorkspace | None") -> str:
+    """When an enumeration scan byte-identical to one already run this mission is
+    re-issued, append a warning to its result — right where the model reasons,
+    so it stops re-scanning and acts on findings. The scan still RAN (this never
+    substitutes a stale cached result: a re-scan after gaining a foothold can
+    legitimately find new paths, and hiding that in a pentest is unacceptable).
+    Records only successful scans, so an errored first attempt can be retried."""
+    if workspace is None or not workspace.flag_repeat_scans or not _SCAN_CMD_RE.search(command):
+        return result
+    norm = " ".join(command.split())
+    if norm in workspace.seen_scans:
+        return ("[note] You already ran this EXACT scan earlier this mission. Re-running a "
+                "completed scan against an unchanged target returns the same result — if the "
+                "output below matches what you already had, it added nothing. Stop re-scanning: "
+                "act on your findings, or scan something NEW (a different host, port, or "
+                "wordlist).\n\n" + result)
+    if not _scan_looks_failed(result):
+        workspace.seen_scans.add(norm)
+    return result
 
 
 # An IPv4 used as a recon/enumeration TARGET: the host of an http(s) URL, or a
@@ -488,8 +533,9 @@ def _make_shell(shell_cfg: ShellConfig | None,
             cwd = workspace.path if workspace is not None else None
             if cwd is not None:
                 cwd.mkdir(parents=True, exist_ok=True)
-            return _shell(command, registry, cwd=cwd,
-                         artifacts=artifacts, structured_cfg=structured_cfg)
+            result = _shell(command, registry, cwd=cwd,
+                           artifacts=artifacts, structured_cfg=structured_cfg)
+            return _annotate_repeat_scan(command, result, workspace)
         return _local_shell
 
     ssh = shell_cfg.ssh
@@ -526,8 +572,9 @@ def _make_shell(shell_cfg: ShellConfig | None,
         remote_command = f"bash -c {shlex.quote(remote_command)}"
         args += ["-p", str(ssh.port), f"{ssh.user}@{ssh.host}" if ssh.user else ssh.host,
                 remote_command]
-        return _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry,
-                               command_text=command, artifacts=artifacts, structured_cfg=structured_cfg)
+        result = _run_subprocess(args, shell=False, timeout=ssh.timeout, registry=registry,
+                                 command_text=command, artifacts=artifacts, structured_cfg=structured_cfg)
+        return _annotate_repeat_scan(command, result, workspace)
     return _shell_ssh
 
 

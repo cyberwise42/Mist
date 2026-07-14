@@ -252,6 +252,12 @@ class MissionConfig(BaseModel):
                                         # whole token budget still "thinking" and never
                                         # calling a tool, which could otherwise run
                                         # undetected all the way to max_turns/max_seconds.
+    flag_repeat_scans: bool = True  # when the model re-issues an enumeration scan (nmap/gobuster/
+                                    # ffuf/nuclei/...) byte-identical to one already run this
+                                    # mission, append a warning to its result so it stops
+                                    # re-scanning and acts on findings. The scan still RUNS (never
+                                    # a stale cached result — a re-scan after a foothold can find
+                                    # new paths), this only flags the redundancy. False disables.
     stuck_recovery_attempts: int = 2  # how many autonomous reasoning-assisted recovery attempts
                                       # a stuck streak gets before the mission PAUSES for the
                                       # operator. Each attempt re-prompts the model to break its
