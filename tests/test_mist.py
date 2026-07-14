@@ -614,6 +614,54 @@ def test_engagement_state_empty_until_facts_exist():
     assert "TARGET" in st.render()                       # a target alone is enough to show
 
 
+async def test_astream_turn_refreshes_ledger_each_inner_decision(tmp_path):
+    # The ledger must be re-injected fresh before EVERY inner-loop decision (not
+    # just at turn start), or a long turn re-runs scans it already ran that turn.
+    from mist.tools.registry import Tool
+    step = [0]
+
+    def state_provider():
+        step[0] += 1
+        return f"CURRENT ENGAGEMENT STATE\nDONE step-{step[0]}"
+
+    seen: list[list[str]] = []  # ledger messages the LLM saw on each decision
+
+    class RecordingLLM:
+        def __init__(self, decisions):
+            self.decisions = list(decisions)
+
+        async def acomplete(self, messages, json_schema=None, force_think=False):
+            seen.append([m["content"] for m in messages
+                         if m["content"].startswith("CURRENT ENGAGEMENT STATE")])
+            return self.decisions.pop(0)
+
+        async def astream(self, messages):
+            yield "done"
+
+    llm = RecordingLLM([
+        json.dumps({"action": "use_tool", "tool": "noop", "arguments": {}}),
+        json.dumps({"action": "use_tool", "tool": "noop", "arguments": {}}),
+        json.dumps({"action": "respond"}),
+    ])
+    cfg = MistConfig()
+    cfg.memory.db_path = str(tmp_path / "t.db")
+    store = MemoryStore(cfg.db_path)
+    skills = SkillRouter("skills_library")
+    tools = default_registry(remember_fn=store.remember)
+    tools.register(Tool(name="noop", description="noop",
+                        parameters={"type": "object", "properties": {}}, fn=lambda: "ok"))
+    agent = MistAgent(cfg, llm, store, skills, tools)
+
+    _ = [e async for e in agent.astream_turn("go", state_provider=state_provider)]
+
+    assert len(seen) == 3                       # a ledger present at every decision
+    assert all(len(s) == 1 for s in seen), seen  # exactly one — not accumulating stale copies
+    # and REFRESHED each decision (reflects this-turn progress), not the stale first snapshot
+    assert "step-1" in seen[0][0]
+    assert "step-2" in seen[1][0]
+    assert "step-3" in seen[2][0]
+
+
 # -- stuck-recovery nudges (dead-end pivot) ------------------------------
 
 def test_recovery_nudge_manual_probe_carries_pivot_playbook():
@@ -4715,7 +4763,12 @@ async def test_mission_first_turn_uses_imperative_framing_not_bare_objective(tmp
 
     class CapturingLLM(ScriptedAsyncLLM):
         async def acomplete(self, messages, json_schema=None, force_think=False):
-            captured.setdefault("first_user", messages[-1]["content"])
+            # The engagement ledger is now appended as the freshest (last)
+            # message, so the imperative continue-message is second-to-last —
+            # capture it by content, not position.
+            captured.setdefault("first_user", next(
+                (m["content"] for m in messages if "not a request for a plan" in m["content"]),
+                messages[-1]["content"]))
             return self.decisions.pop(0)
 
     llm = CapturingLLM([

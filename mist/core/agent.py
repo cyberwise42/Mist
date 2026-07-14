@@ -774,7 +774,9 @@ class MistAgent:
     # Streaming interface (mist tui)
     # ------------------------------------------------------------------
     async def astream_turn(self, user_msg: str, force_think: bool = False,
-                           routing_query: str | None = None) -> AsyncIterator[TurnEvent]:
+                           routing_query: str | None = None,
+                           state_provider: "Callable[[], str] | None" = None
+                           ) -> AsyncIterator[TurnEvent]:
         """Async generator form of a turn: yields TurnEvents as they happen so
         a caller (the TUI) can render tokens live and — since this is a plain
         asyncio coroutine — cancel it cleanly (Ctrl+C) at any await point.
@@ -785,7 +787,17 @@ class MistAgent:
 
         `routing_query` (see `_assemble_context`) lets a mission drive
         tool/skill/memory selection off the bare objective instead of the
-        full boilerplate-wrapped continue-message."""
+        full boilerplate-wrapped continue-message.
+
+        `state_provider` (a mission passes engagement.render) returns the CURRENT
+        engagement-state ledger. It's re-queried before EVERY inner-loop decision
+        and re-injected as the freshest message — because a turn's inner loop can
+        run up to max_tool_steps (40) tool calls, and the ledger baked into the
+        turn-start user_msg goes stale within that one turn, so the model
+        re-ran scans it had already run *this same turn*. The mission loop's
+        engagement.observe() runs right after each tool_result yield (before the
+        next decision resumes here), so this callback always reflects the calls
+        already made this turn."""
         self._ctx_cache = {}  # fresh per-turn context memo (see __init__)
         history = self._history()
         # Context assembly can make a network call (embedding fallback in
@@ -822,7 +834,24 @@ class MistAgent:
         # objective moving, without the per-inner-call slowdown that reasoning
         # across the whole (up to max_tool_steps-long) turn caused.
         acted_this_turn = False
+        ledger_msg: dict[str, str] | None = None  # refreshed engagement ledger (see state_provider)
         for _ in range(self.cfg.context.max_tool_steps):
+            # Refresh the engagement-state ledger BEFORE each decision so it
+            # reflects the calls already made THIS turn — not just the snapshot
+            # baked into the turn-start user_msg. Without this the ledger only
+            # updated between turns, so within one (up to 40-step) inner loop the
+            # model re-ran scans it had already run this same turn (confirmed
+            # live: gobuster dir on the same host multiple times in one turn).
+            # Drop the stale copy and append the current one so it's the freshest
+            # (most-recent) message the decision sees.
+            if state_provider is not None:
+                if ledger_msg is not None and ledger_msg in messages:
+                    messages.remove(ledger_msg)
+                ledger_msg = None
+                text = state_provider()
+                if text:
+                    ledger_msg = {"role": "user", "content": text}
+                    messages.append(ledger_msg)
             # Re-fit before EVERY decision, not just the first. This turn's tool
             # results are appended to `messages` each step (below) and never
             # removed, so a long chain — a basic nmap, then a full nmap, then
@@ -1153,7 +1182,8 @@ class MistAgent:
                 error_text: str | None = None
                 tool_called_this_turn = False
                 async for event in self.astream_turn(user_msg, force_think=use_think,
-                                                     routing_query=routing_query):
+                                                     routing_query=routing_query,
+                                                     state_provider=engagement.render):
                     yield MissionEvent(kind=event.kind, text=event.text,
                                        tool=event.tool, detail=event.detail)
                     if event.kind == "tool_start":
@@ -1288,7 +1318,7 @@ class MistAgent:
                                                 stuck_repeat_count, escalated=False)
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge,
-                                                             findings=mission_findings, state_summary=engagement.render())
+                                                             findings=mission_findings)
                         routing_query = _mission_routing_query(objective, notes, nudge)
                         occurrences = 0
                         near_dup_occurrences = 0
@@ -1318,7 +1348,7 @@ class MistAgent:
                                             stuck_repeat_count, escalated=True)
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge,
-                                                         findings=mission_findings, state_summary=engagement.render())
+                                                         findings=mission_findings)
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     occurrences = 0
                     near_dup_occurrences = 0
@@ -1339,7 +1369,7 @@ class MistAgent:
                     notes = control.pop_notes()
                     nudge = f"Your previous attempt failed: {error_text}. Try again."
                     user_msg = _mission_continue_message(objective, notes, nudge,
-                                                         findings=mission_findings, state_summary=engagement.render())
+                                                         findings=mission_findings)
                     routing_query = _mission_routing_query(objective, notes, nudge)
                     continue
 
@@ -1377,7 +1407,7 @@ class MistAgent:
                 if tool_called_this_turn:
                     recovered_once = False
                 notes = control.pop_notes()
-                user_msg = _mission_continue_message(objective, notes, findings=mission_findings, state_summary=engagement.render())
+                user_msg = _mission_continue_message(objective, notes, findings=mission_findings)
                 routing_query = _mission_routing_query(objective, notes)
         finally:
             self.always_exposed.discard("finish_objective")

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 
 class ContextConfig(BaseModel):
-    token_budget: int = 6000
+    token_budget: int = 16384
     history_turns: int = 6
     max_tool_output_chars: int = 2000
     max_tool_steps: int = 8  # bound on tool calls per turn; raise for longer chains
@@ -185,7 +185,7 @@ class SubagentConfig(BaseModel):
 
 class GenerationConfig(BaseModel):
     temperature: float = 0.2
-    max_tokens: int = 1024
+    max_tokens: int = 8192
     think: bool = True  # reasoning-model <think> traces on the free-text answer step;
                         # forced off regardless on schema-constrained calls (see LLMClient)
     keep_alive: str | None = None  # Ollama-only: how long to keep the model resident in
