@@ -205,13 +205,17 @@ def _recovery_nudge(stuck_kind: str, stuck_display: str, count: int, escalated: 
                 "commands as text.")
     # exact- or near-duplicate repeat
     if escalated:
-        return (f"You've repeated the same tool call ({stuck_display}) {count} times in a row with "
-                "no new result — that approach isn't working. Try something different, or explain "
-                f"what you're blocked on if you need the operator's judgment. {_DEAD_END_PIVOT}")
-    return (f"You've repeated the same tool call ({stuck_display}) {count} times in a row with no "
-            "new result. Stop and actually think through why this specific approach isn't working, "
-            "then commit to a genuinely different next step — not a minor variation of the same "
-            f"command. {_DEAD_END_PIVOT}")
+        return (f"You have run this same command ({stuck_display}) {count} times and gotten the "
+                "SAME result every time — it is deterministic, so running it again produces "
+                "identical output and CANNOT tell you anything new. Do not run it or a trivial "
+                "variation again. Either act on what that output already told you, or explain what "
+                f"you're blocked on if you need the operator's judgment. {_DEAD_END_PIVOT}")
+    return (f"You have run this EXACT command ({stuck_display}) {count} times and gotten the SAME "
+            "result every time. Running it again produces byte-for-byte identical output — it "
+            "cannot help, and neither can a trivial variation (a different flag, wordlist, or "
+            "grep pattern on the same target). The result you already have is your answer; act on "
+            "it and choose a genuinely DIFFERENT next action — a different service, tool, or "
+            f"technique. {_DEAD_END_PIVOT}")
 
 
 def _now() -> str:
@@ -1104,6 +1108,7 @@ class MistAgent:
                                   if manual_probe_threshold is None else manual_probe_threshold)
         respond_streak_threshold = (self.cfg.mission.respond_streak_threshold
                                     if respond_streak_threshold is None else respond_streak_threshold)
+        recovery_budget = self.cfg.mission.stuck_recovery_attempts
 
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
@@ -1160,7 +1165,7 @@ class MistAgent:
             engagement = EngagementState(objective)  # deterministic ports/hosts/done ledger
             last_command = ""                          # cmd from the current tool_start, for observe()
             next_turn_think = False
-            recovered_once = False
+            recovery_attempts = 0  # autonomous recoveries used on the current stuck streak
             # Reason on the opening decision until the mission has made its
             # first tool call, then run fast. astream_turn applies this only to
             # the first decision of each turn (before any tool runs that turn),
@@ -1294,25 +1299,28 @@ class MistAgent:
                     return
 
                 if stuck:
-                    if not recovered_once:
-                        # First time stuck on this streak: give it one
-                        # genuine reasoning pass instead of immediately
-                        # pausing for an operator. Every stuck-loop observed
-                        # in real runs was fixed by a human saying "stop and
-                        # actually think about why this isn't working" —
-                        # this is that same nudge, but resolved by the model
-                        # itself rather than requiring a human every time.
+                    if recovery_attempts < recovery_budget:
+                        # Give the model another autonomous reasoning pass to
+                        # break its own loop instead of immediately pausing for
+                        # an operator. Every stuck-loop observed in real runs was
+                        # fixed by a human saying "stop and actually think about
+                        # why this isn't working" — this is that same nudge,
+                        # resolved by the model itself. recovery_budget of these
+                        # attempts happen before it requires a human, so an
+                        # occasional loop doesn't pull the operator in every time.
+                        recovery_attempts += 1
                         self._mission_log_append(
                             log_path,
-                            f"\n**Recovering** at {_now()}: repeated the same tool call "
+                            f"\n**Recovering** at {_now()} (attempt {recovery_attempts}/"
+                            f"{recovery_budget}): repeated the same tool call "
                             f"{stuck_repeat_count}x in a row ({stuck_display}) — attempting a "
                             "reasoning-assisted recovery before pausing.\n",
                         )
                         yield MissionEvent(
                             kind="recovering",
                             text=(f"Repeated the same tool call {stuck_repeat_count}x in a row "
-                                  f"({stuck_display}) — reasoning through a different "
-                                  "approach before giving up."),
+                                  f"({stuck_display}) — reasoning through a different approach "
+                                  f"(recovery {recovery_attempts}/{recovery_budget})."),
                         )
                         nudge = _recovery_nudge(stuck_kind, stuck_display,
                                                 stuck_repeat_count, escalated=False)
@@ -1324,13 +1332,11 @@ class MistAgent:
                         near_dup_occurrences = 0
                         manual_probe_streak = 0
                         respond_streak = 0
-                        recovered_once = True
                         next_turn_think = True
                         continue
 
-                    # Already tried a reasoning-assisted recovery for this
-                    # streak and got stuck again — that didn't work either,
-                    # so this now genuinely needs an operator.
+                    # Exhausted the autonomous recovery budget for this streak —
+                    # it genuinely needs an operator now.
                     control.pause()
                     self._mission_log_append(
                         log_path,
@@ -1354,7 +1360,7 @@ class MistAgent:
                     near_dup_occurrences = 0
                     manual_probe_streak = 0
                     respond_streak = 0
-                    recovered_once = False
+                    recovery_attempts = 0
                     continue
 
                 if error_text is not None:
@@ -1405,7 +1411,7 @@ class MistAgent:
                 # recovery attempt (each not-yet-stuck turn in between
                 # would silently discard the "already tried once" state).
                 if tool_called_this_turn:
-                    recovered_once = False
+                    recovery_attempts = 0  # progress broke the streak; refresh the recovery budget
                 notes = control.pop_notes()
                 user_msg = _mission_continue_message(objective, notes, findings=mission_findings)
                 routing_query = _mission_routing_query(objective, notes)

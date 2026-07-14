@@ -707,13 +707,16 @@ def test_recovery_nudge_manual_probe_carries_pivot_playbook():
     assert "new host" in n.lower()
 
 
-def test_recovery_nudge_repeat_carries_pivot_and_escalation_wording():
+def test_recovery_nudge_repeat_is_blunt_about_identical_repeats_and_carries_pivot():
     from mist.core.agent import _recovery_nudge
     first = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=False)
-    assert "think through" in first.lower()        # first-time recovery wording
-    assert "Host: FUZZ" in first                    # pivot playbook attached
+    # blunt about the deterministic identical repeat, and pushes a DIFFERENT action
+    assert "identical" in first.lower()
+    assert "different" in first.lower()
+    assert "shell:{cmd}" in first                    # names the offending command
+    assert "Host: FUZZ" in first                     # pivot playbook attached
     escalated = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=True)
-    assert "blocked on" in escalated.lower()        # escalated defers to operator
+    assert "blocked on" in escalated.lower()         # escalated defers to operator
     assert "Host: FUZZ" in escalated
 
 
@@ -4001,10 +4004,44 @@ def make_mission_agent(tmp_path, decisions):
     cfg = MistConfig()
     cfg.memory.db_path = str(tmp_path / "test.db")
     cfg.wiki.root_path = str(tmp_path / "wiki")
+    # These mission tests assert detection -> one recovery -> pause; pin the
+    # recovery budget to 1 so they're decoupled from the default (which a later
+    # test exercises directly). See mission.stuck_recovery_attempts.
+    cfg.mission.stuck_recovery_attempts = 1
     store = MemoryStore(cfg.db_path)
     skills = SkillRouter("skills_library")
     tools = default_registry(remember_fn=store.remember, wiki_root=cfg.wiki_root)
     return MistAgent(cfg, ScriptedAsyncLLM(decisions), store, skills, tools)
+
+
+async def test_stuck_recovery_budget_gives_multiple_recoveries_before_pausing(tmp_path):
+    # With stuck_recovery_attempts=2, a stuck streak gets TWO autonomous recovery
+    # attempts before the mission pauses for the operator — fewer human pulls.
+    ident = json.dumps({"action": "use_tool", "tool": "shell",
+                        "arguments": {"command": "echo same"}})
+    agent = make_mission_agent(tmp_path, [ident] * 12)
+    agent.cfg.mission.stuck_recovery_attempts = 2   # override the helper's pin of 1
+    agent.cfg.mission.stuck_repeat_threshold = 3
+    control = MissionControl()
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("do it", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(500):
+        if any(e.kind == "stuck" for e in events):
+            break
+        await asyncio.sleep(0.01)
+    kinds = [e.kind for e in events]
+    assert kinds.count("recovering") == 2   # two autonomous recoveries...
+    assert kinds.count("stuck") == 1        # ...only then does it pause
+    assert control.paused
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_mission_redirects_shell_workspace_to_target_directory(tmp_path, monkeypatch):

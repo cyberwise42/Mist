@@ -252,6 +252,13 @@ class MissionConfig(BaseModel):
                                         # whole token budget still "thinking" and never
                                         # calling a tool, which could otherwise run
                                         # undetected all the way to max_turns/max_seconds.
+    stuck_recovery_attempts: int = 2  # how many autonomous reasoning-assisted recovery attempts
+                                      # a stuck streak gets before the mission PAUSES for the
+                                      # operator. Each attempt re-prompts the model to break its
+                                      # own loop; only after this many fail does it require a human.
+                                      # Raise to cut operator interventions (at the cost of a few
+                                      # more turns spent self-correcting); 1 = the old pause-after-
+                                      # one-try behavior; 0 = pause immediately, no self-recovery.
     stall_watchdog_seconds: float = 300.0  # if a running mission emits no event for this many
                                            # seconds, dump every pending asyncio task's stack into
                                            # the mission log — a diagnostic for a wedged turn that
