@@ -614,6 +614,40 @@ def test_engagement_state_empty_until_facts_exist():
     assert "TARGET" in st.render()                       # a target alone is enough to show
 
 
+def test_engagement_state_captures_credentials_and_skips_noise():
+    # Regression: the model read a git commit's .env with real DB creds and
+    # walked right past them, because the ledger never captured/pinned the loot.
+    from mist.core.engagement_state import EngagementState
+    st = EngagementState("target ip 10.129.36.101")
+    st.observe("git show 1615c46:.env",
+               "DB_CONNECTION=mysql\nDB_HOST=krayin-mysql\nDB_PORT=3306\n"
+               "DB_USERNAME=krayin\nDB_PASSWORD=N27xh!!2ucY04\n"
+               "REDIS_PASSWORD=null\nMAIL_PASSWORD=null\nIMAP_PASSWORD=password1\n")
+    assert "DB_USERNAME=krayin" in st.creds
+    assert "DB_PASSWORD=N27xh!!2ucY04" in st.creds       # the real password, captured
+    assert "IMAP_PASSWORD=password1" in st.creds
+    # noise skipped: null values, and non-secret keys (host/connection/port)
+    assert not any("null" in c for c in st.creds)
+    assert not any(c.startswith(("DB_HOST", "DB_CONNECTION", "DB_PORT")) for c in st.creds)
+    # rendered prominently with an imperative to USE them
+    block = st.render()
+    assert "CREDS" in block and "USE THESE" in block
+    assert "N27xh!!2ucY04" in block
+
+
+def test_engagement_state_credential_placeholder_filtering():
+    from mist.core.engagement_state import EngagementState
+    st = EngagementState("target ip 10.10.10.5")
+    st.observe("cat config", "PASSWORD=changeme\nAPI_KEY=<your_key_here>\n"
+                             "SECRET=\nADMIN_PASSWORD=password\nDB_PASSWORD=Sup3rStr0ng!\n")
+    # placeholders/empties dropped, the one real secret kept
+    assert st.creds == ["DB_PASSWORD=Sup3rStr0ng!"]
+    # a real username value that happens to be "admin" is NOT treated as noise
+    st2 = EngagementState("")
+    st2.observe("cat .env", "DB_USERNAME=admin\nDB_PASSWORD=r00tme\n")
+    assert "DB_USERNAME=admin" in st2.creds and "DB_PASSWORD=r00tme" in st2.creds
+
+
 async def test_astream_turn_refreshes_ledger_each_inner_decision(tmp_path):
     # The ledger must be re-injected fresh before EVERY inner-loop decision (not
     # just at turn start), or a long turn re-runs scans it already ran that turn.

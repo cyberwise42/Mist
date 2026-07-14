@@ -50,6 +50,30 @@ _ACTION_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
 ]
 _URL_HOST_RE = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.-]*)")
 
+# A KEY=value / KEY: value assignment whose key names a secret. Targets the
+# deterministic loot an engagement actually turns up — .env / config /
+# docker-compose / git-history creds — which is the single highest-value thing
+# found and exactly what the model was losing when the output scrolled out of
+# context (it read a git commit's .env with DB_PASSWORD and walked right past it).
+_ASSIGN_RE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z][\w.-]*)[ \t]*[=:][ \t]*(.+?)[ \t]*$", re.MULTILINE)
+_SECRET_KEY_RE = re.compile(
+    r"passw(?:or)?d|username|secret|api[_-]?key|apikey|access[_-]?key|"
+    r"private[_-]?key|auth[_-]?token|_token$|^token$|credential", re.IGNORECASE)
+# Placeholder / unset values that are NOT real creds. Note: common real
+# usernames (admin/root/user) are deliberately NOT here — they're valid loot.
+_CRED_PLACEHOLDER = {"null", "none", "nil", "undefined", "password", "passwd",
+                     "changeme", "changethis", "example", "secret", "token",
+                     "your_password", "your-password", "supersecret", "xxx"}
+
+
+def _is_placeholder_value(v: str) -> bool:
+    v = v.strip().strip("'\"").strip()
+    if len(v) < 3 or len(v) > 100:
+        return True
+    low = v.lower()
+    return low in _CRED_PLACEHOLDER or low.startswith(("<", "${", "your", "changeme", "example", "xxx"))
+
 
 class EngagementState:
     """Accumulates deterministic facts about the target from tool output and
@@ -63,6 +87,7 @@ class EngagementState:
         self.ports: dict[int, tuple[str, str]] = {}   # port -> (service, version)
         self.hosts: list[str] = []                     # known hostnames (ordered, unique)
         self.actions: list[str] = []                   # completed recon labels (ordered, unique)
+        self.creds: list[str] = []                     # discovered KEY=value secrets (ordered, unique)
 
     def observe(self, command: str, output: str) -> None:
         """Fold one tool call's command+output into the state. Safe to call on
@@ -72,6 +97,12 @@ class EngagementState:
         # Open ports/services from any nmap output present.
         for port, service, version in _NMAP_PORT_RE.findall(output):
             self.ports[int(port)] = (service, (version or "").strip()[:40])
+        # Credentials found in tool output (.env / config / git history / etc.).
+        for key, value in _ASSIGN_RE.findall(output):
+            if _SECRET_KEY_RE.search(key) and not _is_placeholder_value(value):
+                entry = f"{key}={value.strip().strip(chr(39) + chr(34))}"
+                if entry not in self.creds:
+                    self.creds.append(entry)
         # Hostnames written to /etc/hosts (the model's own vhost bookkeeping).
         if "/etc/hosts" in command:
             for host in _HOST_PAIR_RE.findall(command):
@@ -95,10 +126,16 @@ class EngagementState:
     def render(self) -> str:
         """Compact block for injection. Empty (returns "") until there's at
         least a target, so an opening turn isn't cluttered with blank fields."""
-        if not (self.target_ip or self.target_name or self.ports or self.hosts or self.actions):
+        if not (self.target_ip or self.target_name or self.ports or self.hosts
+                or self.actions or self.creds):
             return ""
         lines = ["CURRENT ENGAGEMENT STATE (facts already gathered — act on these; do NOT "
                  "re-run anything under DONE or re-add a HOST you already have):"]
+        # Creds first — they're the loot, and losing them was the whole problem.
+        if self.creds:
+            lines.append("CREDS (USE THESE before any more enumeration — try them for ssh, the "
+                         "web-app/service login, or the database they name; do not walk past "
+                         "them): " + " · ".join(self.creds[:12]))
         tgt = " ".join(x for x in (self.target_name, self.target_ip) if x)
         if tgt:
             lines.append(f"TARGET {tgt}")
