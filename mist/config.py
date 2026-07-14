@@ -252,6 +252,15 @@ class MissionConfig(BaseModel):
                                         # whole token budget still "thinking" and never
                                         # calling a tool, which could otherwise run
                                         # undetected all the way to max_turns/max_seconds.
+    exploitation_guard_multiplier: float = 3.0  # phase-aware loosening: when the current shell
+                                                # command is hands-on exploitation (a crafted POST
+                                                # payload, a web/reverse-shell string, SQLi, or an
+                                                # exploit script — see _is_exploitation_iteration),
+                                                # the near_duplicate and manual_probe thresholds are
+                                                # multiplied by this, since iterating payloads
+                                                # against ONE endpoint is productive, not a loop.
+                                                # Exact byte-identical repeats (stuck_repeat) stay
+                                                # tight. 1.0 = no loosening.
     flag_repeat_scans: bool = True  # when the model re-issues an enumeration scan (nmap/gobuster/
                                     # ffuf/nuclei/...) byte-identical to one already run this
                                     # mission, append a warning to its result so it stops

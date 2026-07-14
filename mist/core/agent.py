@@ -469,6 +469,29 @@ def _is_manual_probe(tool: str, args_json: str) -> bool:
     return bool(_MANUAL_PROBE_RE.match(command))
 
 
+# Hands-on EXPLOITATION of a known target — a crafted request BODY, a web or
+# reverse-shell payload, a SQLi string, or running an exploit script — as
+# opposed to recon path-guessing. During exploitation, hammering ONE endpoint
+# with varied payloads is the correct, productive move, so the near-duplicate
+# and manual-probe guards (tuned to catch hand-guessing content-discovery PATHS)
+# must give it far more rope before flagging a loop.
+_EXPLOIT_ITER_RE = re.compile(
+    r"-X\s*POST|--data(?:-binary|-raw|-urlencode)?\b|\s-d\s|"              # crafted request body
+    r"system\(|passthru\(|shell_exec|proc_open|\beval\(|<\?php|base64_decode|"  # web RCE payloads
+    r"/dev/tcp/|bash\s+-i|nc\s+-e|mkfifo|"                                  # reverse-shell payloads
+    r"union\s+select|'\s*or\s*'1|sleep\(\d|\bsqlmap\b|"                     # sqli
+    r"\bpython[23]?\b[^|]*\.py\b|\b(?:ruby|perl|php)\b[^|]*\.(?:rb|pl|php)\b|"  # running an exploit script
+    r"\bmsfconsole\b|\bmsfvenom\b|[?&]cmd=|shell\.php|\.\./\.\.",           # exploit endpoints / traversal
+    re.IGNORECASE)
+
+
+def _is_exploitation_iteration(command: str) -> bool:
+    """True when a shell command looks like hands-on exploitation (see
+    `_EXPLOIT_ITER_RE`) rather than recon path-guessing — the signal that the
+    near-duplicate / manual-probe guards should be loosened for it."""
+    return bool(command and _EXPLOIT_ITER_RE.search(command))
+
+
 @dataclass
 class TurnResult:
     response: str
@@ -1109,6 +1132,7 @@ class MistAgent:
         respond_streak_threshold = (self.cfg.mission.respond_streak_threshold
                                     if respond_streak_threshold is None else respond_streak_threshold)
         recovery_budget = self.cfg.mission.stuck_recovery_attempts
+        exploitation_guard_multiplier = self.cfg.mission.exploitation_guard_multiplier
 
         mission_id = f"{self.session_id}-{int(time.time())}"
         log_path = self._mission_log_path(mission_id)
@@ -1219,6 +1243,15 @@ class MistAgent:
                         near_dup_signature = nd_sig
                         manual_probe_streak = (manual_probe_streak + 1
                                                if _is_manual_probe(event.tool, event.detail) else 0)
+                        # Phase-aware loosening: while the model is doing hands-on
+                        # exploitation (crafted payloads against a known endpoint,
+                        # or running an exploit script), payload iteration is
+                        # productive — give the near-dup / manual-probe guards far
+                        # more rope. Exact byte-identical repeats stay tight.
+                        gm = (exploitation_guard_multiplier
+                              if _is_exploitation_iteration(last_command) else 1.0)
+                        eff_near_dup = int(near_dup_threshold * gm)
+                        eff_manual_probe = int(manual_probe_threshold * gm)
                         if occurrences >= stuck_threshold:
                             # Break out of astream_turn's own tool loop
                             # immediately — a single turn can run up to
@@ -1231,7 +1264,7 @@ class MistAgent:
                             stuck_repeat_count = occurrences
                             stuck_display = last_signature
                             break
-                        if near_dup_occurrences >= near_dup_threshold:
+                        if near_dup_occurrences >= eff_near_dup:
                             # Same idea, but for calls that are never
                             # byte-identical — e.g. `search_files` spammed
                             # with a different query each time, or the same
@@ -1243,7 +1276,7 @@ class MistAgent:
                             stuck_repeat_count = near_dup_occurrences
                             stuck_display = f"{event.tool} (varying only a literal/number each call)"
                             break
-                        if manual_probe_streak >= manual_probe_threshold:
+                        if manual_probe_streak >= eff_manual_probe:
                             # A third, distinct failure shape: every call is
                             # genuinely different (a different path each
                             # time), so neither check above ever fires — but
