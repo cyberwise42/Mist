@@ -700,7 +700,7 @@ async def test_astream_turn_refreshes_ledger_each_inner_decision(tmp_path):
 
 def test_recovery_nudge_manual_probe_carries_pivot_playbook():
     from mist.core.agent import _recovery_nudge
-    n = _recovery_nudge("manual_probe", "8x curl/wget", 8, escalated=False)
+    n = _recovery_nudge("manual_probe", "8x curl/wget", 8, attempt=1, budget=10)
     assert "scanner" in n.lower()                 # existing steer preserved
     assert "Host: FUZZ" in n                       # vhost pivot added
     assert "SAME target" in n                      # widen, don't switch
@@ -709,20 +709,32 @@ def test_recovery_nudge_manual_probe_carries_pivot_playbook():
 
 def test_recovery_nudge_repeat_is_blunt_about_identical_repeats_and_carries_pivot():
     from mist.core.agent import _recovery_nudge
-    first = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=False)
+    first = _recovery_nudge("repeat", "shell:{cmd}", 3, attempt=1, budget=10)
     # blunt about the deterministic identical repeat, and pushes a DIFFERENT action
-    assert "identical" in first.lower()
+    assert "same result" in first.lower()
     assert "different" in first.lower()
     assert "shell:{cmd}" in first                    # names the offending command
     assert "Host: FUZZ" in first                     # pivot playbook attached
-    escalated = _recovery_nudge("repeat", "shell:{cmd}", 3, escalated=True)
-    assert "blocked on" in escalated.lower()         # escalated defers to operator
-    assert "Host: FUZZ" in escalated
+    final = _recovery_nudge("repeat", "shell:{cmd}", 3, attempt=10, budget=10, final=True)
+    assert "blocked on" in final.lower()             # final/pause defers to operator
+    assert "Host: FUZZ" in final
+
+
+def test_recovery_nudge_escalates_across_attempts():
+    from mist.core.agent import _recovery_nudge
+    early = _recovery_nudge("repeat", "shell:{cmd}", 3, attempt=1, budget=10)
+    mid = _recovery_nudge("repeat", "shell:{cmd}", 3, attempt=5, budget=10)
+    late = _recovery_nudge("repeat", "shell:{cmd}", 3, attempt=9, budget=10)
+    # each tier gives DIFFERENT steering, not the same nudge repeated
+    assert early != mid and mid != late and early != late
+    assert "different next command" in early.lower()        # tier 1: change the command
+    assert "approach" in mid.lower()                         # tier 2: change the approach
+    assert "misread" in late.lower() or "from scratch" in late.lower()  # tier 3: rethink
 
 
 def test_recovery_nudge_no_action_demands_a_tool_without_pivot_noise():
     from mist.core.agent import _recovery_nudge
-    n = _recovery_nudge("no_action", "2x turns", 2, escalated=False)
+    n = _recovery_nudge("no_action", "2x turns", 2, attempt=1, budget=10)
     assert "call a tool" in n.lower()
     # not a dead-end-on-a-service case — the vhost/port pivot would be off-topic
     assert "FUZZ" not in n

@@ -172,50 +172,63 @@ _DEAD_END_PIVOT = (
 )
 
 
-def _recovery_nudge(stuck_kind: str, stuck_display: str, count: int, escalated: bool) -> str:
-    """The steering message injected into the next mission turn when a
-    stuck-loop guard fires. `escalated` is the second time on the same streak
-    (a reasoning-assisted recovery already failed, now pausing for the
-    operator): its wording asks the model to explain what it's blocked on
-    rather than just "try again". Kept as one function so the recovery and
-    pause branches can't drift apart — and so the dead-end pivot playbook is
-    attached consistently to the two kinds where "out of leads" is the real
-    problem (manual probing and repeating), but not to `no_action` (which is
-    about not acting at all, a different failure)."""
+def _escalation_directive(attempt: int, budget: int) -> str:
+    """How forcefully to redirect the model, intensifying as autonomous recovery
+    attempts on the same streak pile up — so N recoveries VARY the steering
+    instead of repeating one nudge N times (the whole point of a larger
+    stuck_recovery_attempts budget). Three tiers across the budget: nudge the
+    command, then the approach, then a from-scratch rethink."""
+    frac = attempt / max(budget, 1)
+    if frac <= 0.34:
+        return ("Choose a genuinely different next command — a different endpoint, flag, or "
+                "technique — not a variation of what just failed.")
+    if frac <= 0.67:
+        return ("Zoom out: it's the whole APPROACH that isn't working, not just this command. "
+                "Switch tool or technique, or move to a different service/port/vhost entirely — "
+                "re-read your CURRENT ENGAGEMENT STATE and take the least-explored lead.")
+    return ("You've been stuck on this for several tries now — reconsider from scratch. Re-read "
+            "your engagement state AND your earlier tool output: you may have MISREAD a result or "
+            "skipped a finding that's the real way forward. Pursue a completely different vector.")
+
+
+def _recovery_nudge(stuck_kind: str, stuck_display: str, count: int,
+                    attempt: int, budget: int, final: bool = False) -> str:
+    """The steering message injected into the next mission turn when a stuck-loop
+    guard fires. `attempt`/`budget` drive an escalating redirect (see
+    `_escalation_directive`) so repeated autonomous recoveries don't repeat one
+    nudge; `final` is the operator handoff (budget exhausted), whose wording
+    asks the model to explain what it's blocked on. Kept as one function so the
+    recovery and pause branches can't drift apart — and so the dead-end pivot
+    playbook is attached to the two kinds where "out of leads" is the real
+    problem (manual probing and repeating) but not `no_action`."""
+    directive = _escalation_directive(attempt, budget)
     if stuck_kind == "manual_probe":
-        if escalated:
+        if final:
             return (f"You're still making manual curl/wget requests ({stuck_display}) instead of "
                     "switching to a scanner (gobuster/ffuf/nuclei/searchsploit) or recognizing the "
                     "objective is already done. Explain what you're blocked on if you need the "
                     f"operator's judgment. {_DEAD_END_PIVOT}")
-        return (f"You've made {count} manual curl/wget requests in a row, each to a different path, "
-                "without running a scanner. Content/route discovery is a scanner's job (gobuster/"
-                "ffuf/dirsearch) and vulnerability checks come from nmap --script vuln / nuclei / "
-                "searchsploit — not hand-picked URLs. Also check whether the objective is already "
-                "satisfied by what you've already found; if it is, call finish_objective now instead "
-                f"of continuing to explore. {_DEAD_END_PIVOT}")
+        return (f"You've made {count} manual curl/wget requests in a row without running a scanner. "
+                "Content/route discovery is a scanner's job (gobuster/ffuf/dirsearch) and "
+                "vulnerability checks come from nmap --script vuln / nuclei / searchsploit — not "
+                f"hand-picked URLs. {directive} {_DEAD_END_PIVOT}")
     if stuck_kind == "no_action":
-        if escalated:
+        if final:
             return (f"You're still responding in plain text ({stuck_display}) instead of calling a "
                     "tool. Call a tool for a concrete next step, or explain what you're blocked on "
                     "if you need the operator's judgment.")
         return (f"You've given a plain-text response for {count} turns in a row without calling a "
-                "tool. This objective requires action, not a description of what you would do — pick "
-                "one concrete next step and call a tool for it right now instead of writing out "
-                "commands as text.")
+                f"tool. This objective requires ACTION, not a description of what you would do. "
+                f"{directive} Call a tool for it right now.")
     # exact- or near-duplicate repeat
-    if escalated:
+    if final:
         return (f"You have run this same command ({stuck_display}) {count} times and gotten the "
-                "SAME result every time — it is deterministic, so running it again produces "
-                "identical output and CANNOT tell you anything new. Do not run it or a trivial "
-                "variation again. Either act on what that output already told you, or explain what "
+                "SAME result every time — it is deterministic, so running it again cannot tell you "
+                "anything new. Either act on what that output already told you, or explain what "
                 f"you're blocked on if you need the operator's judgment. {_DEAD_END_PIVOT}")
-    return (f"You have run this EXACT command ({stuck_display}) {count} times and gotten the SAME "
-            "result every time. Running it again produces byte-for-byte identical output — it "
-            "cannot help, and neither can a trivial variation (a different flag, wordlist, or "
-            "grep pattern on the same target). The result you already have is your answer; act on "
-            "it and choose a genuinely DIFFERENT next action — a different service, tool, or "
-            f"technique. {_DEAD_END_PIVOT}")
+    return (f"You have run this command ({stuck_display}) {count} times and gotten the SAME result "
+            "every time — repeating it (or a trivial variation) produces identical output and "
+            f"cannot help. The result you already have is your answer. {directive} {_DEAD_END_PIVOT}")
 
 
 def _now() -> str:
@@ -1359,8 +1372,8 @@ class MistAgent:
                                   f"({stuck_display}) — reasoning through a different approach "
                                   f"(recovery {recovery_attempts}/{recovery_budget})."),
                         )
-                        nudge = _recovery_nudge(stuck_kind, stuck_display,
-                                                stuck_repeat_count, escalated=False)
+                        nudge = _recovery_nudge(stuck_kind, stuck_display, stuck_repeat_count,
+                                                attempt=recovery_attempts, budget=recovery_budget)
                         notes = control.pop_notes()
                         user_msg = _mission_continue_message(objective, notes, nudge,
                                                              findings=mission_findings)
@@ -1387,8 +1400,8 @@ class MistAgent:
                               f"the same tool call {stuck_repeat_count}x in a row again "
                               f"({stuck_display}) — paused for operator review."),
                     )
-                    nudge = _recovery_nudge(stuck_kind, stuck_display,
-                                            stuck_repeat_count, escalated=True)
+                    nudge = _recovery_nudge(stuck_kind, stuck_display, stuck_repeat_count,
+                                            attempt=recovery_budget, budget=recovery_budget, final=True)
                     notes = control.pop_notes()
                     user_msg = _mission_continue_message(objective, notes, nudge,
                                                          findings=mission_findings)
